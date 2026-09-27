@@ -1,0 +1,519 @@
+use std::error::Error;
+use std::fmt;
+
+use chrono::{DateTime, Utc};
+use sqlx::FromRow;
+use url::Url;
+
+use crate::domain::{
+    EmptyOpaqueValueError, GatewayKeyId, PasswordHash, PositiveValueError, ProtocolType, Provider,
+    ProviderCursor, ProviderId, ProviderStatus, RequestId, RequestLog, RequestLogCursor,
+    RequestLogId, SecretCiphertext, TransportType,
+};
+
+pub mod postgres;
+pub mod sqlite;
+
+pub const MAX_PROVIDER_PAGE_SIZE: usize = 100;
+pub const MAX_REQUEST_LOG_PAGE_SIZE: usize = 100;
+
+#[derive(Clone, Debug)]
+pub struct NewProvider {
+    name: String,
+    protocol_type: ProtocolType,
+    endpoint: Url,
+    upstream_api_key_ciphertext: SecretCiphertext,
+    gateway_key_id: GatewayKeyId,
+    gateway_api_key_hash: PasswordHash,
+    status: ProviderStatus,
+    created_at: DateTime<Utc>,
+}
+
+impl NewProvider {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        protocol_type: ProtocolType,
+        endpoint: Url,
+        upstream_api_key_ciphertext: SecretCiphertext,
+        gateway_key_id: GatewayKeyId,
+        gateway_api_key_hash: PasswordHash,
+        status: ProviderStatus,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            name,
+            protocol_type,
+            endpoint,
+            upstream_api_key_ciphertext,
+            gateway_key_id,
+            gateway_api_key_hash,
+            status,
+            created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderUpdate {
+    name: String,
+    protocol_type: ProtocolType,
+    endpoint: Url,
+    upstream_api_key_ciphertext: SecretCiphertext,
+    gateway_key_id: GatewayKeyId,
+    gateway_api_key_hash: PasswordHash,
+    status: ProviderStatus,
+}
+
+impl ProviderUpdate {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        protocol_type: ProtocolType,
+        endpoint: Url,
+        upstream_api_key_ciphertext: SecretCiphertext,
+        gateway_key_id: GatewayKeyId,
+        gateway_api_key_hash: PasswordHash,
+        status: ProviderStatus,
+    ) -> Self {
+        Self {
+            name,
+            protocol_type,
+            endpoint,
+            upstream_api_key_ciphertext,
+            gateway_key_id,
+            gateway_api_key_hash,
+            status,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderListRequest {
+    after_id: Option<ProviderCursor>,
+    limit: usize,
+}
+
+impl ProviderListRequest {
+    pub fn new(
+        after_id: Option<ProviderCursor>,
+        limit: usize,
+    ) -> Result<Self, ProviderListRequestError> {
+        if !(1..=MAX_PROVIDER_PAGE_SIZE).contains(&limit) {
+            return Err(ProviderListRequestError);
+        }
+        Ok(Self { after_id, limit })
+    }
+
+    pub fn after_id(self) -> Option<ProviderCursor> {
+        self.after_id
+    }
+
+    pub fn limit(self) -> usize {
+        self.limit
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderListRequestError;
+
+impl fmt::Display for ProviderListRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "provider page size must be between 1 and {MAX_PROVIDER_PAGE_SIZE}"
+        )
+    }
+}
+
+impl Error for ProviderListRequestError {}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogStarted {
+    request_id: RequestId,
+    provider_id: ProviderId,
+    protocol_type: ProtocolType,
+    transport_type: TransportType,
+    path: String,
+    start_time: DateTime<Utc>,
+}
+
+impl RequestLogStarted {
+    pub fn new(
+        request_id: RequestId,
+        provider_id: ProviderId,
+        protocol_type: ProtocolType,
+        transport_type: TransportType,
+        path: String,
+        start_time: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            request_id,
+            provider_id,
+            protocol_type,
+            transport_type,
+            path,
+            start_time,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogCompleted {
+    request_id: RequestId,
+    status_code: Option<u16>,
+    end_time: DateTime<Utc>,
+    error_msg: Option<String>,
+}
+
+impl RequestLogCompleted {
+    pub fn new(
+        request_id: RequestId,
+        status_code: Option<u16>,
+        end_time: DateTime<Utc>,
+        error_msg: Option<String>,
+    ) -> Self {
+        Self {
+            request_id,
+            status_code,
+            end_time,
+            error_msg,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestLogQuery {
+    after_id: Option<RequestLogCursor>,
+    limit: usize,
+    provider_id: Option<ProviderId>,
+    transport_type: Option<TransportType>,
+    start_time_gte: Option<DateTime<Utc>>,
+    start_time_lt: Option<DateTime<Utc>>,
+}
+
+impl RequestLogQuery {
+    pub fn new(
+        after_id: Option<RequestLogCursor>,
+        limit: usize,
+        provider_id: Option<ProviderId>,
+        transport_type: Option<TransportType>,
+        start_time_gte: Option<DateTime<Utc>>,
+        start_time_lt: Option<DateTime<Utc>>,
+    ) -> Result<Self, RequestLogQueryError> {
+        if !(1..=MAX_REQUEST_LOG_PAGE_SIZE).contains(&limit) {
+            return Err(RequestLogQueryError::InvalidLimit);
+        }
+        if matches!((start_time_gte, start_time_lt), (Some(start), Some(end)) if start >= end) {
+            return Err(RequestLogQueryError::InvalidTimeRange);
+        }
+        Ok(Self {
+            after_id,
+            limit,
+            provider_id,
+            transport_type,
+            start_time_gte,
+            start_time_lt,
+        })
+    }
+
+    pub fn after_id(self) -> Option<RequestLogCursor> {
+        self.after_id
+    }
+
+    pub fn limit(self) -> usize {
+        self.limit
+    }
+
+    pub fn provider_id(self) -> Option<ProviderId> {
+        self.provider_id
+    }
+
+    pub fn transport_type(self) -> Option<TransportType> {
+        self.transport_type
+    }
+
+    pub fn start_time_gte(self) -> Option<DateTime<Utc>> {
+        self.start_time_gte
+    }
+
+    pub fn start_time_lt(self) -> Option<DateTime<Utc>> {
+        self.start_time_lt
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestLogQueryError {
+    InvalidLimit,
+    InvalidTimeRange,
+}
+
+impl fmt::Display for RequestLogQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimit => write!(
+                formatter,
+                "request log page size must be between 1 and {MAX_REQUEST_LOG_PAGE_SIZE}"
+            ),
+            Self::InvalidTimeRange => {
+                formatter.write_str("request log start time lower bound must precede upper bound")
+            }
+        }
+    }
+}
+
+impl Error for RequestLogQueryError {}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogPage {
+    items: Vec<RequestLog>,
+    has_more: bool,
+}
+
+impl RequestLogPage {
+    fn new(items: Vec<RequestLog>, has_more: bool) -> Self {
+        Self { items, has_more }
+    }
+
+    pub fn items(&self) -> &[RequestLog] {
+        &self.items
+    }
+
+    pub fn into_items(self) -> Vec<RequestLog> {
+        self.items
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub fn next_after_id(&self) -> Option<RequestLogCursor> {
+        self.items
+            .last()
+            .map(|log| RequestLogCursor::try_from(log.id().get()))
+            .transpose()
+            .expect("stored request log IDs are positive")
+    }
+}
+
+#[derive(Debug)]
+pub struct ProviderPage {
+    items: Vec<Provider>,
+    has_more: bool,
+}
+
+impl ProviderPage {
+    fn new(items: Vec<Provider>, has_more: bool) -> Self {
+        Self { items, has_more }
+    }
+
+    pub fn items(&self) -> &[Provider] {
+        &self.items
+    }
+
+    pub fn into_items(self) -> Vec<Provider> {
+        self.items
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub fn next_after_id(&self) -> Option<ProviderCursor> {
+        self.items
+            .last()
+            .map(|provider| ProviderCursor::try_from(provider.id().get()))
+            .transpose()
+            .expect("stored provider IDs are positive")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryError {
+    Conflict,
+    ProviderInUse,
+    NotFound,
+    InvalidStoredData,
+    Storage,
+}
+
+impl fmt::Display for RepositoryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Conflict => "record conflicts with existing data",
+            Self::ProviderInUse => "provider is referenced by request logs",
+            Self::NotFound => "referenced record was not found",
+            Self::InvalidStoredData => "stored data is invalid",
+            Self::Storage => "storage operation failed",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for RepositoryError {}
+
+#[allow(async_fn_in_trait)]
+pub trait ProviderRepository: Send + Sync {
+    async fn find_by_key_id(
+        &self,
+        key_id: &GatewayKeyId,
+    ) -> Result<Option<Provider>, RepositoryError>;
+
+    async fn list(&self, request: ProviderListRequest) -> Result<ProviderPage, RepositoryError>;
+
+    async fn create(&self, provider: NewProvider) -> Result<Provider, RepositoryError>;
+
+    async fn update(
+        &self,
+        id: ProviderId,
+        update: ProviderUpdate,
+    ) -> Result<Provider, RepositoryError>;
+
+    async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RequestLogRepository: Send + Sync {
+    async fn insert_started(&self, event: RequestLogStarted) -> Result<(), RepositoryError>;
+
+    async fn apply_completed(&self, event: RequestLogCompleted) -> Result<(), RepositoryError>;
+
+    async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError>;
+}
+
+#[derive(FromRow)]
+struct ProviderRow {
+    id: i64,
+    name: String,
+    protocol_type: String,
+    endpoint: String,
+    upstream_api_key_ciphertext: String,
+    gateway_key_id: String,
+    gateway_api_key_hash: String,
+    status: String,
+    created_at: i64,
+}
+
+impl ProviderRow {
+    fn into_provider(self) -> Result<Provider, RepositoryError> {
+        let id = ProviderId::try_from(self.id).map_err(invalid_positive_value)?;
+        let protocol_type = match self.protocol_type.as_str() {
+            "openai" => ProtocolType::OpenAi,
+            "anthropic" => ProtocolType::Anthropic,
+            _ => return Err(RepositoryError::InvalidStoredData),
+        };
+        let endpoint =
+            Url::parse(&self.endpoint).map_err(|_| RepositoryError::InvalidStoredData)?;
+        let gateway_key_id =
+            GatewayKeyId::new(self.gateway_key_id).map_err(invalid_opaque_value)?;
+        let status = match self.status.as_str() {
+            "enabled" => ProviderStatus::Enabled,
+            "disabled" => ProviderStatus::Disabled,
+            _ => return Err(RepositoryError::InvalidStoredData),
+        };
+        let created_at = DateTime::from_timestamp_micros(self.created_at)
+            .ok_or(RepositoryError::InvalidStoredData)?;
+
+        Ok(Provider::new(
+            id,
+            self.name,
+            protocol_type,
+            endpoint,
+            SecretCiphertext::new(self.upstream_api_key_ciphertext),
+            gateway_key_id,
+            PasswordHash::new(self.gateway_api_key_hash),
+            status,
+            created_at,
+        ))
+    }
+}
+
+#[derive(FromRow)]
+struct RequestLogRow {
+    id: i64,
+    request_id: String,
+    provider_id: i64,
+    protocol_type: String,
+    transport_type: String,
+    path: String,
+    status_code: Option<i64>,
+    start_time: i64,
+    end_time: Option<i64>,
+    error_msg: Option<String>,
+}
+
+impl RequestLogRow {
+    fn into_request_log(self) -> Result<RequestLog, RepositoryError> {
+        let id = RequestLogId::try_from(self.id).map_err(invalid_positive_value)?;
+        let request_id = RequestId::new(self.request_id).map_err(invalid_opaque_value)?;
+        let provider_id = ProviderId::try_from(self.provider_id).map_err(invalid_positive_value)?;
+        let protocol_type = parse_protocol_value(&self.protocol_type)?;
+        let transport_type = match self.transport_type.as_str() {
+            "http" => TransportType::Http,
+            "websocket" => TransportType::WebSocket,
+            _ => return Err(RepositoryError::InvalidStoredData),
+        };
+        let status_code = self
+            .status_code
+            .map(|value| u16::try_from(value).map_err(|_| RepositoryError::InvalidStoredData))
+            .transpose()?;
+        let start_time = DateTime::from_timestamp_micros(self.start_time)
+            .ok_or(RepositoryError::InvalidStoredData)?;
+        let end_time = self
+            .end_time
+            .map(|value| {
+                DateTime::from_timestamp_micros(value).ok_or(RepositoryError::InvalidStoredData)
+            })
+            .transpose()?;
+
+        Ok(RequestLog::new(
+            id,
+            request_id,
+            provider_id,
+            protocol_type,
+            transport_type,
+            self.path,
+            status_code,
+            start_time,
+            end_time,
+            self.error_msg,
+        ))
+    }
+}
+
+fn invalid_positive_value(_: PositiveValueError) -> RepositoryError {
+    RepositoryError::InvalidStoredData
+}
+
+fn invalid_opaque_value(_: EmptyOpaqueValueError) -> RepositoryError {
+    RepositoryError::InvalidStoredData
+}
+
+fn protocol_value(protocol_type: ProtocolType) -> &'static str {
+    match protocol_type {
+        ProtocolType::OpenAi => "openai",
+        ProtocolType::Anthropic => "anthropic",
+    }
+}
+
+fn parse_protocol_value(value: &str) -> Result<ProtocolType, RepositoryError> {
+    match value {
+        "openai" => Ok(ProtocolType::OpenAi),
+        "anthropic" => Ok(ProtocolType::Anthropic),
+        _ => Err(RepositoryError::InvalidStoredData),
+    }
+}
+
+fn transport_value(transport_type: TransportType) -> &'static str {
+    match transport_type {
+        TransportType::Http => "http",
+        TransportType::WebSocket => "websocket",
+    }
+}
+
+fn status_value(status: ProviderStatus) -> &'static str {
+    match status {
+        ProviderStatus::Enabled => "enabled",
+        ProviderStatus::Disabled => "disabled",
+    }
+}

@@ -1,5 +1,10 @@
+use std::io;
+
+use tokenstream::MigrationRunner;
+use tokenstream::RejectAll;
 use tokenstream::config::Config;
-use tokenstream::{RegisteredMigrations, RejectAll};
+use tokenstream::persistence::postgres::PostgresDatabase;
+use tokenstream::persistence::sqlite::SqliteDatabase;
 
 #[tokio::main]
 async fn main() {
@@ -16,10 +21,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
     );
+    let database_url = config.database_url().expose();
+    if database_url.starts_with("sqlite:") {
+        let database =
+            SqliteDatabase::connect(database_url, config.database_max_connections()).await?;
+        run_with_database(&config, database).await?;
+    } else {
+        let database =
+            PostgresDatabase::connect(database_url, config.database_max_connections()).await?;
+        run_with_database(&config, database).await?;
+    }
+    Ok(())
+}
+
+async fn run_with_database<M>(config: &Config, database: M) -> io::Result<()>
+where
+    M: MigrationRunner,
+{
     tokenstream::run(
-        data_address,
-        control_address,
-        RegisteredMigrations,
+        config.data_listen_addr(),
+        config.admin_listen_addr(),
+        database,
         RejectAll,
         RejectAll,
         tokio::signal::ctrl_c(),
