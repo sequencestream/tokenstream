@@ -16,6 +16,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
 pub mod config;
+pub mod domain;
 
 type ResponseBody = Full<Bytes>;
 const MAX_SCAFFOLD_CONNECTIONS_PER_PLANE: usize = 64;
