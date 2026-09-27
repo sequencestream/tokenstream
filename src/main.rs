@@ -1,5 +1,9 @@
+use std::io;
+
+use tokenstream::MigrationRunner;
 use tokenstream::RejectAll;
 use tokenstream::config::Config;
+use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 
 #[tokio::main]
@@ -14,24 +18,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let data_address = config.data_listen_addr();
     let control_address = config.admin_listen_addr();
-    if !config.database_url().expose().starts_with("sqlite:") {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "configured database backend is not available",
-        )
-        .into());
-    }
-    let database = SqliteDatabase::connect(
-        config.database_url().expose(),
-        config.database_max_connections(),
-    )
-    .await?;
     eprintln!(
         "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
     );
+    let database_url = config.database_url().expose();
+    if database_url.starts_with("sqlite:") {
+        let database =
+            SqliteDatabase::connect(database_url, config.database_max_connections()).await?;
+        run_with_database(&config, database).await?;
+    } else {
+        let database =
+            PostgresDatabase::connect(database_url, config.database_max_connections()).await?;
+        run_with_database(&config, database).await?;
+    }
+    Ok(())
+}
+
+async fn run_with_database<M>(config: &Config, database: M) -> io::Result<()>
+where
+    M: MigrationRunner,
+{
     tokenstream::run(
-        data_address,
-        control_address,
+        config.data_listen_addr(),
+        config.admin_listen_addr(),
         database,
         RejectAll,
         RejectAll,
