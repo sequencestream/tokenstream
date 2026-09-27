@@ -21,3 +21,26 @@ Tokenstream is an MVP-stage design for a high-performance, transparent AI gatewa
 - Minimal administration UI for provider management and request-log queries.
 
 See the [architecture](doc/architecture.md) for binding principles, the [MVP specification](doc/mvp/mvp.md) for scope and acceptance criteria, and the [MVP design](doc/mvp/design.md) for implementation behavior.
+
+## Build and run the scaffold
+
+Requires Rust 1.97 or newer and Node.js 22 or newer. The Rust process currently exposes only a loopback health endpoint; the administration page is a static scaffold. Provider management and proxy traffic are not available yet.
+
+Development, in separate terminals:
+
+```sh
+cargo run --locked
+cd web && npm ci && npm run dev
+```
+
+The health endpoint is `http://127.0.0.1:3000/healthz`. Vite prints the local address of the administration page.
+
+Production build and launch of the current scaffold:
+
+```sh
+cargo build --release --locked
+cd web && npm ci && npm run check && npm run build
+../target/release/tokenstream
+```
+
+The compiled frontend is in `web/dist/`. It is not served by the Rust process yet. Basic checks are `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, and, in `web/`, `npm run check` and `npm run build`.
