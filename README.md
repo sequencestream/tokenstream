@@ -21,3 +21,45 @@ Tokenstream is an MVP-stage design for a high-performance, transparent AI gatewa
 - Minimal administration UI for provider management and request-log queries.
 
 See the [architecture](doc/architecture.md) for binding principles, the [MVP specification](doc/mvp/mvp.md) for scope and acceptance criteria, and the [MVP design](doc/mvp/design.md) for implementation behavior.
+
+## Build and run the scaffold
+
+Requires Rust 1.97 or newer and Node.js 22 or newer. The Rust process currently exposes only a loopback health endpoint; the administration page is a static scaffold. Provider management and proxy traffic are not available yet.
+
+Development, in separate terminals:
+
+```sh
+export TOKENSTREAM_DATA_LISTEN_ADDR=127.0.0.1:3000
+export TOKENSTREAM_ADMIN_LISTEN_ADDR=127.0.0.1:3001
+export TOKENSTREAM_DATABASE_URL=sqlite://tokenstream.db
+export TOKENSTREAM_MASTER_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+export TOKENSTREAM_ADMIN_PASSWORD_HASH='$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA'
+export TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS=5000
+export TOKENSTREAM_UPSTREAM_HEADER_TIMEOUT_MS=30000
+export TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS=60000
+export TOKENSTREAM_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
+export TOKENSTREAM_LOG_FLUSH_TIMEOUT_MS=5000
+export TOKENSTREAM_DATABASE_MAX_CONNECTIONS=16
+export TOKENSTREAM_MAX_PROXY_CONNECTIONS=4096
+export TOKENSTREAM_HTTP_BUFFER_BYTES=65536
+export TOKENSTREAM_WEBSOCKET_MAX_FRAME_BYTES=1048576
+export TOKENSTREAM_WEBSOCKET_MAX_MESSAGE_BYTES=8388608
+export TOKENSTREAM_WEBSOCKET_QUEUE_CAPACITY=32
+export TOKENSTREAM_LOG_QUEUE_CAPACITY=8192
+export TOKENSTREAM_LOG_BATCH_SIZE=128
+export TOKENSTREAM_LOG_BATCH_INTERVAL_MS=100
+cargo run --locked
+cd web && npm ci && npm run dev
+```
+
+The health endpoint is `http://127.0.0.1:3000/healthz`. Vite prints the local address of the administration page. Every setting above is required and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted only through the environment (or an environment populated by a secret manager), never command-line flags.
+
+Production build and launch of the current scaffold:
+
+```sh
+cargo build --release --locked
+cd web && npm ci && npm run check && npm run build
+../target/release/tokenstream
+```
+
+The compiled frontend is in `web/dist/`. It is not served by the Rust process yet. Basic checks are `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, and, in `web/`, `npm run check` and `npm run build`.

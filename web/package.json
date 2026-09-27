@@ -1,0 +1,20 @@
+{
+  "name": "tokenstream-admin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "check": "vue-tsc --noEmit"
+  },
+  "dependencies": {
+    "vue": "3.5.18"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "6.0.1",
+    "typescript": "5.9.2",
+    "vite": "7.1.3",
+    "vue-tsc": "3.1.0"
+  }
+}
