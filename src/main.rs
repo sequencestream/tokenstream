@@ -1,5 +1,5 @@
 use tokenstream::config::Config;
-use tokenstream::serve;
+use tokenstream::{RegisteredMigrations, RejectAll};
 
 #[tokio::main]
 async fn main() {
@@ -11,9 +11,20 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
-    let address = config.data_listen_addr();
-    let listener = tokio::net::TcpListener::bind(address).await?;
-    eprintln!("Tokenstream scaffold listening on http://{address}");
-    serve(listener, tokio::signal::ctrl_c()).await?;
+    let data_address = config.data_listen_addr();
+    let control_address = config.admin_listen_addr();
+    eprintln!(
+        "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
+    );
+    tokenstream::run(
+        data_address,
+        control_address,
+        RegisteredMigrations,
+        RejectAll,
+        RejectAll,
+        tokio::signal::ctrl_c(),
+        config.shutdown_drain_timeout(),
+    )
+    .await?;
     Ok(())
 }

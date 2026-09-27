@@ -24,7 +24,7 @@ See the [architecture](doc/architecture.md) for binding principles, the [MVP spe
 
 ## Build and run the scaffold
 
-Requires Rust 1.97 or newer and Node.js 22 or newer. The Rust process currently exposes only a loopback health endpoint; the administration page is a static scaffold. Provider management and proxy traffic are not available yet.
+Requires Rust 1.97 or newer and Node.js 22 or newer. The Rust process exposes independent data-plane and control-plane listeners, each with its own health endpoint and closed-by-default authentication boundary. The administration page is a static scaffold. Provider management and proxy traffic are not available yet.
 
 Development, in separate terminals:
 
@@ -52,7 +52,7 @@ cargo run --locked
 cd web && npm ci && npm run dev
 ```
 
-The health endpoint is `http://127.0.0.1:3000/healthz`. Vite prints the local address of the administration page. Every setting above is required and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted only through the environment (or an environment populated by a secret manager), never command-line flags.
+The data-plane and control-plane health endpoints are `http://127.0.0.1:3000/healthz` and `http://127.0.0.1:3001/healthz`. Vite prints the local address of the administration page. Startup migrations finish before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout. Every setting above is required and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted only through the environment (or an environment populated by a secret manager), never command-line flags.
 
 Production build and launch of the current scaffold:
 
