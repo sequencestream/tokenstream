@@ -1,14 +1,16 @@
 use std::io;
 
-use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::MigrationRunner;
 use crate::domain::{GatewayKeyId, Provider, ProviderId};
 
 use super::{
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
-    ProviderUpdate, RepositoryError, protocol_value, status_value,
+    ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
+    RequestLogRepository, RequestLogRow, RequestLogStarted, protocol_value, status_value,
+    transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -162,12 +164,99 @@ impl ProviderRepository for PostgresDatabase {
     }
 }
 
+impl RequestLogRepository for PostgresDatabase {
+    async fn insert_started(&self, event: RequestLogStarted) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "INSERT INTO request_log (
+                 request_id, provider_id, protocol_type, transport_type, path, start_time
+             ) VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(event.request_id.as_str())
+        .bind(event.provider_id.get())
+        .bind(protocol_value(event.protocol_type))
+        .bind(transport_value(event.transport_type))
+        .bind(event.path)
+        .bind(event.start_time.timestamp_micros())
+        .execute(&self.pool)
+        .await
+        .map_err(map_write_error)?;
+        Ok(())
+    }
+
+    async fn apply_completed(&self, event: RequestLogCompleted) -> Result<(), RepositoryError> {
+        sqlx::query(
+            "UPDATE request_log
+             SET status_code = $1, end_time = $2, error_msg = $3
+             WHERE request_id = $4 AND end_time IS NULL",
+        )
+        .bind(event.status_code.map(i64::from))
+        .bind(event.end_time.timestamp_micros())
+        .bind(event.error_msg)
+        .bind(event.request_id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(map_storage_error)?;
+        Ok(())
+    }
+
+    async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError> {
+        let mut statement = QueryBuilder::<Postgres>::new(
+            "SELECT id, request_id, provider_id, protocol_type, transport_type, path,
+                    status_code::BIGINT AS status_code, start_time, end_time, error_msg
+             FROM request_log
+             WHERE id > ",
+        );
+        statement.push_bind(query.after_id().map_or(0, |cursor| cursor.get()));
+        if let Some(provider_id) = query.provider_id() {
+            statement
+                .push(" AND provider_id = ")
+                .push_bind(provider_id.get());
+        }
+        if let Some(transport_type) = query.transport_type() {
+            statement
+                .push(" AND transport_type = ")
+                .push_bind(transport_value(transport_type));
+        }
+        if let Some(start_time) = query.start_time_gte() {
+            statement
+                .push(" AND start_time >= ")
+                .push_bind(start_time.timestamp_micros());
+        }
+        if let Some(start_time) = query.start_time_lt() {
+            statement
+                .push(" AND start_time < ")
+                .push_bind(start_time.timestamp_micros());
+        }
+        statement.push(" ORDER BY id ASC LIMIT ").push_bind(
+            i64::try_from(query.limit() + 1).expect("bounded request log page size fits in i64"),
+        );
+
+        let mut rows = statement
+            .build_query_as::<RequestLogRow>()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_storage_error)?;
+        let has_more = rows.len() > query.limit();
+        rows.truncate(query.limit());
+        let items = rows
+            .into_iter()
+            .map(RequestLogRow::into_request_log)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RequestLogPage::new(items, has_more))
+    }
+}
+
 fn map_write_error(error: sqlx::Error) -> RepositoryError {
     if error
         .as_database_error()
         .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
     {
         RepositoryError::Conflict
+    } else if error
+        .as_database_error()
+        .is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation)
+    {
+        RepositoryError::NotFound
     } else {
         RepositoryError::Storage
     }

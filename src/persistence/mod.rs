@@ -7,13 +7,15 @@ use url::Url;
 
 use crate::domain::{
     EmptyOpaqueValueError, GatewayKeyId, PasswordHash, PositiveValueError, ProtocolType, Provider,
-    ProviderCursor, ProviderId, ProviderStatus, SecretCiphertext,
+    ProviderCursor, ProviderId, ProviderStatus, RequestId, RequestLog, RequestLogCursor,
+    RequestLogId, SecretCiphertext, TransportType,
 };
 
 pub mod postgres;
 pub mod sqlite;
 
 pub const MAX_PROVIDER_PAGE_SIZE: usize = 100;
+pub const MAX_REQUEST_LOG_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, Debug)]
 pub struct NewProvider {
@@ -126,6 +128,174 @@ impl fmt::Display for ProviderListRequestError {
 
 impl Error for ProviderListRequestError {}
 
+#[derive(Clone, Debug)]
+pub struct RequestLogStarted {
+    request_id: RequestId,
+    provider_id: ProviderId,
+    protocol_type: ProtocolType,
+    transport_type: TransportType,
+    path: String,
+    start_time: DateTime<Utc>,
+}
+
+impl RequestLogStarted {
+    pub fn new(
+        request_id: RequestId,
+        provider_id: ProviderId,
+        protocol_type: ProtocolType,
+        transport_type: TransportType,
+        path: String,
+        start_time: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            request_id,
+            provider_id,
+            protocol_type,
+            transport_type,
+            path,
+            start_time,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogCompleted {
+    request_id: RequestId,
+    status_code: Option<u16>,
+    end_time: DateTime<Utc>,
+    error_msg: Option<String>,
+}
+
+impl RequestLogCompleted {
+    pub fn new(
+        request_id: RequestId,
+        status_code: Option<u16>,
+        end_time: DateTime<Utc>,
+        error_msg: Option<String>,
+    ) -> Self {
+        Self {
+            request_id,
+            status_code,
+            end_time,
+            error_msg,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestLogQuery {
+    after_id: Option<RequestLogCursor>,
+    limit: usize,
+    provider_id: Option<ProviderId>,
+    transport_type: Option<TransportType>,
+    start_time_gte: Option<DateTime<Utc>>,
+    start_time_lt: Option<DateTime<Utc>>,
+}
+
+impl RequestLogQuery {
+    pub fn new(
+        after_id: Option<RequestLogCursor>,
+        limit: usize,
+        provider_id: Option<ProviderId>,
+        transport_type: Option<TransportType>,
+        start_time_gte: Option<DateTime<Utc>>,
+        start_time_lt: Option<DateTime<Utc>>,
+    ) -> Result<Self, RequestLogQueryError> {
+        if !(1..=MAX_REQUEST_LOG_PAGE_SIZE).contains(&limit) {
+            return Err(RequestLogQueryError::InvalidLimit);
+        }
+        if matches!((start_time_gte, start_time_lt), (Some(start), Some(end)) if start >= end) {
+            return Err(RequestLogQueryError::InvalidTimeRange);
+        }
+        Ok(Self {
+            after_id,
+            limit,
+            provider_id,
+            transport_type,
+            start_time_gte,
+            start_time_lt,
+        })
+    }
+
+    pub fn after_id(self) -> Option<RequestLogCursor> {
+        self.after_id
+    }
+
+    pub fn limit(self) -> usize {
+        self.limit
+    }
+
+    pub fn provider_id(self) -> Option<ProviderId> {
+        self.provider_id
+    }
+
+    pub fn transport_type(self) -> Option<TransportType> {
+        self.transport_type
+    }
+
+    pub fn start_time_gte(self) -> Option<DateTime<Utc>> {
+        self.start_time_gte
+    }
+
+    pub fn start_time_lt(self) -> Option<DateTime<Utc>> {
+        self.start_time_lt
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestLogQueryError {
+    InvalidLimit,
+    InvalidTimeRange,
+}
+
+impl fmt::Display for RequestLogQueryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidLimit => write!(
+                formatter,
+                "request log page size must be between 1 and {MAX_REQUEST_LOG_PAGE_SIZE}"
+            ),
+            Self::InvalidTimeRange => {
+                formatter.write_str("request log start time lower bound must precede upper bound")
+            }
+        }
+    }
+}
+
+impl Error for RequestLogQueryError {}
+
+#[derive(Clone, Debug)]
+pub struct RequestLogPage {
+    items: Vec<RequestLog>,
+    has_more: bool,
+}
+
+impl RequestLogPage {
+    fn new(items: Vec<RequestLog>, has_more: bool) -> Self {
+        Self { items, has_more }
+    }
+
+    pub fn items(&self) -> &[RequestLog] {
+        &self.items
+    }
+
+    pub fn into_items(self) -> Vec<RequestLog> {
+        self.items
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub fn next_after_id(&self) -> Option<RequestLogCursor> {
+        self.items
+            .last()
+            .map(|log| RequestLogCursor::try_from(log.id().get()))
+            .transpose()
+            .expect("stored request log IDs are positive")
+    }
+}
+
 #[derive(Debug)]
 pub struct ProviderPage {
     items: Vec<Provider>,
@@ -170,11 +340,11 @@ pub enum RepositoryError {
 impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
-            Self::Conflict => "provider conflicts with an existing record",
+            Self::Conflict => "record conflicts with existing data",
             Self::ProviderInUse => "provider is referenced by request logs",
-            Self::NotFound => "provider was not found",
-            Self::InvalidStoredData => "stored provider data is invalid",
-            Self::Storage => "provider storage operation failed",
+            Self::NotFound => "referenced record was not found",
+            Self::InvalidStoredData => "stored data is invalid",
+            Self::Storage => "storage operation failed",
         };
         formatter.write_str(message)
     }
@@ -200,6 +370,15 @@ pub trait ProviderRepository: Send + Sync {
     ) -> Result<Provider, RepositoryError>;
 
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait RequestLogRepository: Send + Sync {
+    async fn insert_started(&self, event: RequestLogStarted) -> Result<(), RepositoryError>;
+
+    async fn apply_completed(&self, event: RequestLogCompleted) -> Result<(), RepositoryError>;
+
+    async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError>;
 }
 
 #[derive(FromRow)]
@@ -249,6 +428,59 @@ impl ProviderRow {
     }
 }
 
+#[derive(FromRow)]
+struct RequestLogRow {
+    id: i64,
+    request_id: String,
+    provider_id: i64,
+    protocol_type: String,
+    transport_type: String,
+    path: String,
+    status_code: Option<i64>,
+    start_time: i64,
+    end_time: Option<i64>,
+    error_msg: Option<String>,
+}
+
+impl RequestLogRow {
+    fn into_request_log(self) -> Result<RequestLog, RepositoryError> {
+        let id = RequestLogId::try_from(self.id).map_err(invalid_positive_value)?;
+        let request_id = RequestId::new(self.request_id).map_err(invalid_opaque_value)?;
+        let provider_id = ProviderId::try_from(self.provider_id).map_err(invalid_positive_value)?;
+        let protocol_type = parse_protocol_value(&self.protocol_type)?;
+        let transport_type = match self.transport_type.as_str() {
+            "http" => TransportType::Http,
+            "websocket" => TransportType::WebSocket,
+            _ => return Err(RepositoryError::InvalidStoredData),
+        };
+        let status_code = self
+            .status_code
+            .map(|value| u16::try_from(value).map_err(|_| RepositoryError::InvalidStoredData))
+            .transpose()?;
+        let start_time = DateTime::from_timestamp_micros(self.start_time)
+            .ok_or(RepositoryError::InvalidStoredData)?;
+        let end_time = self
+            .end_time
+            .map(|value| {
+                DateTime::from_timestamp_micros(value).ok_or(RepositoryError::InvalidStoredData)
+            })
+            .transpose()?;
+
+        Ok(RequestLog::new(
+            id,
+            request_id,
+            provider_id,
+            protocol_type,
+            transport_type,
+            self.path,
+            status_code,
+            start_time,
+            end_time,
+            self.error_msg,
+        ))
+    }
+}
+
 fn invalid_positive_value(_: PositiveValueError) -> RepositoryError {
     RepositoryError::InvalidStoredData
 }
@@ -261,6 +493,21 @@ fn protocol_value(protocol_type: ProtocolType) -> &'static str {
     match protocol_type {
         ProtocolType::OpenAi => "openai",
         ProtocolType::Anthropic => "anthropic",
+    }
+}
+
+fn parse_protocol_value(value: &str) -> Result<ProtocolType, RepositoryError> {
+    match value {
+        "openai" => Ok(ProtocolType::OpenAi),
+        "anthropic" => Ok(ProtocolType::Anthropic),
+        _ => Err(RepositoryError::InvalidStoredData),
+    }
+}
+
+fn transport_value(transport_type: TransportType) -> &'static str {
+    match transport_type {
+        TransportType::Http => "http",
+        TransportType::WebSocket => "websocket",
     }
 }
 
