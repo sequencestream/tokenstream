@@ -215,6 +215,8 @@ pub enum ProviderServiceError {
     NotFound,
     /// The provider is referenced by request logs and cannot be deleted.
     InUse,
+    /// The edit named no writable field, so nothing was changed.
+    NoFieldsToUpdate,
     /// The record could not be persisted.
     Storage,
 }
@@ -231,6 +233,7 @@ impl fmt::Display for ProviderServiceError {
             Self::Conflict => "provider conflicts with existing data",
             Self::NotFound => "provider was not found",
             Self::InUse => "provider is referenced by request logs",
+            Self::NoFieldsToUpdate => "the edit named no writable field",
             Self::Storage => "provider could not be persisted",
         };
         formatter.write_str(message)
@@ -380,50 +383,41 @@ where
 
     /// Applies a partial edit, committing only the named fields.
     ///
-    /// Validation and re-encryption happen before the single storage write, so
-    /// a rejected edit leaves the stored record untouched. The gateway
-    /// credential is unchanged; rotating it is a separate operation. Requests
-    /// admitted before the commit keep their immutable snapshot.
+    /// The change set names exactly the fields the caller supplied; storage
+    /// writes those columns alone, so an edit can never restore a rotated
+    /// gateway key, re-enable a provider, or rewrite a field it never named —
+    /// even when a rotation or a status change was committed after this
+    /// request began. Validation and re-encryption happen before the single
+    /// write, so a rejected edit leaves the stored record untouched. The
+    /// gateway credential is unchanged; rotating it is a separate operation.
+    /// Requests admitted before the commit keep their immutable snapshot.
     pub async fn update(
         &self,
         id: ProviderId,
         request: UpdateProviderRequest,
     ) -> Result<Provider, ProviderServiceError> {
-        let current = self
-            .repository
-            .find_by_id(id)
-            .await
-            .map_err(map_repository_error)?
-            .ok_or(ProviderServiceError::NotFound)?;
-
-        let name = match request.name {
-            Some(name) => validate_name(&name)?,
-            None => current.name().to_owned(),
-        };
-        let endpoint = match request.endpoint.as_deref() {
-            Some(endpoint) => validate_endpoint(endpoint, self.allow_insecure_endpoints)?,
-            None => current.endpoint().clone(),
-        };
-        let upstream_api_key_ciphertext = match request.upstream_api_key {
-            Some(upstream_api_key) => {
-                validate_upstream_api_key(&upstream_api_key)?;
-                self.cipher
-                    .encrypt(&upstream_api_key)
-                    .map_err(|_| ProviderServiceError::Cipher)?
-            }
-            None => current.upstream_api_key_ciphertext().clone(),
-        };
-        let status = request.status.unwrap_or(current.status());
-
-        let update = ProviderUpdate::new(
-            name,
-            current.protocol_type(),
-            endpoint,
-            upstream_api_key_ciphertext,
-            current.gateway_key_id().clone(),
-            current.gateway_api_key_hash().clone(),
-            status,
-        );
+        let mut update = ProviderUpdate::new();
+        if let Some(name) = request.name {
+            update = update.with_name(validate_name(&name)?);
+        }
+        if let Some(endpoint) = request.endpoint.as_deref() {
+            update =
+                update.with_endpoint(validate_endpoint(endpoint, self.allow_insecure_endpoints)?);
+        }
+        if let Some(upstream_api_key) = request.upstream_api_key {
+            validate_upstream_api_key(&upstream_api_key)?;
+            let ciphertext = self
+                .cipher
+                .encrypt(&upstream_api_key)
+                .map_err(|_| ProviderServiceError::Cipher)?;
+            update = update.with_upstream_api_key_ciphertext(ciphertext);
+        }
+        if let Some(status) = request.status {
+            update = update.with_status(status);
+        }
+        if update.is_empty() {
+            return Err(ProviderServiceError::NoFieldsToUpdate);
+        }
         self.repository
             .update(id, update)
             .await
@@ -503,6 +497,7 @@ fn map_repository_error(error: RepositoryError) -> ProviderServiceError {
         RepositoryError::Conflict => ProviderServiceError::Conflict,
         RepositoryError::ProviderInUse => ProviderServiceError::InUse,
         RepositoryError::NotFound => ProviderServiceError::NotFound,
+        RepositoryError::NoFieldsToUpdate => ProviderServiceError::NoFieldsToUpdate,
         _ => ProviderServiceError::Storage,
     }
 }

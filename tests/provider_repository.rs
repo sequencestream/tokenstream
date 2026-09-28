@@ -38,15 +38,17 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
 }
 
 fn provider_update(prefix: &str, number: usize, name: String) -> ProviderUpdate {
-    ProviderUpdate::new(
-        name,
-        ProtocolType::Anthropic,
-        Url::parse(&format!("https://updated-{number}.example.com/api")).expect("valid endpoint"),
-        SecretCiphertext::new(format!("updated-ciphertext-{number}")),
-        GatewayKeyId::new(format!("{prefix}-updated-key-{number}")).expect("non-empty key ID"),
-        PasswordHash::new(format!("updated-hash-{number}")),
-        ProviderStatus::Disabled,
-    )
+    let _ = prefix;
+    ProviderUpdate::new()
+        .with_name(name)
+        .with_endpoint(
+            Url::parse(&format!("https://updated-{number}.example.com/api"))
+                .expect("valid endpoint"),
+        )
+        .with_upstream_api_key_ciphertext(SecretCiphertext::new(format!(
+            "updated-ciphertext-{number}"
+        )))
+        .with_status(ProviderStatus::Disabled)
 }
 
 async fn verify_contract<R>(repository: &R, prefix: &str) -> Vec<ProviderId>
@@ -106,7 +108,7 @@ where
         .expect("update provider");
     assert_eq!(updated.id(), first.id());
     assert_eq!(updated.name(), updated_name);
-    assert_eq!(updated.protocol_type(), ProtocolType::Anthropic);
+    assert_eq!(updated.protocol_type(), ProtocolType::OpenAi);
     assert_eq!(updated.status(), ProviderStatus::Disabled);
     assert_eq!(
         updated.endpoint().as_str(),
@@ -114,11 +116,27 @@ where
     );
     assert_eq!(updated.created_at(), first_created_at);
     assert!(
+        updated
+            .upstream_api_key_ciphertext()
+            .expose()
+            .contains("updated-ciphertext-20")
+    );
+    // A partial update never touches the gateway key columns, so the original
+    // key identifier and hash keep resolving to this provider.
+    assert_eq!(updated.gateway_key_id(), &first_key);
+    assert!(
         repository
             .find_by_key_id(&first_key)
             .await
-            .expect("old key lookup")
-            .is_none()
+            .expect("original key lookup after edit")
+            .is_some()
+    );
+    assert_eq!(
+        repository
+            .update(first.id(), ProviderUpdate::new())
+            .await
+            .expect_err("an empty change set is refused"),
+        RepositoryError::NoFieldsToUpdate
     );
 
     let second_original_key =

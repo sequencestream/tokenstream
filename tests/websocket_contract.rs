@@ -23,7 +23,7 @@ use tokenstream::persistence::RepositoryError;
 use tokenstream::proxy::admission::ProxyLimits;
 use tokenstream::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use tokenstream::proxy::http::HttpProxy;
-use tokenstream::proxy::websocket::WebSocketProxy;
+use tokenstream::proxy::websocket::{RejectionBody, WebSocketProxy};
 use tokenstream::proxy::websocket::{RelayOutcome, relay};
 use tokenstream::routing::resolve_route;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -117,15 +117,17 @@ async fn spawn_gateway(upstream: SocketAddr) -> (SocketAddr, tokio::task::JoinHa
                     request.headers(),
                 ) {
                     Ok(route) => route,
-                    Err(error) => return Ok::<_, Infallible>(local_error(error.into())),
+                    Err(error) => {
+                        return Ok::<_, Infallible>(boxed_full(local_error(error.into())));
+                    }
                 };
                 let query = request.uri().query().map(str::to_owned);
-                let response = match proxy
+                let response: Response<UnsyncBoxBody<Bytes, io::Error>> = match proxy
                     .handshake(&snapshot, &route, query.as_deref(), peer, &mut request)
                     .await
                 {
-                    Ok(handshake) => handshake.into_response(),
-                    Err(error) => local_error(error),
+                    Ok(handshake) => boxed_handshake(handshake.into_response()),
+                    Err(error) => boxed_full(local_error(error)),
                 };
                 Ok::<_, Infallible>(response)
             }
@@ -169,6 +171,12 @@ async fn read_http_head(stream: &mut TcpStream) -> String {
 fn boxed_full(response: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, io::Error>> {
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, body.map_err(|never| match never {}).boxed_unsync())
+}
+
+/// Boxes a handshake response so a test service can return either outcome.
+fn boxed_handshake(response: Response<RejectionBody>) -> Response<UnsyncBoxBody<Bytes, io::Error>> {
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, body.map_err(io::Error::other).boxed_unsync())
 }
 
 #[tokio::test]
@@ -418,7 +426,7 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                                 )
                                 .await
                                 .expect("upstream returns an HTTP rejection");
-                            boxed_full(handshake.into_response())
+                            boxed_handshake(handshake.into_response())
                         } else {
                             let response = http_proxy
                                 .forward_logged(
@@ -716,4 +724,351 @@ fn relay_outcomes_do_not_include_transport_or_payload_text() {
     );
     assert!(!rendered.contains("gateway-secret"));
     assert!(!rendered.contains("application-body"));
+}
+
+/// A rejected handshake whose body is relayed as an HTTP stream, not a buffer.
+///
+/// The upstream writes the head and body in separate writes with a pause
+/// between them, then closes. The client reads the response as raw bytes so
+/// the exact body bytes, their arrival after the head, and the absence of any
+/// gateway-generated content are all observable.
+#[tokio::test]
+async fn a_rejected_handshake_relays_head_and_body_as_one_stream() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let payload = b"{\"error\":{\"message\":\"websocket upgrade is not available\"}}";
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = upstream_listener.accept().await.expect("accept upstream");
+        let head = read_http_head(&mut stream).await;
+        assert!(
+            head.starts_with("GET /provider-prefix/v1/responses?opaque=%2Fvalue+kept HTTP/1.1")
+        );
+        // The head is sent alone; the body only follows well after it.
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\nx-upstream-error: retained\r\ncontent-length: {}\r\n\r\n",
+                    payload.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write rejection head");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        stream
+            .write_all(payload)
+            .await
+            .expect("write rejection body");
+        stream.shutdown().await.expect("close upstream");
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    client
+        .write_all(
+            format!(
+                "GET /v1/responses?opaque=%2Fvalue+kept HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send handshake request");
+
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let head_end = loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => panic!("connection ended before the head"),
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => panic!("read failed before the head"),
+        }
+        if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&received[..head_end]).to_ascii_lowercase();
+    assert!(
+        head.starts_with("http/1.1 503 service unavailable"),
+        "{head}"
+    );
+    assert!(head.contains("x-upstream-error: retained"), "{head}");
+    // Hop-by-hop headers never travel to the client.
+    assert!(!head.contains("connection:"), "{head}");
+
+    // The body is still arriving on the same connection after the head.
+    let body_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while received.len() < head_end + payload.len() {
+        match tokio::time::timeout_at(body_deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+    }
+    assert_eq!(
+        &received[head_end..head_end + payload.len()],
+        payload.as_slice(),
+        "the rejection body must be relayed byte for byte"
+    );
+    assert!(
+        !String::from_utf8_lossy(&received).contains("gateway-id.gateway-secret"),
+        "no credential may appear in a relayed rejection"
+    );
+    drop(client);
+
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
+}
+
+/// A chunked rejection body is relayed frame by frame, so a body that never
+/// ends inside one read is still delivered in full.
+#[tokio::test]
+async fn a_chunked_rejection_body_is_relayed_without_truncation() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let chunks: Vec<String> = (0..8).map(|index| format!("chunk-{index}\n")).collect();
+    // The gateway is transparent, so the chunk framing itself is what travels.
+    let expected: String = chunks
+        .iter()
+        .map(|chunk| format!("{:x}\r\n{chunk}\r\n", chunk.len()))
+        .chain(std::iter::once("0\r\n\r\n".to_owned()))
+        .collect();
+    let upstream = tokio::spawn({
+        let chunks = chunks.clone();
+        async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await
+                .expect("write chunked head");
+            for chunk in &chunks {
+                stream
+                    .write_all(format!("{:x}\r\n{chunk}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .expect("write chunk");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stream
+                .write_all(b"0\r\n\r\n")
+                .await
+                .expect("write terminating chunk");
+            stream.shutdown().await.expect("close upstream");
+        }
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+
+    // The response is read as raw bytes: a client library stops at the first
+    // frame, which would hide whether the rest of the body was relayed.
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    client
+        .write_all(
+            format!(
+                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send handshake request");
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // The chunked body is self-delimiting: once the terminating chunk has
+    // arrived, the full relayed body is present and the socket is closed.
+    let needed = expected.len() + 128;
+    while received.len() < needed {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+        let text = String::from_utf8_lossy(&received);
+        if text
+            .find("\r\n\r\n")
+            .is_some_and(|position| text.len() >= position + 4 + expected.len())
+        {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&received).to_string();
+    assert!(
+        text.to_ascii_lowercase()
+            .starts_with("http/1.1 400 bad request"),
+        "{text}"
+    );
+    let head_end = text.find("\r\n\r\n").expect("response head") + 4;
+    assert_eq!(
+        &text[head_end..head_end + expected.len()],
+        expected,
+        "every chunked frame must reach the client"
+    );
+    drop(client);
+
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
+}
+
+/// A rejection body larger than one socket read is delivered in full, which a
+/// buffer of the already-read remainder could not achieve.
+#[tokio::test]
+async fn a_large_rejection_body_is_relayed_in_full() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let payload: Vec<u8> = (0..512 * 1024).map(|index| (index % 251) as u8).collect();
+    let upstream = tokio::spawn({
+        let payload = payload.clone();
+        async move {
+            let (mut stream, _) = upstream_listener.accept().await.expect("accept upstream");
+            read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 413 Payload Too Large\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write head");
+            for slice in payload.chunks(16 * 1024) {
+                stream.write_all(slice).await.expect("write body slice");
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            stream.shutdown().await.expect("close upstream");
+        }
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    let head = format!(
+        "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+    );
+    client
+        .write_all(head.as_bytes())
+        .await
+        .expect("send handshake request");
+
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let head_end = loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => panic!("connection ended before the head"),
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => panic!("read failed before the head"),
+        }
+        if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let expected_total = head_end + payload.len();
+    while received.len() < expected_total {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+    }
+    assert_eq!(
+        received.len(),
+        expected_total,
+        "a large rejection body must not be truncated"
+    );
+    assert_eq!(&received[head_end..], payload.as_slice());
+    drop(client);
+
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
+}
+
+/// An accepted upgrade keeps the allowed end-to-end handshake headers and drops
+/// the hop-by-hop set, while the required upgrade headers address the
+/// downstream peer rather than being copied from the upstream.
+#[tokio::test]
+async fn an_accepted_upgrade_keeps_allowed_headers_and_rebuilds_the_upgrade() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.expect("accept upstream");
+        read_http_head(&mut socket).await;
+        let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: keep-alive, x-drop-me, Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-protocol: openai-realtime-v1\r\nx-upstream-negotiated: retained\r\nx-drop-me: gone\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write upgrade head");
+        let _ = socket;
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    client
+        .write_all(
+            format!(
+                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send handshake request");
+
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+        if received.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&received).to_ascii_lowercase();
+    assert!(
+        text.starts_with("http/1.1 101 switching protocols"),
+        "{text}"
+    );
+    assert!(
+        text.contains("sec-websocket-accept: s3pplmbitxaq9kygzzhzrbk+xoo="),
+        "{text}"
+    );
+    assert!(
+        text.contains("sec-websocket-protocol: openai-realtime-v1"),
+        "{text}"
+    );
+    assert!(text.contains("x-upstream-negotiated: retained"), "{text}");
+    // `x-drop-me` is nominated by `Connection` and is therefore hop-by-hop.
+    assert!(!text.contains("x-drop-me"), "{text}");
+    // `Connection` itself is rebuilt for the downstream upgrade, so neither
+    // the upstream's nomination list nor its `keep-alive` token survives.
+    assert!(text.contains("connection: upgrade"), "{text}");
+    assert!(!text.contains("keep-alive"), "{text}");
+    assert!(!text.contains("x-drop-me"), "{text}");
+
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
 }

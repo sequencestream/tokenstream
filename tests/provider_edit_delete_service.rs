@@ -1,7 +1,9 @@
 use std::path::Path;
 
 use chrono::Utc;
-use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier, SecretCipher};
+use tokenstream::crypto::{
+    AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher,
+};
 use tokenstream::domain::{
     ProtocolType, ProviderId, ProviderSnapshot, ProviderStatus, RequestId, SecretString,
     TransportType,
@@ -120,6 +122,98 @@ async fn edit_commits_only_named_fields_and_keeps_credential() {
         .expect("provider exists");
     assert_eq!(stored.endpoint().as_str(), "https://other.example.com/v1");
     assert_eq!(provider_count(&database).await, 1);
+}
+
+#[tokio::test]
+async fn an_edit_that_names_no_field_changes_nothing() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("empty-edit.db")).await;
+    let service = service(database.clone(), false);
+    let cipher = AesGcmCipher::new(&MASTER_KEY);
+
+    let created = service
+        .create(create_request(
+            "primary",
+            "https://api.example.com/base",
+            UPSTREAM_KEY,
+        ))
+        .await
+        .expect("create provider");
+    let id = created.provider().id();
+
+    assert_eq!(
+        service
+            .update(id, UpdateProviderRequest::new())
+            .await
+            .expect_err("an empty edit is refused before storage"),
+        ProviderServiceError::NoFieldsToUpdate
+    );
+
+    let stored = database
+        .find_by_id(id)
+        .await
+        .expect("find provider by id")
+        .expect("provider exists");
+    assert_eq!(stored.name(), "primary");
+    assert_eq!(stored.endpoint().as_str(), "https://api.example.com/base");
+    assert_eq!(stored.status(), ProviderStatus::Enabled);
+    assert_eq!(decrypt(&cipher, &stored), UPSTREAM_KEY);
+}
+
+#[tokio::test]
+async fn a_late_configuration_edit_never_restores_a_rotated_credential() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("edit-after-rotate.db")).await;
+    let service = service(database.clone(), false);
+    let verifier = Argon2GatewaySecretVerifier::new();
+
+    let created = service
+        .create(create_request(
+            "primary",
+            "https://api.example.com/base",
+            UPSTREAM_KEY,
+        ))
+        .await
+        .expect("create provider");
+    let id = created.provider().id();
+    let old_secret = created.gateway_credential().secret().clone();
+
+    let rotated = service
+        .rotate_gateway_credential(id)
+        .await
+        .expect("rotate gateway credential");
+    let new_secret = rotated.gateway_credential().secret().clone();
+
+    // The edit runs after the rotation committed, reading no earlier state
+    // from storage, so the write set it names is exactly the name column.
+    service
+        .update(id, UpdateProviderRequest::new().with_name("renamed"))
+        .await
+        .expect("rename after rotation");
+
+    let stored = database
+        .find_by_id(id)
+        .await
+        .expect("find provider by id")
+        .expect("provider exists");
+    assert_eq!(stored.name(), "renamed");
+    assert_eq!(
+        stored.gateway_key_id(),
+        rotated.gateway_credential().key_id(),
+        "a configuration edit must not write the gateway key columns"
+    );
+    assert!(
+        !verifier
+            .verify(&old_secret, stored.gateway_api_key_hash())
+            .expect("stored hash is well formed"),
+        "the retired credential must stop verifying"
+    );
+    assert!(
+        verifier
+            .verify(&new_secret, stored.gateway_api_key_hash())
+            .expect("stored hash is well formed"),
+        "the rotated credential must keep verifying after an edit"
+    );
 }
 
 #[tokio::test]

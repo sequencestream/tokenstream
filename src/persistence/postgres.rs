@@ -188,33 +188,58 @@ impl ProviderRepository for PostgresDatabase {
         .into_provider()
     }
 
+    /// Writes only the named fields and returns the complete reloaded row.
+    ///
+    /// The `SET` clause is built from the change set itself, so a column the
+    /// caller did not name keeps its stored value in the same statement.
+    /// Writes only the named fields and returns the complete reloaded row.
+    ///
+    /// The `SET` clause is built from the change set itself, so a column the
+    /// caller did not name keeps its stored value in the same statement. No
+    /// gateway key column is writable through this path, so a configuration
+    /// edit can never restore a rotated credential.
     async fn update(
         &self,
         id: ProviderId,
         update: ProviderUpdate,
     ) -> Result<Provider, RepositoryError> {
-        sqlx::query_as::<_, ProviderRow>(
-            "UPDATE provider
-             SET name = $1, protocol_type = $2, endpoint = $3,
-                 upstream_api_key_ciphertext = $4, gateway_key_id = $5,
-                 gateway_api_key_hash = $6, status = $7
-             WHERE id = $8
-             RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                       gateway_key_id, gateway_api_key_hash, status, created_at",
-        )
-        .bind(update.name)
-        .bind(protocol_value(update.protocol_type))
-        .bind(update.endpoint.as_str())
-        .bind(update.upstream_api_key_ciphertext.expose())
-        .bind(update.gateway_key_id.as_str())
-        .bind(update.gateway_api_key_hash.expose())
-        .bind(status_value(update.status))
-        .bind(id.get())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(map_write_error)?
-        .ok_or(RepositoryError::NotFound)?
-        .into_provider()
+        if update.is_empty() {
+            return Err(RepositoryError::NoFieldsToUpdate);
+        }
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE provider SET ");
+        {
+            let mut assignments = builder.separated(", ");
+            if let Some(name) = update.name() {
+                assignments.push("name = ").push_bind_unseparated(name);
+            }
+            if let Some(endpoint) = update.endpoint() {
+                assignments
+                    .push("endpoint = ")
+                    .push_bind_unseparated(endpoint.as_str());
+            }
+            if let Some(ciphertext) = update.upstream_api_key_ciphertext() {
+                assignments
+                    .push("upstream_api_key_ciphertext = ")
+                    .push_bind_unseparated(ciphertext.expose());
+            }
+            if let Some(status) = update.status() {
+                assignments
+                    .push("status = ")
+                    .push_bind_unseparated(status_value(status));
+            }
+        }
+        builder.push(" WHERE id = ").push_bind(id.get());
+        builder.push(
+            " RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+                      gateway_key_id, gateway_api_key_hash, status, created_at",
+        );
+        builder
+            .build_query_as::<ProviderRow>()
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_write_error)?
+            .ok_or(RepositoryError::NotFound)?
+            .into_provider()
     }
 
     async fn rotate_gateway_key(

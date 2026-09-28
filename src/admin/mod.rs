@@ -763,6 +763,7 @@ fn provider_error(error: ProviderServiceError) -> Response<ApiBody> {
             "provider_in_use",
             "Provider is referenced by request logs.",
         ),
+        ProviderServiceError::NoFieldsToUpdate => invalid_input("No provider field was supplied."),
         ProviderServiceError::Credential
         | ProviderServiceError::Cipher
         | ProviderServiceError::Storage => internal_error(),

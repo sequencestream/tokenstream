@@ -124,37 +124,73 @@ impl NewProvider {
     }
 }
 
-#[derive(Clone, Debug)]
+/// A field-scoped provider change set.
+///
+/// Only the named fields are written. Every unnamed column keeps the value it
+/// currently holds in the database, so an edit can never restore a rotated
+/// gateway key, revoke a status transition it did not name, or reset an
+/// unchanged configuration field. A change set with no named field matches
+/// nothing and is rejected by the caller before it reaches storage.
+#[derive(Clone, Debug, Default)]
 pub struct ProviderUpdate {
-    name: String,
-    protocol_type: ProtocolType,
-    endpoint: Url,
-    upstream_api_key_ciphertext: SecretCiphertext,
-    gateway_key_id: GatewayKeyId,
-    gateway_api_key_hash: PasswordHash,
-    status: ProviderStatus,
+    name: Option<String>,
+    endpoint: Option<Url>,
+    upstream_api_key_ciphertext: Option<SecretCiphertext>,
+    status: Option<ProviderStatus>,
 }
 
 impl ProviderUpdate {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        name: String,
-        protocol_type: ProtocolType,
-        endpoint: Url,
-        upstream_api_key_ciphertext: SecretCiphertext,
-        gateway_key_id: GatewayKeyId,
-        gateway_api_key_hash: PasswordHash,
-        status: ProviderStatus,
-    ) -> Self {
-        Self {
-            name,
-            protocol_type,
-            endpoint,
-            upstream_api_key_ciphertext,
-            gateway_key_id,
-            gateway_api_key_hash,
-            status,
-        }
+    /// Starts an empty change set that names no field.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Names the display name as a field to write.
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    /// Names the upstream endpoint as a field to write.
+    pub fn with_endpoint(mut self, endpoint: Url) -> Self {
+        self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// Names the encrypted upstream credential as a field to write.
+    pub fn with_upstream_api_key_ciphertext(mut self, ciphertext: SecretCiphertext) -> Self {
+        self.upstream_api_key_ciphertext = Some(ciphertext);
+        self
+    }
+
+    /// Names the status as a field to write.
+    pub fn with_status(mut self, status: ProviderStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Reports whether the change set names no field at all.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.endpoint.is_none()
+            && self.upstream_api_key_ciphertext.is_none()
+            && self.status.is_none()
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn endpoint(&self) -> Option<&Url> {
+        self.endpoint.as_ref()
+    }
+
+    pub fn upstream_api_key_ciphertext(&self) -> Option<&SecretCiphertext> {
+        self.upstream_api_key_ciphertext.as_ref()
+    }
+
+    pub fn status(&self) -> Option<ProviderStatus> {
+        self.status
     }
 }
 
@@ -443,6 +479,8 @@ pub enum RepositoryError {
     Conflict,
     ProviderInUse,
     NotFound,
+    /// A partial update named no writable field, so no statement was issued.
+    NoFieldsToUpdate,
     InvalidStoredData,
     Storage,
 }
@@ -453,6 +491,7 @@ impl fmt::Display for RepositoryError {
             Self::Conflict => "record conflicts with existing data",
             Self::ProviderInUse => "provider is referenced by request logs",
             Self::NotFound => "referenced record was not found",
+            Self::NoFieldsToUpdate => "the change set named no writable field",
             Self::InvalidStoredData => "stored data is invalid",
             Self::Storage => "storage operation failed",
         };
