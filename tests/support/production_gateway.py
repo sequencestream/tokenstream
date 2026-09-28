@@ -83,6 +83,24 @@ class Upstream(http.server.BaseHTTPRequestHandler):
         records.append((self.path, dict(self.headers), b''))
         if self.headers.get('x-test-mode') == 'slow-head':
             time.sleep(.6)
+        if self.headers.get('x-test-mode') == 'reject-handshake':
+            # A refused upgrade carries a body of its own, sent in a separate
+            # write after the head. A gateway that only relays what fits in one
+            # read hands the client a truncated explanation.
+            self.send_response(400)
+            self.send_header('content-type', 'text/plain')
+            self.send_header('transfer-encoding', 'chunked')
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(.2)
+            for chunk in [b'chunk-%d\n' % index for index in range(8)]:
+                self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                self.wfile.flush()
+                time.sleep(.01)
+            self.wfile.write(b'0\r\n\r\n')
+            self.wfile.flush()
+            self.close_connection = True
+            return
         key = self.headers['Sec-WebSocket-Key']
         accept = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
         self.send_response(101)
@@ -328,6 +346,45 @@ def stored_key_recovery(directory, plain):
     print('passed stored upstream key recovery across a process restart')
 
 
+def refused_handshake_body(data_port, credential):
+    """A refused upgrade relays its whole body through the production entry.
+
+    The head and the body arrive in separate writes, so a gateway that relays
+    only what one read already holds would close the exchange early. The
+    response is read as raw bytes for that reason.
+    """
+    sock = socket.create_connection(('127.0.0.1', data_port), timeout=5)
+    sock.sendall((
+        'GET /v1/responses HTTP/1.1\r\nHost: localhost\r\n'
+        f'Authorization: Bearer {credential}\r\n'
+        'Connection: Upgrade\r\nUpgrade: websocket\r\n'
+        'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+        'X-Test-Mode: reject-handshake\r\n\r\n'
+    ).encode())
+    stream = sock.makefile('rb')
+    chunks = [b'chunk-%d\n' % index for index in range(8)]
+    expected = b''.join(b'%x\r\n%s\r\n' % (len(chunk), chunk) for chunk in chunks) + b'0\r\n\r\n'
+    received = b''
+    head_end = -1
+    deadline = time.monotonic() + 5
+    while True:
+        position = received.find(b'\r\n\r\n')
+        if position != -1:
+            head_end = position + 4
+            if len(received) >= head_end + len(expected) or time.monotonic() > deadline:
+                break
+        piece = stream.read1(4096)
+        if not piece:
+            break
+        received += piece
+    assert received.startswith(b'HTTP/1.1 400'), received[:120]
+    assert received[head_end:head_end + len(expected)] == expected, 'the refused handshake body must be relayed in full'
+    assert credential.encode() not in received, 'a refused handshake must not carry a credential'
+    stream.close()
+    sock.close()
+    print('passed refused handshake body relay through the production entry')
+
+
 def run_case(directory, trusted, untrusted, plain, development, capacity=None):
 
     global records
@@ -380,6 +437,8 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
             runtime_bounds(data_port, admin_port, openai, auth, capacity, opened, provider)
             print('passed runtime resource bounds', capacity)
             return
+        if development:
+            refused_handshake_body(data_port, openai)
         for path, key, native in [('/v1/chat/completions', openai, 'authorization'), ('/v1/responses', openai, 'authorization'), ('/v1/messages', anthropic, 'x-api-key')]:
             for mode in ['ordinary', 'sse', 'error']:
                 request_headers = {native: f'Bearer {key}' if native == 'authorization' else key, 'x-test-mode': mode, 'x-forwarded-for': 'forged'}
@@ -449,8 +508,10 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
         assert 'upstream-secret' not in str(rows) and 'private=' not in str(rows)
         if development:
             websocket_rows = [row for row in rows if row[1] == 'websocket']
-            assert len(websocket_rows) == 2
+            # Three: the refused upgrade above plus the closed and the held session.
+            assert len(websocket_rows) == 3
             assert sum(row[3] is None for row in websocket_rows) == 1, 'forced shutdown must not invent completion'
+            assert sum(row[3] is not None for row in websocket_rows) == 2
             assert any(row[4] == 'downstream_cancelled' for row in rows if row[1] == 'http')
 
         print('passed', 'development HTTP/WebSocket/shutdown' if development else 'production HTTPS/SSE/certificate validation')

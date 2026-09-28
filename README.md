@@ -74,7 +74,7 @@ TOKENSTREAM_ADMIN_STATIC_ROOT=dist ../target/release/tokenstream
 
 ## Release verification
 
-`scripts/release-gate.sh` runs the full release gate: formatting and strict static analysis, the unit, repository, protocol, and security suites, a fast component load profile, a sustained mixed load profile measured against a real gateway process, the administration frontend checks and production build, the pinned client suite, and the pinned clients driven through a real gateway process. The gate provisions an ephemeral PostgreSQL server when one is not supplied through `TOKENSTREAM_TEST_POSTGRES_URL`, and fails rather than skipping when no server is available.
+`scripts/release-gate.sh` runs the full release gate: formatting and strict static analysis, the unit, repository, protocol, and security suites, a fast component load profile, a sustained mixed load profile measured against a real gateway process, the administration frontend checks and production build, the pinned client suite, and the pinned clients driven through a real gateway process. The gate provisions an ephemeral PostgreSQL server when one is not supplied through `TOKENSTREAM_TEST_POSTGRES_URL`, and fails rather than skipping when no server is available. A supplied server that is not reachable is a gate failure, not a reason to record the dual-backend layers as unexecuted, and the storage layers themselves report a missing server as a failure rather than skipping.
 
 The real-process stages start the compiled binary, configure providers through the administration API, and measure the gateway's own resource use:
 
