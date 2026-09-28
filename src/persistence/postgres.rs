@@ -1,4 +1,5 @@
 use std::io;
+use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -6,11 +7,12 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use crate::MigrationRunner;
 use crate::domain::{GatewayKeyId, Provider, ProviderId};
 
+use super::time::to_epoch_micros;
 use super::{
-    NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
-    ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
-    RequestLogRepository, RequestLogRow, RequestLogStarted, protocol_value, status_value,
-    transport_value,
+    DEFAULT_POOL_ACQUIRE_TIMEOUT, NewProvider, ProviderListRequest, ProviderPage,
+    ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted,
+    RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted,
+    protocol_value, status_value, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -22,8 +24,26 @@ pub struct PostgresDatabase {
 
 impl PostgresDatabase {
     pub async fn connect(database_url: &str, max_connections: usize) -> Result<Self, sqlx::Error> {
+        Self::connect_with_acquire_timeout(
+            database_url,
+            max_connections,
+            DEFAULT_POOL_ACQUIRE_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Connects with an explicit pooled-connection count and acquisition deadline.
+    ///
+    /// The connection count is a hard upper bound; the deadline bounds how long a
+    /// caller waits when every connection is busy before failing closed.
+    pub async fn connect_with_acquire_timeout(
+        database_url: &str,
+        max_connections: usize,
+        acquire_timeout: Duration,
+    ) -> Result<Self, sqlx::Error> {
         let pool = PgPoolOptions::new()
             .max_connections(max_connections as u32)
+            .acquire_timeout(acquire_timeout)
             .connect(database_url)
             .await?;
         Ok(Self { pool })
@@ -105,7 +125,7 @@ impl ProviderRepository for PostgresDatabase {
         .bind(provider.gateway_key_id.as_str())
         .bind(provider.gateway_api_key_hash.expose())
         .bind(status_value(provider.status))
-        .bind(provider.created_at.timestamp_micros())
+        .bind(to_epoch_micros(provider.created_at))
         .fetch_one(&self.pool)
         .await
         .map_err(map_write_error)?
@@ -176,7 +196,7 @@ impl RequestLogRepository for PostgresDatabase {
         .bind(protocol_value(event.protocol_type))
         .bind(transport_value(event.transport_type))
         .bind(event.path)
-        .bind(event.start_time.timestamp_micros())
+        .bind(to_epoch_micros(event.start_time))
         .execute(&self.pool)
         .await
         .map_err(map_write_error)?;
@@ -190,7 +210,7 @@ impl RequestLogRepository for PostgresDatabase {
              WHERE request_id = $4 AND end_time IS NULL",
         )
         .bind(event.status_code.map(i64::from))
-        .bind(event.end_time.timestamp_micros())
+        .bind(to_epoch_micros(event.end_time))
         .bind(event.error_msg)
         .bind(event.request_id.as_str())
         .execute(&self.pool)
@@ -220,12 +240,12 @@ impl RequestLogRepository for PostgresDatabase {
         if let Some(start_time) = query.start_time_gte() {
             statement
                 .push(" AND start_time >= ")
-                .push_bind(start_time.timestamp_micros());
+                .push_bind(to_epoch_micros(start_time));
         }
         if let Some(start_time) = query.start_time_lt() {
             statement
                 .push(" AND start_time < ")
-                .push_bind(start_time.timestamp_micros());
+                .push_bind(to_epoch_micros(start_time));
         }
         statement.push(" ORDER BY id ASC LIMIT ").push_bind(
             i64::try_from(query.limit() + 1).expect("bounded request log page size fits in i64"),
