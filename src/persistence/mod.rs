@@ -226,6 +226,30 @@ impl RequestLogStarted {
             start_time,
         }
     }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    pub fn protocol_type(&self) -> ProtocolType {
+        self.protocol_type
+    }
+
+    pub fn transport_type(&self) -> TransportType {
+        self.transport_type
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn start_time(&self) -> DateTime<Utc> {
+        self.start_time
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -249,6 +273,22 @@ impl RequestLogCompleted {
             end_time,
             error_msg,
         }
+    }
+
+    pub fn request_id(&self) -> &RequestId {
+        &self.request_id
+    }
+
+    pub fn status_code(&self) -> Option<u16> {
+        self.status_code
+    }
+
+    pub fn end_time(&self) -> DateTime<Utc> {
+        self.end_time
+    }
+
+    pub fn error_msg(&self) -> Option<&str> {
+        self.error_msg.as_deref()
     }
 }
 

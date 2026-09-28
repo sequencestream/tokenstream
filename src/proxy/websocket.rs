@@ -33,7 +33,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use url::Url;
 
 use crate::config::Config;
-use crate::domain::ProviderSnapshot;
+use crate::domain::{ProviderSnapshot, RequestId};
+use crate::logging::{LogSink, RequestLogLifecycle};
 use crate::proxy::admission::ProxyLimits;
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
@@ -202,6 +203,53 @@ impl WebSocketProxy {
             response,
             relay: Some(relay),
         })
+    }
+
+    /// Performs the handshake while emitting start and completion metadata to
+    /// the non-blocking logger. Successful upgrades complete when the relay
+    /// closes; rejected handshakes complete as ordinary upstream HTTP results.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn handshake_logged(
+        &self,
+        snapshot: &ProviderSnapshot,
+        route: &ResolvedRoute,
+        query: Option<&str>,
+        downstream_peer: SocketAddr,
+        request: &mut Request<Incoming>,
+        log_sink: LogSink,
+        request_id: RequestId,
+    ) -> Result<Handshake, GatewayError> {
+        let mut lifecycle = RequestLogLifecycle::start(log_sink, request_id, snapshot, route);
+        let handshake = match self
+            .handshake(snapshot, route, query, downstream_peer, request)
+            .await
+        {
+            Ok(handshake) => handshake,
+            Err(error) => {
+                lifecycle.complete(None, Some(error.code()));
+                return Err(error);
+            }
+        };
+        let (response, relay) = handshake.into_parts();
+        let status = response.status();
+        let relay = match relay {
+            None => {
+                lifecycle.complete(Some(status), None);
+                None
+            }
+            Some(relay) => Some(tokio::spawn(async move {
+                let outcome = relay.await.unwrap_or(RelayOutcome::Failed);
+                let error = match outcome {
+                    RelayOutcome::Closed => None,
+                    RelayOutcome::MessageTooLarge => Some("message_too_large"),
+                    RelayOutcome::IdleTimeout => Some("idle_timeout"),
+                    RelayOutcome::Failed => Some("relay_failed"),
+                };
+                lifecycle.complete(Some(status), error);
+                outcome
+            })),
+        };
+        Ok(Handshake { response, relay })
     }
 }
 

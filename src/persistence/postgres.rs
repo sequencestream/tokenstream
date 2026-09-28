@@ -6,6 +6,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::MigrationRunner;
 use crate::domain::{GatewayKeyId, PasswordHash, Provider, ProviderId};
+use crate::logging::LogEvent;
 
 use super::time::to_epoch_micros;
 use super::{
@@ -55,6 +56,46 @@ impl PostgresDatabase {
 
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
         MIGRATOR.run(&self.pool).await
+    }
+
+    /// Persists one logger batch atomically so retry never observes a partial batch.
+    pub(crate) async fn write_log_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+        let mut transaction = self.pool.begin().await.map_err(map_storage_error)?;
+        for event in events {
+            match event {
+                LogEvent::Started(event) => {
+                    sqlx::query(
+                        "INSERT INTO request_log (
+                             request_id, provider_id, protocol_type, transport_type, path, start_time
+                         ) VALUES ($1, $2, $3, $4, $5, $6)",
+                    )
+                    .bind(event.request_id().as_str())
+                    .bind(event.provider_id().get())
+                    .bind(protocol_value(event.protocol_type()))
+                    .bind(transport_value(event.transport_type()))
+                    .bind(event.path())
+                    .bind(to_epoch_micros(event.start_time()))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(map_write_error)?;
+                }
+                LogEvent::Completed(event) => {
+                    sqlx::query(
+                        "UPDATE request_log
+                         SET status_code = $1, end_time = $2, error_msg = $3
+                         WHERE request_id = $4 AND end_time IS NULL",
+                    )
+                    .bind(event.status_code().map(i64::from))
+                    .bind(to_epoch_micros(event.end_time()))
+                    .bind(event.error_msg())
+                    .bind(event.request_id().as_str())
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(map_storage_error)?;
+                }
+            }
+        }
+        transaction.commit().await.map_err(map_storage_error)
     }
 }
 

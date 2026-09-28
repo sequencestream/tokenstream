@@ -23,6 +23,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod domain;
+pub mod logging;
 pub mod persistence;
 pub mod providers;
 pub mod proxy;

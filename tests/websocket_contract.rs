@@ -18,6 +18,8 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, RequestId, SecretString};
+use tokenstream::logging::{LogEvent, LogStore, channel};
+use tokenstream::persistence::RepositoryError;
 use tokenstream::proxy::admission::ProxyLimits;
 use tokenstream::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use tokenstream::proxy::http::HttpProxy;
@@ -26,7 +28,7 @@ use tokenstream::proxy::websocket::{RelayOutcome, relay};
 use tokenstream::routing::resolve_route;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
@@ -37,6 +39,18 @@ use tokio_tungstenite::{
 use url::Url;
 
 type Socket = WebSocketStream<DuplexStream>;
+
+#[derive(Default)]
+struct RecordingLogStore {
+    events: Mutex<Vec<LogEvent>>,
+}
+
+impl LogStore for RecordingLogStore {
+    async fn write_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+        self.events.lock().await.extend_from_slice(events);
+        Ok(())
+    }
+}
 
 async fn socket_pair(server_config: WebSocketConfig) -> (Socket, Socket) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
@@ -232,11 +246,12 @@ async fn an_upstream_http_rejection_remains_an_ordinary_http_response() {
             "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/problem+json\r\nx-upstream-error: retained\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
             body.len()
         );
+        let mut response = response.into_bytes();
+        response.extend_from_slice(body);
         stream
-            .write_all(response.as_bytes())
+            .write_all(&response)
             .await
-            .expect("write head");
-        stream.write_all(body).await.expect("write body");
+            .expect("write rejection response");
         stream.shutdown().await.expect("close upstream");
     });
     let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
@@ -355,6 +370,10 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
         Duration::from_secs(1),
     ));
     let sequence = Arc::new(AtomicUsize::new(0));
+    let log_store = Arc::new(RecordingLogStore::default());
+    let (log_sink, log_worker) = channel(Arc::clone(&log_store), 8, 4, Duration::from_millis(20));
+    let log_worker = tokio::spawn(log_worker.run());
+    let gateway_log_sink = log_sink.clone();
     let gateway = tokio::spawn(async move {
         let mut connections = Vec::new();
         for _ in 0..2 {
@@ -366,15 +385,18 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
             let websocket_proxy = Arc::clone(&websocket_proxy);
             let http_proxy = Arc::clone(&http_proxy);
             let sequence = Arc::clone(&sequence);
+            let log_sink = gateway_log_sink.clone();
             connections.push(tokio::spawn(async move {
                 let service = service_fn(move |mut request: Request<Incoming>| {
                     let snapshot = Arc::clone(&snapshot);
                     let websocket_proxy = Arc::clone(&websocket_proxy);
                     let http_proxy = Arc::clone(&http_proxy);
                     let sequence = Arc::clone(&sequence);
+                    let log_sink = log_sink.clone();
                     async move {
                         let number = sequence.fetch_add(1, Ordering::SeqCst) + 1;
-                        let request_id = format!("request-{number}");
+                        let request_id =
+                            RequestId::new(format!("request-{number}")).expect("request ID");
                         let route = resolve_route(
                             snapshot.protocol_type(),
                             request.method(),
@@ -385,16 +407,32 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                         let query = request.uri().query().map(str::to_owned);
                         let mut response = if request.method() == Method::GET {
                             let handshake = websocket_proxy
-                                .handshake(&snapshot, &route, query.as_deref(), peer, &mut request)
+                                .handshake_logged(
+                                    &snapshot,
+                                    &route,
+                                    query.as_deref(),
+                                    peer,
+                                    &mut request,
+                                    log_sink,
+                                    request_id.clone(),
+                                )
                                 .await
                                 .expect("upstream returns an HTTP rejection");
                             boxed_full(handshake.into_response())
                         } else {
-                            let upstream = http_proxy
-                                .forward(&snapshot, &route, query.as_deref(), peer, request)
+                            let response = http_proxy
+                                .forward_logged(
+                                    &snapshot,
+                                    &route,
+                                    query.as_deref(),
+                                    peer,
+                                    request,
+                                    log_sink,
+                                    request_id.clone(),
+                                )
                                 .await
                                 .expect("forward HTTP fallback");
-                            let (parts, body) = http_proxy.relay_response(upstream).into_parts();
+                            let (parts, body) = response.into_parts();
                             Response::from_parts(
                                 parts,
                                 body.map_err(io::Error::other).boxed_unsync(),
@@ -402,7 +440,7 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                         };
                         response.headers_mut().insert(
                             "x-request-id",
-                            request_id.parse().expect("request ID header"),
+                            request_id.as_str().parse().expect("request ID header"),
                         );
                         Ok::<_, Infallible>(response)
                     }
@@ -462,6 +500,43 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
 
     upstream.await.expect("upstream task");
     gateway.await.expect("gateway task");
+    drop(log_sink);
+    log_worker.await.expect("log worker");
+
+    let events = log_store.events.lock().await;
+    assert_eq!(events.len(), 4);
+    let LogEvent::Started(websocket_start) = &events[0] else {
+        panic!("WebSocket start must be first");
+    };
+    let LogEvent::Completed(websocket_end) = &events[1] else {
+        panic!("WebSocket completion must follow its start");
+    };
+    let LogEvent::Started(http_start) = &events[2] else {
+        panic!("HTTP start must be independent");
+    };
+    let LogEvent::Completed(http_end) = &events[3] else {
+        panic!("HTTP completion must follow its start");
+    };
+    assert_eq!(websocket_start.request_id().as_str(), "request-1");
+    assert_eq!(
+        websocket_start.transport_type(),
+        tokenstream::domain::TransportType::WebSocket
+    );
+    assert_eq!(websocket_start.path(), "/v1/responses");
+    assert_eq!(websocket_end.request_id().as_str(), "request-1");
+    assert_eq!(websocket_end.status_code(), Some(503));
+    assert_eq!(http_start.request_id().as_str(), "request-2");
+    assert_eq!(
+        http_start.transport_type(),
+        tokenstream::domain::TransportType::Http
+    );
+    assert_eq!(http_start.path(), "/v1/responses");
+    assert_eq!(http_end.request_id().as_str(), "request-2");
+    assert_eq!(http_end.status_code(), Some(200));
+    assert_ne!(
+        websocket_start.request_id().as_str(),
+        http_start.request_id().as_str()
+    );
 }
 
 #[tokio::test]
