@@ -173,3 +173,27 @@ async fn every_admitted_request_returns_its_slot() -> io::Result<()> {
     server.await.expect("server task completes")?;
     Ok(())
 }
+
+#[tokio::test]
+async fn cancelling_an_admitted_task_returns_its_slot() {
+    let control = admission(1);
+    let task_control = control.clone();
+    let (held_tx, held_rx) = oneshot::channel();
+
+    let task = tokio::spawn(async move {
+        let _permit = task_control.try_admit().expect("the only slot");
+        held_tx.send(()).expect("the test is waiting");
+        std::future::pending::<()>().await;
+    });
+    held_rx.await.expect("the permit is held");
+    assert_eq!(control.in_flight(), 1);
+
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("the task is cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(control.in_flight(), 0);
+    assert_eq!(control.available(), 1);
+}

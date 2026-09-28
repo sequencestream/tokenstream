@@ -7,11 +7,12 @@
 //! the request target and the envelope headers are rebuilt, and only from the
 //! validated route, the immutable snapshot, and the direct downstream peer.
 //!
-//! Two deadlines bound the boundary. The transport enforces a connect timeout,
-//! and the exchange is wrapped in a response-header timeout. A refused or
-//! failed connection becomes a sanitized upstream-connection failure and either
-//! deadline becomes a sanitized upstream timeout. Because no upstream response
-//! has been received at that point, a local error can still be sent downstream.
+//! Three deadlines bound the boundary. The transport enforces a connect
+//! timeout, the exchange is wrapped in a response-header timeout, and request
+//! and response bodies enforce a per-frame idle timeout. A refused or failed
+//! connection becomes a sanitized upstream-connection failure and any deadline
+//! becomes a sanitized upstream timeout. Before response headers arrive a local
+//! error can still be sent downstream; afterward the body stream is terminated.
 //!
 //! The response travels back the same way through [`relay_response`]: its status
 //! and allowed end-to-end headers are forwarded immediately and its body stays a
@@ -19,16 +20,19 @@
 //! instead of accumulating in the gateway.
 
 use std::error::Error as StdError;
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use hyper::body::{Body, Incoming};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use tokio::time::timeout;
+use tokio::time::{Instant, Sleep, timeout};
 
 use crate::config::Config;
 use crate::domain::ProviderSnapshot;
@@ -43,25 +47,33 @@ use crate::routing::{ResolvedRoute, build_upstream_uri};
 /// pools transport connections but holds no credential: every call re-reads the
 /// request-local snapshot it is handed.
 pub struct HttpProxy<B> {
-    client: Client<HttpConnector, B>,
+    client: Client<HttpConnector, IdleTimeoutBody<B>>,
     header_timeout: Duration,
+    idle_timeout: Duration,
 }
 
 impl<B> HttpProxy<B>
 where
-    B: Body + Send + 'static + Unpin,
-    B::Data: Send,
+    B: Body<Data = bytes::Bytes> + Send + 'static + Unpin,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    /// Builds a proxy with explicit connect and response-header deadlines.
-    pub fn new(connect_timeout: Duration, header_timeout: Duration) -> Self {
+    /// Builds a proxy with explicit connect, response-header, and stream-idle
+    /// deadlines.
+    pub fn new(
+        connect_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_nodelay(true);
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let mut builder = Client::builder(TokioExecutor::new());
+        builder.retry_canceled_requests(false);
+        let client = builder.build(connector);
         Self {
             client,
             header_timeout,
+            idle_timeout,
         }
     }
 
@@ -70,6 +82,7 @@ where
         Self::new(
             config.upstream_connect_timeout(),
             config.upstream_header_timeout(),
+            config.stream_idle_timeout(),
         )
     }
 
@@ -100,7 +113,7 @@ where
         let mut upstream = Request::builder()
             .method(parts.method)
             .uri(uri)
-            .body(body)
+            .body(IdleTimeoutBody::new(body, self.idle_timeout))
             .map_err(|_| GatewayError::InternalError)?;
         *upstream.headers_mut() = headers;
 
@@ -109,6 +122,21 @@ where
             Ok(Err(error)) => Err(classify(&error)),
             Ok(Ok(response)) => Ok(response),
         }
+    }
+
+    /// Converts a received upstream response into the downstream streaming
+    /// response governed by this proxy's idle deadline.
+    ///
+    /// The upstream status and headers have already arrived, so later body
+    /// failures cannot be replaced with a gateway error envelope. Instead the
+    /// response stream terminates with a sanitized [`HttpBodyError`]. Dropping
+    /// the returned response drops the upstream body immediately, which makes
+    /// downstream cancellation cancel the associated upstream transfer.
+    pub fn relay_response(
+        &self,
+        upstream: Response<Incoming>,
+    ) -> Response<IdleTimeoutBody<Incoming>> {
+        relay_response(upstream, self.idle_timeout)
     }
 }
 
@@ -124,10 +152,13 @@ where
 /// Nothing here reads the content type, the body, or any application field, so
 /// an SSE stream, a JSON document that happens to mention `stream`, and an
 /// upstream error body all relay identically.
-pub fn relay_response(upstream: Response<Incoming>) -> Response<Incoming> {
+pub fn relay_response(
+    upstream: Response<Incoming>,
+    idle_timeout: Duration,
+) -> Response<IdleTimeoutBody<Incoming>> {
     let (mut parts, body) = upstream.into_parts();
     parts.headers = build_downstream_response_headers(&parts.headers);
-    Response::from_parts(parts, body)
+    Response::from_parts(parts, IdleTimeoutBody::new(body, idle_timeout))
 }
 
 impl<B> std::fmt::Debug for HttpProxy<B> {
@@ -135,7 +166,115 @@ impl<B> std::fmt::Debug for HttpProxy<B> {
         formatter
             .debug_struct("HttpProxy")
             .field("header_timeout", &self.header_timeout)
+            .field("idle_timeout", &self.idle_timeout)
             .finish_non_exhaustive()
+    }
+}
+
+/// A sanitized failure emitted after downstream response headers have started.
+///
+/// The error intentionally exposes neither a transport error string nor any
+/// upstream data. At this point HTTP permits only terminating the body stream;
+/// callers must not synthesize a second response or retry the request.
+#[derive(Debug)]
+pub enum HttpBodyError {
+    /// The HTTP body ended with a transport or framing failure.
+    Stream,
+    /// No HTTP body frame arrived within the configured idle interval.
+    IdleTimeout,
+}
+
+impl HttpBodyError {
+    /// Reports whether the body was terminated by the stream-idle deadline.
+    pub fn is_idle_timeout(&self) -> bool {
+        matches!(self, Self::IdleTimeout)
+    }
+}
+
+impl fmt::Display for HttpBodyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stream => "the HTTP body stream failed",
+            Self::IdleTimeout => "the HTTP body stream timed out",
+        })
+    }
+}
+
+impl StdError for HttpBodyError {}
+
+/// An upstream body that enforces an idle deadline without a background task.
+///
+/// The timer advances only while the downstream is polling for the next frame.
+/// This preserves backpressure: a slow downstream does not cause the gateway to
+/// read ahead merely to keep a timer alive. Every received frame resets the
+/// deadline. EOF passes through normally; an abnormal EOF is a sanitized body
+/// error. Dropping this value drops the upstream body and its transfer state.
+#[derive(Debug)]
+pub struct IdleTimeoutBody<B> {
+    inner: B,
+    idle_timeout: Duration,
+    deadline: Pin<Box<Sleep>>,
+    finished: bool,
+}
+
+impl<B> IdleTimeoutBody<B> {
+    fn new(inner: B, idle_timeout: Duration) -> Self {
+        Self {
+            inner,
+            idle_timeout,
+            deadline: Box::pin(tokio::time::sleep(idle_timeout)),
+            finished: false,
+        }
+    }
+}
+
+impl<B> Body for IdleTimeoutBody<B>
+where
+    B: Body<Data = bytes::Bytes> + Unpin,
+{
+    type Data = bytes::Bytes;
+    type Error = HttpBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.finished {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut this.inner).poll_frame(context) {
+            Poll::Ready(Some(Ok(frame))) => {
+                this.deadline
+                    .as_mut()
+                    .reset(Instant::now() + this.idle_timeout);
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(_error))) => {
+                this.finished = true;
+                Poll::Ready(Some(Err(HttpBodyError::Stream)))
+            }
+            Poll::Ready(None) => {
+                this.finished = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => match this.deadline.as_mut().poll(context) {
+                Poll::Ready(()) => {
+                    this.finished = true;
+                    Poll::Ready(Some(Err(HttpBodyError::IdleTimeout)))
+                }
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finished || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -157,6 +296,11 @@ fn is_timeout(error: &(dyn StdError + 'static)) -> bool {
     while let Some(source) = current {
         if let Some(io) = source.downcast_ref::<io::Error>()
             && io.kind() == io::ErrorKind::TimedOut
+        {
+            return true;
+        }
+        if let Some(body) = source.downcast_ref::<HttpBodyError>()
+            && body.is_idle_timeout()
         {
             return true;
         }

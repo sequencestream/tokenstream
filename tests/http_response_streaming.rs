@@ -21,7 +21,7 @@ use hyper::body::{Body, Incoming};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, Response, StatusCode};
 use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
-use tokenstream::proxy::http::{HttpProxy, relay_response};
+use tokenstream::proxy::http::{HttpProxy, IdleTimeoutBody, relay_response};
 use tokenstream::routing::{ResolvedRoute, resolve_route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -41,6 +41,8 @@ enum Command {
     Chunk(Bytes),
     /// Terminate the body and close the connection.
     Finish,
+    /// Close the transport without a complete chunked-body terminator.
+    Abort,
 }
 
 /// A mock upstream whose response the test releases one step at a time.
@@ -48,6 +50,7 @@ struct ScriptedUpstream {
     address: SocketAddr,
     ready: oneshot::Receiver<()>,
     commands: mpsc::UnboundedSender<Command>,
+    closed: oneshot::Receiver<()>,
 }
 
 impl ScriptedUpstream {
@@ -78,6 +81,20 @@ impl ScriptedUpstream {
             .send(Command::Finish)
             .expect("the upstream is still running");
     }
+
+    /// Abruptly closes the response without a valid body terminator.
+    fn abort(&self) {
+        self.commands
+            .send(Command::Abort)
+            .expect("the upstream is still running");
+    }
+
+    /// Waits until the upstream connection has closed.
+    async fn wait_closed(&mut self) {
+        (&mut self.closed)
+            .await
+            .expect("the upstream reports connection closure");
+    }
 }
 
 /// Starts a scripted mock upstream and returns its address and control handle.
@@ -87,6 +104,7 @@ async fn scripted_upstream() -> ScriptedUpstream {
         .expect("bind the mock upstream");
     let address = listener.local_addr().expect("mock upstream address");
     let (ready_tx, ready) = oneshot::channel();
+    let (closed_tx, closed) = oneshot::channel();
     let (commands, mut receiver) = mpsc::unbounded_channel();
 
     tokio::spawn(async move {
@@ -95,7 +113,25 @@ async fn scripted_upstream() -> ScriptedUpstream {
         let _ = read_request_body(&mut stream, &head, body).await;
         let _ = ready_tx.send(());
 
-        while let Some(command) = receiver.recv().await {
+        loop {
+            let command = tokio::select! {
+                command = receiver.recv() => command,
+                readiness = stream.readable() => {
+                    if readiness.is_err() {
+                        break;
+                    }
+                    let mut probe = [0u8; 1];
+                    match stream.try_read(&mut probe) {
+                        Ok(0) => break,
+                        Ok(_) => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(_) => break,
+                    }
+                }
+            };
+            let Some(command) = command else {
+                break;
+            };
             let result = match command {
                 Command::Head { status, headers } => {
                     let mut head = format!("HTTP/1.1 {status}\r\n");
@@ -124,6 +160,7 @@ async fn scripted_upstream() -> ScriptedUpstream {
                     let _ = stream.write_all(b"0\r\n\r\n").await;
                     break;
                 }
+                Command::Abort => break,
             };
             if result.is_err() {
                 break;
@@ -131,12 +168,14 @@ async fn scripted_upstream() -> ScriptedUpstream {
             let _ = stream.flush().await;
         }
         let _ = stream.shutdown().await;
+        let _ = closed_tx.send(());
     });
 
     ScriptedUpstream {
         address,
         ready,
         commands,
+        closed,
     }
 }
 
@@ -308,11 +347,18 @@ fn downstream_request() -> Request<Full<Bytes>> {
 }
 
 fn proxy() -> HttpProxy<Full<Bytes>> {
-    HttpProxy::new(Duration::from_secs(5), Duration::from_secs(5))
+    HttpProxy::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
 }
 
 /// Sends one request and returns the relayed downstream response.
-async fn relay(upstream: &mut Upstream, proxy: HttpProxy<Full<Bytes>>) -> Response<Incoming> {
+async fn relay(
+    upstream: &mut Upstream,
+    proxy: HttpProxy<Full<Bytes>>,
+) -> Response<IdleTimeoutBody<Incoming>> {
     let snapshot = snapshot(upstream.address());
     let route = responses_route();
     let forwarding = tokio::spawn(async move {
@@ -326,7 +372,114 @@ async fn relay(upstream: &mut Upstream, proxy: HttpProxy<Full<Bytes>>) -> Respon
             .await
             .expect("join the forwarding task")
             .expect("the upstream answers"),
+        Duration::from_secs(5),
     )
+}
+
+#[tokio::test]
+async fn a_stalled_body_times_out_after_response_headers_have_started() {
+    let mut upstream = scripted_upstream().await;
+    let proxy = HttpProxy::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_millis(80),
+    );
+
+    let snapshot = snapshot(upstream.address);
+    let route = responses_route();
+    let forwarding = tokio::spawn(async move {
+        proxy
+            .forward(&snapshot, &route, None, peer(), downstream_request())
+            .await
+    });
+    upstream.wait_ready().await;
+    upstream.head("200 OK", vec![("content-type", "text/event-stream")]);
+
+    let upstream_response = forwarding
+        .await
+        .expect("join")
+        .expect("the response head arrives");
+    let mut response = relay_response(upstream_response, Duration::from_millis(80));
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let error = tokio::time::timeout(Duration::from_secs(1), response.body_mut().frame())
+        .await
+        .expect("the idle deadline is bounded")
+        .expect("the timeout is a body error")
+        .expect_err("a stalled stream must terminate");
+    assert!(error.is_idle_timeout());
+    assert_eq!(error.to_string(), "the HTTP body stream timed out");
+    assert!(response.body_mut().frame().await.is_none());
+
+    drop(response);
+    upstream.wait_closed().await;
+}
+
+#[tokio::test]
+async fn an_abrupt_upstream_eof_terminates_the_started_stream_without_retry() {
+    let mut upstream = scripted_upstream().await;
+    let proxy = proxy();
+
+    let snapshot = snapshot(upstream.address);
+    let route = responses_route();
+    let forwarding = tokio::spawn(async move {
+        proxy
+            .forward(&snapshot, &route, None, peer(), downstream_request())
+            .await
+    });
+    upstream.wait_ready().await;
+    upstream.head("200 OK", vec![("content-type", "text/event-stream")]);
+    upstream.chunk(Bytes::from_static(b"data: partial\n\n"));
+    upstream.abort();
+
+    let upstream_response = forwarding
+        .await
+        .expect("join")
+        .expect("the response head arrives");
+    let mut response = relay_response(upstream_response, Duration::from_secs(5));
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        next_bytes(response.body_mut()).await,
+        Bytes::from_static(b"data: partial\n\n")
+    );
+
+    let error = response
+        .body_mut()
+        .frame()
+        .await
+        .expect("the abnormal EOF is reported")
+        .expect_err("the incomplete chunked body must fail");
+    assert!(!error.is_idle_timeout());
+    assert_eq!(error.to_string(), "the HTTP body stream failed");
+    assert!(response.body_mut().frame().await.is_none());
+    upstream.wait_closed().await;
+}
+
+#[tokio::test]
+async fn dropping_the_downstream_response_cancels_the_upstream_stream() {
+    let mut upstream = scripted_upstream().await;
+    let proxy = proxy();
+
+    let snapshot = snapshot(upstream.address);
+    let route = responses_route();
+    let forwarding = tokio::spawn(async move {
+        proxy
+            .forward(&snapshot, &route, None, peer(), downstream_request())
+            .await
+    });
+    upstream.wait_ready().await;
+    upstream.head("200 OK", vec![("content-type", "text/event-stream")]);
+
+    let upstream_response = forwarding
+        .await
+        .expect("join")
+        .expect("the response head arrives");
+    let response = relay_response(upstream_response, Duration::from_secs(5));
+    drop(response);
+
+    tokio::time::timeout(Duration::from_secs(1), upstream.wait_closed())
+        .await
+        .expect("downstream cancellation closes the upstream promptly");
 }
 
 /// Collects the next non-empty data frame from a response body.
@@ -395,7 +548,7 @@ async fn an_sse_event_split_across_chunks_is_relayed_incrementally() {
         .await
         .expect("join")
         .expect("the upstream answers");
-    let mut response = relay_response(upstream_response);
+    let mut response = relay_response(upstream_response, Duration::from_secs(5));
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -473,7 +626,7 @@ async fn an_upstream_error_body_is_relayed_unchanged() {
         .await
         .expect("join")
         .expect("the upstream answers");
-    let mut response = relay_response(upstream_response);
+    let mut response = relay_response(upstream_response, Duration::from_secs(5));
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     let headers = response.headers();
@@ -553,7 +706,7 @@ async fn arbitrary_chunking_preserves_the_payload_and_ignores_stream_fields() {
         .await
         .expect("join")
         .expect("the upstream answers");
-    let mut response = relay_response(upstream_response);
+    let mut response = relay_response(upstream_response, Duration::from_secs(5));
 
     assert_eq!(response.status(), StatusCode::OK);
     let received = read_at_least(response.body_mut(), payload.len()).await;

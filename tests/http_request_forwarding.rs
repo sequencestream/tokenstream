@@ -41,6 +41,27 @@ struct Chunks {
     emitted: Arc<AtomicUsize>,
 }
 
+/// A body that sends one frame and then never produces another frame or EOF.
+struct StalledBody {
+    first: Option<Bytes>,
+}
+
+impl Body for StalledBody {
+    type Data = Bytes;
+    type Error = Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        _context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Infallible>>> {
+        let this = self.get_mut();
+        match this.first.take() {
+            Some(first) => Poll::Ready(Some(Ok(Frame::data(first)))),
+            None => Poll::Pending,
+        }
+    }
+}
+
 impl Chunks {
     fn new(frames: Vec<Bytes>, emitted: Arc<AtomicUsize>) -> Self {
         Self {
@@ -244,7 +265,11 @@ async fn the_request_target_and_envelope_reach_the_upstream() {
     })
     .await;
 
-    let proxy = HttpProxy::<Chunks>::new(Duration::from_secs(5), Duration::from_secs(5));
+    let proxy = HttpProxy::<Chunks>::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
     let emitted = Arc::new(AtomicUsize::new(0));
     let body = Bytes::from_static(b"{\"model\":\"unknown-field\",\"stream\":true}");
 
@@ -295,7 +320,11 @@ async fn the_request_target_and_envelope_reach_the_upstream() {
 async fn the_body_is_forwarded_byte_for_byte_across_arbitrary_chunks() {
     let (address, upstream) = mock_upstream(MockUpstream::default()).await;
 
-    let proxy = HttpProxy::<Chunks>::new(Duration::from_secs(5), Duration::from_secs(5));
+    let proxy = HttpProxy::<Chunks>::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
     let emitted = Arc::new(AtomicUsize::new(0));
 
     // The same bytes split into frames of very different sizes, including
@@ -341,6 +370,7 @@ async fn a_slow_upstream_applies_backpressure_to_the_request_body() {
     .await;
 
     let proxy = Arc::new(HttpProxy::<Chunks>::new(
+        Duration::from_secs(5),
         Duration::from_secs(5),
         Duration::from_secs(5),
     ));
@@ -390,7 +420,11 @@ async fn a_slow_upstream_applies_backpressure_to_the_request_body() {
 #[tokio::test]
 async fn a_refused_connection_is_a_sanitized_connect_failure() {
     let address = unused_address().await;
-    let proxy = HttpProxy::<Chunks>::new(Duration::from_secs(2), Duration::from_secs(5));
+    let proxy = HttpProxy::<Chunks>::new(
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
     let emitted = Arc::new(AtomicUsize::new(0));
 
     let error = proxy
@@ -416,7 +450,11 @@ async fn a_slow_response_head_is_a_sanitized_upstream_timeout() {
     })
     .await;
 
-    let proxy = HttpProxy::<Chunks>::new(Duration::from_secs(2), Duration::from_millis(150));
+    let proxy = HttpProxy::<Chunks>::new(
+        Duration::from_secs(2),
+        Duration::from_millis(150),
+        Duration::from_secs(5),
+    );
     let emitted = Arc::new(AtomicUsize::new(0));
 
     let error = proxy
@@ -432,4 +470,116 @@ async fn a_slow_response_head_is_a_sanitized_upstream_timeout() {
 
     assert_eq!(error, GatewayError::UpstreamTimeout);
     assert_eq!(error.status(), StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test]
+async fn cancelling_before_response_headers_closes_upstream_without_retrying() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind cancellation upstream");
+    let address = listener.local_addr().expect("upstream address");
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("the first request arrives");
+        let (head, body) = read_request_head(&mut stream).await;
+        let body = read_request_body(&mut stream, &head, body).await;
+        ready_tx.send(()).expect("the test is waiting");
+
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("cancellation closes the upstream promptly")
+            .expect("read cancellation EOF");
+        assert_eq!(read, 0, "the cancelled request must close its transport");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), listener.accept())
+                .await
+                .is_err(),
+            "the gateway must not create a retry request"
+        );
+        body
+    });
+
+    let proxy = Arc::new(HttpProxy::<Chunks>::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    ));
+    let emitted = Arc::new(AtomicUsize::new(0));
+    let forwarding = {
+        let proxy = Arc::clone(&proxy);
+        let snapshot = snapshot(address);
+        let route = responses_route();
+        tokio::spawn(async move {
+            proxy
+                .forward(
+                    &snapshot,
+                    &route,
+                    None,
+                    peer(),
+                    downstream_request(vec![Bytes::from_static(b"{\"cancel\":true}")], emitted),
+                )
+                .await
+        })
+    };
+
+    ready_rx.await.expect("the upstream received the request");
+    forwarding.abort();
+    assert!(
+        forwarding
+            .await
+            .expect_err("the forwarding future is cancelled")
+            .is_cancelled()
+    );
+    assert_eq!(
+        upstream.await.expect("the upstream task completes"),
+        b"{\"cancel\":true}"
+    );
+}
+
+#[tokio::test]
+async fn a_stalled_request_body_hits_the_stream_idle_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind stalled-body upstream");
+    let address = listener.local_addr().expect("upstream address");
+    let upstream = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("the request arrives");
+        let (_head, _body) = read_request_head(&mut stream).await;
+        let mut remaining = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut remaining))
+            .await
+            .expect("the timed-out upload closes promptly")
+            .expect("read upload cancellation");
+        assert!(read < 1024, "a stalled upload must not accumulate data");
+    });
+
+    let proxy = HttpProxy::<StalledBody>::new(
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+        Duration::from_millis(80),
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/responses")
+        .header("authorization", format!("Bearer {GATEWAY_CREDENTIAL}"))
+        .body(StalledBody {
+            first: Some(Bytes::from_static(b"{")),
+        })
+        .expect("valid downstream request");
+
+    let error = proxy
+        .forward(
+            &snapshot(address),
+            &responses_route(),
+            None,
+            peer(),
+            request,
+        )
+        .await
+        .expect_err("the upload remains idle");
+    assert_eq!(error, GatewayError::UpstreamTimeout);
+    upstream.await.expect("the upstream task completes");
 }
