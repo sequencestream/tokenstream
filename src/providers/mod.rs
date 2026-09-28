@@ -16,7 +16,10 @@ use crate::crypto::{GatewaySecretVerifier, SecretCipher};
 use crate::domain::{
     GatewayCredential, ProtocolType, Provider, ProviderId, ProviderStatus, SecretString,
 };
-use crate::persistence::{NewProvider, ProviderRepository, ProviderUpdate, RepositoryError};
+use crate::persistence::{
+    NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderUpdate,
+    RepositoryError,
+};
 
 /// Longest accepted provider name, counted in Unicode scalar values.
 pub const MAX_PROVIDER_NAME_LEN: usize = 128;
@@ -248,6 +251,26 @@ where
     C: SecretCipher,
     V: GatewaySecretVerifier,
 {
+    /// Returns one provider for administration without exposing stored secrets.
+    pub async fn get(&self, id: ProviderId) -> Result<Provider, ProviderServiceError> {
+        self.repository
+            .find_by_id(id)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or(ProviderServiceError::NotFound)
+    }
+
+    /// Lists providers by their increasing database identifier.
+    pub async fn list(
+        &self,
+        request: ProviderListRequest,
+    ) -> Result<ProviderPage, ProviderServiceError> {
+        self.repository
+            .list(request)
+            .await
+            .map_err(map_repository_error)
+    }
+
     /// Builds a service over the given storage and cryptographic collaborators.
     ///
     /// `allow_insecure_endpoints` admits plain-HTTP endpoints and must only be

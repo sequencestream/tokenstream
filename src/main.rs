@@ -1,5 +1,7 @@
 use tokenstream::RejectAll;
+use tokenstream::admin::AdminApi;
 use tokenstream::config::Config;
+use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::persistence::Database;
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::telemetry::Metrics;
@@ -34,12 +36,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.log_batch_interval(),
         metrics.clone(),
     );
-    tokenstream::run_with_logging(
+    let admin_api = AdminApi::new(
+        database.clone(),
+        AesGcmCipher::new(config.master_key().expose()),
+        Argon2GatewaySecretVerifier::new(),
+        config.development_mode(),
+        config.admin_password_hash().expose().to_owned(),
+    );
+    tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),
         config.admin_listen_addr(),
         database,
         RejectAll,
-        RejectAll,
+        admin_api,
         admission,
         metrics,
         tokio::signal::ctrl_c(),

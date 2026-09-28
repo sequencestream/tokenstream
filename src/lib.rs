@@ -20,6 +20,7 @@ use crate::proxy::admission::AdmissionControl;
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use crate::telemetry::{Metrics, ProxyFailureCategory};
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -31,7 +32,7 @@ pub mod proxy;
 pub mod routing;
 pub mod telemetry;
 
-type ResponseBody = Full<Bytes>;
+pub type ResponseBody = Full<Bytes>;
 const MAX_SCAFFOLD_CONNECTIONS_PER_PLANE: usize = 64;
 
 /// Applies all registered schema migrations before either listening socket is bound.
@@ -47,6 +48,26 @@ pub trait DataPlaneAuthenticator: Send + Sync + 'static {
 /// Authenticates requests entering the control-plane route tree.
 pub trait ControlPlaneAuthenticator: Send + Sync + 'static {
     fn authenticate(&self, request: &Request<Incoming>) -> bool;
+}
+
+/// Serves one request on the isolated administration plane.
+pub trait ControlPlaneService: Send + Sync + 'static {
+    fn serve(
+        &self,
+        request: Request<Incoming>,
+        metrics: Metrics,
+    ) -> impl Future<Output = Response<ResponseBody>> + Send;
+}
+
+struct AuthenticatedControl<C>(C);
+
+impl<C> ControlPlaneService for AuthenticatedControl<C>
+where
+    C: ControlPlaneAuthenticator,
+{
+    async fn serve(&self, request: Request<Incoming>, metrics: Metrics) -> Response<ResponseBody> {
+        control_route(request, &self.0, metrics).await
+    }
 }
 
 /// Placeholder migration registry. Database migrations are added by the persistence layer.
@@ -140,14 +161,54 @@ where
     S: Future<Output = io::Result<()>>,
     L: crate::logging::LogStore,
 {
-    let mut worker_task = tokio::spawn(log_worker.run());
-    let flush_metrics = log_sink.metrics().clone();
-    let server_result = run_observed(
+    run_with_control_and_logging(
         data_address,
         control_address,
         migrations,
         data_authenticator,
-        control_authenticator,
+        AuthenticatedControl(control_authenticator),
+        admission,
+        metrics,
+        shutdown,
+        drain_timeout,
+        log_sink,
+        log_worker,
+        log_flush_timeout,
+    )
+    .await
+}
+
+/// Runs both planes with a complete administration service and bounded log shutdown.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_control_and_logging<M, D, C, S, L>(
+    data_address: SocketAddr,
+    control_address: SocketAddr,
+    migrations: M,
+    data_authenticator: D,
+    control_service: C,
+    admission: AdmissionControl,
+    metrics: Metrics,
+    shutdown: S,
+    drain_timeout: Duration,
+    log_sink: crate::logging::LogSink,
+    log_worker: crate::logging::LogWorker<L>,
+    log_flush_timeout: Duration,
+) -> io::Result<BoundPlanes>
+where
+    M: MigrationRunner,
+    D: DataPlaneAuthenticator,
+    C: ControlPlaneService,
+    S: Future<Output = io::Result<()>>,
+    L: crate::logging::LogStore,
+{
+    let mut worker_task = tokio::spawn(log_worker.run());
+    let flush_metrics = log_sink.metrics().clone();
+    let server_result = run_observed_with_control(
+        data_address,
+        control_address,
+        migrations,
+        data_authenticator,
+        control_service,
         admission,
         metrics,
         shutdown,
@@ -187,6 +248,38 @@ where
     C: ControlPlaneAuthenticator,
     S: Future<Output = io::Result<()>>,
 {
+    run_observed_with_control(
+        data_address,
+        control_address,
+        migrations,
+        data_authenticator,
+        AuthenticatedControl(control_authenticator),
+        admission,
+        metrics,
+        shutdown,
+        drain_timeout,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_observed_with_control<M, D, C, S>(
+    data_address: SocketAddr,
+    control_address: SocketAddr,
+    migrations: M,
+    data_authenticator: D,
+    control_service: C,
+    admission: AdmissionControl,
+    metrics: Metrics,
+    shutdown: S,
+    drain_timeout: Duration,
+) -> io::Result<BoundPlanes>
+where
+    M: MigrationRunner,
+    D: DataPlaneAuthenticator,
+    C: ControlPlaneService,
+    S: Future<Output = io::Result<()>>,
+{
     migrations.run().await?;
 
     let data_listener = TcpListener::bind(data_address).await?;
@@ -200,7 +293,7 @@ where
         data_listener,
         control_listener,
         Arc::new(data_authenticator),
-        Arc::new(control_authenticator),
+        Arc::new(control_service),
         Arc::new(admission),
         metrics,
         shutdown,
@@ -223,7 +316,7 @@ async fn serve<D, C, S>(
 ) -> io::Result<()>
 where
     D: DataPlaneAuthenticator,
-    C: ControlPlaneAuthenticator,
+    C: ControlPlaneService,
     S: Future<Output = io::Result<()>>,
 {
     let mut connections = JoinSet::new();
@@ -330,14 +423,16 @@ fn spawn_control_connection<C>(
     mut stop: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
 ) where
-    C: ControlPlaneAuthenticator,
+    C: ControlPlaneService,
 {
     connections.spawn(async move {
         let _permit = permit;
         let connection = http1::Builder::new().serve_connection(
             TokioIo::new(stream),
             service_fn(move |request| {
-                control_route(request, Arc::clone(&authenticator), metrics.clone())
+                let authenticator = Arc::clone(&authenticator);
+                let metrics = metrics.clone();
+                async move { Ok::<_, hyper::Error>(authenticator.serve(request, metrics).await) }
             }),
         );
         tokio::pin!(connection);
@@ -382,22 +477,22 @@ where
 
 async fn control_route<C>(
     request: Request<Incoming>,
-    authenticator: Arc<C>,
+    authenticator: &C,
     metrics: Metrics,
-) -> Result<Response<ResponseBody>, hyper::Error>
+) -> Response<ResponseBody>
 where
     C: ControlPlaneAuthenticator,
 {
     if is_health_request(&request) {
-        return Ok(text_response(StatusCode::OK, "control plane ok\n"));
+        return text_response(StatusCode::OK, "control plane ok\n");
     }
     if !authenticator.authenticate(&request) {
-        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
+        return text_response(StatusCode::UNAUTHORIZED, "unauthorized\n");
     }
     if request.method() == Method::GET && request.uri().path() == "/metrics" {
-        return Ok(metrics_response(&metrics));
+        return metrics_response(&metrics);
     }
-    Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
+    text_response(StatusCode::NOT_FOUND, "not found\n")
 }
 
 fn metrics_response(metrics: &Metrics) -> Response<ResponseBody> {
