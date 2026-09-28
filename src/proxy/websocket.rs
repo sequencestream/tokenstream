@@ -39,6 +39,7 @@ use crate::proxy::admission::ProxyLimits;
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
+use crate::telemetry::Metrics;
 
 const WEBSOCKET_VERSION: &str = "13";
 const NORMAL_CLOSE_CODE: u16 = 1000;
@@ -94,6 +95,7 @@ pub struct WebSocketProxy {
     header_timeout: Duration,
     idle_timeout: Duration,
     config: WebSocketConfig,
+    metrics: Metrics,
 }
 
 impl WebSocketProxy {
@@ -103,6 +105,22 @@ impl WebSocketProxy {
         header_timeout: Duration,
         idle_timeout: Duration,
         limits: &ProxyLimits,
+    ) -> Self {
+        Self::with_metrics(
+            connect_timeout,
+            header_timeout,
+            idle_timeout,
+            limits,
+            Metrics::default(),
+        )
+    }
+
+    pub fn with_metrics(
+        connect_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
+        limits: &ProxyLimits,
+        metrics: Metrics,
     ) -> Self {
         let frame = limits.websocket_max_frame_bytes();
         let message = limits.websocket_max_message_bytes();
@@ -121,6 +139,7 @@ impl WebSocketProxy {
             header_timeout,
             idle_timeout,
             config,
+            metrics,
         }
     }
 
@@ -175,11 +194,13 @@ impl WebSocketProxy {
 
         let on_upgrade = hyper::upgrade::on(request);
         let connect = connect_async_with_config(upstream_request, Some(self.config), false);
+        let started = tokio::time::Instant::now();
         let connected = timeout(
             self.connect_timeout.saturating_add(self.header_timeout),
             connect,
         )
         .await;
+        self.metrics.observe_upstream_latency(started.elapsed());
         let (upstream, upstream_response) = match connected {
             Err(_) => return Err(GatewayError::UpstreamTimeout),
             Ok(Ok(result)) => result,
@@ -219,7 +240,8 @@ impl WebSocketProxy {
         log_sink: LogSink,
         request_id: RequestId,
     ) -> Result<Handshake, GatewayError> {
-        let mut lifecycle = RequestLogLifecycle::start(log_sink, request_id, snapshot, route);
+        let mut lifecycle =
+            RequestLogLifecycle::start(log_sink, request_id, snapshot, route).observe_websocket();
         let handshake = match self
             .handshake(snapshot, route, query, downstream_peer, request)
             .await

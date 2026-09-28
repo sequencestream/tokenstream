@@ -22,6 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::config::Config;
 use crate::proxy::error::GatewayError;
+use crate::telemetry::{Metrics, ProxyFailureCategory};
 
 /// A resource bound that cannot be used as a limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -142,14 +143,20 @@ impl ProxyLimits {
 pub struct AdmissionControl {
     slots: Arc<Semaphore>,
     limits: ProxyLimits,
+    metrics: Metrics,
 }
 
 impl AdmissionControl {
     /// Builds the control from validated resource bounds.
     pub fn new(limits: ProxyLimits) -> Self {
+        Self::with_metrics(limits, Metrics::default())
+    }
+
+    pub fn with_metrics(limits: ProxyLimits, metrics: Metrics) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(limits.max_connections())),
             limits,
+            metrics,
         }
     }
 
@@ -182,6 +189,8 @@ impl AdmissionControl {
         match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => Ok(AdmissionPermit { _permit: permit }),
             Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                self.metrics
+                    .record_failure(ProxyFailureCategory::ConnectionLimitReached);
                 Err(GatewayError::ConnectionLimitReached)
             }
         }

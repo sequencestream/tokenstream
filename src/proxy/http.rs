@@ -40,6 +40,7 @@ use crate::logging::{LogSink, LoggedBody, RequestLogLifecycle, observe_response}
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
+use crate::telemetry::Metrics;
 
 /// Streams one proxied HTTP request to its provider endpoint.
 ///
@@ -51,6 +52,7 @@ pub struct HttpProxy<B> {
     client: Client<HttpConnector, IdleTimeoutBody<B>>,
     header_timeout: Duration,
     idle_timeout: Duration,
+    metrics: Metrics,
 }
 
 impl<B> HttpProxy<B>
@@ -65,6 +67,20 @@ where
         header_timeout: Duration,
         idle_timeout: Duration,
     ) -> Self {
+        Self::with_metrics(
+            connect_timeout,
+            header_timeout,
+            idle_timeout,
+            Metrics::default(),
+        )
+    }
+
+    pub fn with_metrics(
+        connect_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
+        metrics: Metrics,
+    ) -> Self {
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_nodelay(true);
@@ -75,6 +91,7 @@ where
             client,
             header_timeout,
             idle_timeout,
+            metrics,
         }
     }
 
@@ -118,11 +135,14 @@ where
             .map_err(|_| GatewayError::InternalError)?;
         *upstream.headers_mut() = headers;
 
-        match timeout(self.header_timeout, self.client.request(upstream)).await {
+        let started = Instant::now();
+        let result = match timeout(self.header_timeout, self.client.request(upstream)).await {
             Err(_elapsed) => Err(GatewayError::UpstreamTimeout),
             Ok(Err(error)) => Err(classify(&error)),
             Ok(Ok(response)) => Ok(response),
-        }
+        };
+        self.metrics.observe_upstream_latency(started.elapsed());
+        result
     }
 
     /// Converts a received upstream response into the downstream streaming
@@ -154,7 +174,8 @@ where
         log_sink: LogSink,
         request_id: RequestId,
     ) -> Result<Response<LoggedBody<IdleTimeoutBody<Incoming>>>, GatewayError> {
-        let mut lifecycle = RequestLogLifecycle::start(log_sink, request_id, snapshot, route);
+        let mut lifecycle =
+            RequestLogLifecycle::start(log_sink, request_id, snapshot, route).observe_http();
         match self
             .forward(snapshot, route, query, downstream_peer, request)
             .await

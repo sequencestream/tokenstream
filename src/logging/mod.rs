@@ -6,7 +6,6 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,6 +18,7 @@ use tokio::time::Instant;
 use crate::domain::{ProviderSnapshot, RequestId};
 use crate::persistence::{Database, RepositoryError, RequestLogCompleted, RequestLogStarted};
 use crate::routing::ResolvedRoute;
+use crate::telemetry::{ActiveRequestGuard, Metrics, ProxyFailureCategory};
 
 const MAX_WRITE_ATTEMPTS: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -39,51 +39,51 @@ pub enum EmitResult {
     DroppedClosed,
 }
 
-#[derive(Debug, Default)]
-struct Counters {
-    queued: AtomicUsize,
-    dropped: AtomicU64,
-}
-
 /// Cloneable, bounded, non-blocking event producer used by proxy tasks.
 #[derive(Clone, Debug)]
 pub struct LogSink {
     sender: mpsc::Sender<LogEvent>,
-    counters: Arc<Counters>,
+    metrics: Metrics,
 }
 
 impl LogSink {
     /// Attempts to enqueue without waiting for capacity or database I/O.
     pub fn try_emit(&self, event: LogEvent) -> EmitResult {
-        self.counters.queued.fetch_add(1, Ordering::AcqRel);
+        self.metrics.enqueue_log_event();
         match self.sender.try_send(event) {
             Ok(()) => EmitResult::Enqueued,
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.counters.queued.fetch_sub(1, Ordering::AcqRel);
-                self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                self.metrics.remove_log_events(1);
+                self.metrics.drop_log_events(1);
                 EmitResult::DroppedFull
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.counters.queued.fetch_sub(1, Ordering::AcqRel);
-                self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+                self.metrics.remove_log_events(1);
+                self.metrics.drop_log_events(1);
                 EmitResult::DroppedClosed
             }
         }
     }
 
     pub fn queued_events(&self) -> usize {
-        self.counters.queued.load(Ordering::Acquire)
+        self.metrics.log_queue_depth()
     }
 
     pub fn dropped_events(&self) -> u64 {
-        self.counters.dropped.load(Ordering::Relaxed)
+        self.metrics.dropped_log_events()
+    }
+
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 }
 
 /// Storage boundary used only by the background worker.
-#[allow(async_fn_in_trait)]
 pub trait LogStore: Send + Sync + 'static {
-    async fn write_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError>;
+    fn write_batch(
+        &self,
+        events: &[LogEvent],
+    ) -> impl std::future::Future<Output = Result<(), RepositoryError>> + Send;
 }
 
 impl LogStore for Database {
@@ -99,7 +99,7 @@ impl LogStore for Database {
 pub struct LogWorker<S> {
     receiver: mpsc::Receiver<LogEvent>,
     store: Arc<S>,
-    counters: Arc<Counters>,
+    metrics: Metrics,
     batch_size: usize,
     batch_interval: Duration,
 }
@@ -111,10 +111,8 @@ impl<S> Drop for LogWorker<S> {
             discarded += 1;
         }
         if discarded > 0 {
-            self.counters.queued.fetch_sub(discarded, Ordering::AcqRel);
-            self.counters
-                .dropped
-                .fetch_add(discarded as u64, Ordering::Relaxed);
+            self.metrics.remove_log_events(discarded);
+            self.metrics.drop_log_events(discarded as u64);
         }
     }
 }
@@ -129,6 +127,25 @@ pub fn channel<S>(
 where
     S: LogStore,
 {
+    channel_with_metrics(
+        store,
+        capacity,
+        batch_size,
+        batch_interval,
+        Metrics::default(),
+    )
+}
+
+pub fn channel_with_metrics<S>(
+    store: Arc<S>,
+    capacity: usize,
+    batch_size: usize,
+    batch_interval: Duration,
+    metrics: Metrics,
+) -> (LogSink, LogWorker<S>)
+where
+    S: LogStore,
+{
     assert!(capacity > 0, "log queue capacity must be positive");
     assert!(batch_size > 0, "log batch size must be positive");
     assert!(batch_size <= capacity, "log batch size must fit the queue");
@@ -137,16 +154,15 @@ where
         "log batch interval must be positive"
     );
     let (sender, receiver) = mpsc::channel(capacity);
-    let counters = Arc::new(Counters::default());
     (
         LogSink {
             sender,
-            counters: Arc::clone(&counters),
+            metrics: metrics.clone(),
         },
         LogWorker {
             receiver,
             store,
-            counters,
+            metrics,
             batch_size,
             batch_interval,
         },
@@ -177,13 +193,9 @@ where
 
             let persisted = self.write_with_retry(&batch, &mut last_warning).await;
             if !persisted {
-                self.counters
-                    .dropped
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                self.metrics.drop_log_events(batch.len() as u64);
             }
-            self.counters
-                .queued
-                .fetch_sub(batch.len(), Ordering::AcqRel);
+            self.metrics.remove_log_events(batch.len());
             batch.clear();
         }
     }
@@ -222,6 +234,7 @@ fn warn_rate_limited(last_warning: &mut Option<Instant>) {
 pub struct RequestLogLifecycle {
     sink: LogSink,
     request_id: Option<RequestId>,
+    active: Option<ActiveRequestGuard>,
 }
 
 impl RequestLogLifecycle {
@@ -242,7 +255,18 @@ impl RequestLogLifecycle {
         Self {
             sink,
             request_id: Some(request_id),
+            active: None,
         }
+    }
+
+    pub fn observe_http(mut self) -> Self {
+        self.active = Some(self.sink.metrics.start_http());
+        self
+    }
+
+    pub fn observe_websocket(mut self) -> Self {
+        self.active = Some(self.sink.metrics.start_websocket());
+        self
     }
 
     pub fn complete(&mut self, status: Option<StatusCode>, error: Option<&'static str>) {
@@ -257,7 +281,29 @@ impl RequestLogLifecycle {
                 Utc::now(),
                 error.map(str::to_owned),
             )));
+        if let Some(category) = error.and_then(failure_category) {
+            self.sink.metrics.record_failure(category);
+        }
+        self.active.take();
     }
+}
+
+fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
+    Some(match error {
+        "invalid_gateway_credential" => ProxyFailureCategory::InvalidGatewayCredential,
+        "provider_disabled" => ProxyFailureCategory::ProviderDisabled,
+        "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
+        "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
+        "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,
+        "upstream_timeout" | "idle_timeout" => ProxyFailureCategory::UpstreamTimeout,
+        "connection_limit_reached" => ProxyFailureCategory::ConnectionLimitReached,
+        "internal_error" => ProxyFailureCategory::InternalError,
+        "stream_failed" => ProxyFailureCategory::StreamFailed,
+        "downstream_cancelled" => ProxyFailureCategory::DownstreamCancelled,
+        "message_too_large" => ProxyFailureCategory::MessageTooLarge,
+        "relay_failed" => ProxyFailureCategory::RelayFailed,
+        _ => return None,
+    })
 }
 
 /// Response-body observer that completes an HTTP lifecycle on EOF, failure, or cancellation.

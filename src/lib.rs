@@ -18,6 +18,7 @@ use tokio::task::JoinSet;
 use crate::domain::RequestId;
 use crate::proxy::admission::AdmissionControl;
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
+use crate::telemetry::{Metrics, ProxyFailureCategory};
 
 pub mod auth;
 pub mod config;
@@ -28,6 +29,7 @@ pub mod persistence;
 pub mod providers;
 pub mod proxy;
 pub mod routing;
+pub mod telemetry;
 
 type ResponseBody = Full<Bytes>;
 const MAX_SCAFFOLD_CONNECTIONS_PER_PLANE: usize = 64;
@@ -100,6 +102,91 @@ where
     C: ControlPlaneAuthenticator,
     S: Future<Output = io::Result<()>>,
 {
+    run_observed(
+        data_address,
+        control_address,
+        migrations,
+        data_authenticator,
+        control_authenticator,
+        admission,
+        Metrics::default(),
+        shutdown,
+        drain_timeout,
+    )
+    .await
+}
+
+/// Runs both planes, then closes and flushes the request-log worker in its own
+/// bounded phase after proxy connections have drained.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_logging<M, D, C, S, L>(
+    data_address: SocketAddr,
+    control_address: SocketAddr,
+    migrations: M,
+    data_authenticator: D,
+    control_authenticator: C,
+    admission: AdmissionControl,
+    metrics: Metrics,
+    shutdown: S,
+    drain_timeout: Duration,
+    log_sink: crate::logging::LogSink,
+    log_worker: crate::logging::LogWorker<L>,
+    log_flush_timeout: Duration,
+) -> io::Result<BoundPlanes>
+where
+    M: MigrationRunner,
+    D: DataPlaneAuthenticator,
+    C: ControlPlaneAuthenticator,
+    S: Future<Output = io::Result<()>>,
+    L: crate::logging::LogStore,
+{
+    let mut worker_task = tokio::spawn(log_worker.run());
+    let flush_metrics = log_sink.metrics().clone();
+    let server_result = run_observed(
+        data_address,
+        control_address,
+        migrations,
+        data_authenticator,
+        control_authenticator,
+        admission,
+        metrics,
+        shutdown,
+        drain_timeout,
+    )
+    .await;
+
+    // All connection tasks have completed or been aborted before the last
+    // composition-root sender closes. No synthetic completion events are made.
+    drop(log_sink);
+    if tokio::time::timeout(log_flush_timeout, &mut worker_task)
+        .await
+        .is_err()
+    {
+        worker_task.abort();
+        let _ = worker_task.await;
+        flush_metrics.drop_all_queued_log_events();
+    }
+    server_result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_observed<M, D, C, S>(
+    data_address: SocketAddr,
+    control_address: SocketAddr,
+    migrations: M,
+    data_authenticator: D,
+    control_authenticator: C,
+    admission: AdmissionControl,
+    metrics: Metrics,
+    shutdown: S,
+    drain_timeout: Duration,
+) -> io::Result<BoundPlanes>
+where
+    M: MigrationRunner,
+    D: DataPlaneAuthenticator,
+    C: ControlPlaneAuthenticator,
+    S: Future<Output = io::Result<()>>,
+{
     migrations.run().await?;
 
     let data_listener = TcpListener::bind(data_address).await?;
@@ -115,6 +202,7 @@ where
         Arc::new(data_authenticator),
         Arc::new(control_authenticator),
         Arc::new(admission),
+        metrics,
         shutdown,
         drain_timeout,
     )
@@ -122,12 +210,14 @@ where
     Ok(bound)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve<D, C, S>(
     data_listener: TcpListener,
     control_listener: TcpListener,
     data_authenticator: Arc<D>,
     control_authenticator: Arc<C>,
     admission: Arc<AdmissionControl>,
+    metrics: Metrics,
     shutdown: S,
     drain_timeout: Duration,
 ) -> io::Result<()>
@@ -156,6 +246,7 @@ where
                     stream,
                     Arc::clone(&data_authenticator),
                     Arc::clone(&admission),
+                    metrics.clone(),
                     stop_receiver.clone(),
                     permit,
                 );
@@ -170,6 +261,7 @@ where
                     &mut connections,
                     stream,
                     Arc::clone(&control_authenticator),
+                    metrics.clone(),
                     stop_receiver.clone(),
                     permit,
                 );
@@ -200,6 +292,7 @@ fn spawn_data_connection<D>(
     stream: TcpStream,
     authenticator: Arc<D>,
     admission: Arc<AdmissionControl>,
+    metrics: Metrics,
     mut stop: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
 ) where
@@ -210,7 +303,12 @@ fn spawn_data_connection<D>(
         let connection = http1::Builder::new().serve_connection(
             TokioIo::new(stream),
             service_fn(move |request| {
-                data_route(request, Arc::clone(&authenticator), Arc::clone(&admission))
+                data_route(
+                    request,
+                    Arc::clone(&authenticator),
+                    Arc::clone(&admission),
+                    metrics.clone(),
+                )
             }),
         );
         tokio::pin!(connection);
@@ -228,6 +326,7 @@ fn spawn_control_connection<C>(
     connections: &mut JoinSet<()>,
     stream: TcpStream,
     authenticator: Arc<C>,
+    metrics: Metrics,
     mut stop: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
 ) where
@@ -237,7 +336,9 @@ fn spawn_control_connection<C>(
         let _permit = permit;
         let connection = http1::Builder::new().serve_connection(
             TokioIo::new(stream),
-            service_fn(move |request| control_route(request, Arc::clone(&authenticator))),
+            service_fn(move |request| {
+                control_route(request, Arc::clone(&authenticator), metrics.clone())
+            }),
         );
         tokio::pin!(connection);
         tokio::select! {
@@ -259,6 +360,7 @@ async fn data_route<D>(
     request: Request<Incoming>,
     authenticator: Arc<D>,
     admission: Arc<AdmissionControl>,
+    metrics: Metrics,
 ) -> Result<Response<ResponseBody>, hyper::Error>
 where
     D: DataPlaneAuthenticator,
@@ -271,14 +373,17 @@ where
         Err(error) => return Ok(local_error_response(error)),
     };
     if !authenticator.authenticate(&request) {
+        metrics.record_failure(ProxyFailureCategory::InvalidGatewayCredential);
         return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
     }
+    metrics.record_failure(ProxyFailureCategory::UnsupportedRoute);
     Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
 }
 
 async fn control_route<C>(
     request: Request<Incoming>,
     authenticator: Arc<C>,
+    metrics: Metrics,
 ) -> Result<Response<ResponseBody>, hyper::Error>
 where
     C: ControlPlaneAuthenticator,
@@ -289,7 +394,18 @@ where
     if !authenticator.authenticate(&request) {
         return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
     }
+    if request.method() == Method::GET && request.uri().path() == "/metrics" {
+        return Ok(metrics_response(&metrics));
+    }
     Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
+}
+
+fn metrics_response(metrics: &Metrics) -> Response<ResponseBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(Full::new(Bytes::from(metrics.render())))
+        .expect("the metrics response is valid")
 }
 
 fn is_health_request(request: &Request<Incoming>) -> bool {
