@@ -10,7 +10,11 @@
 //! status, and sanitized message for every class of gateway-originated error.
 //! Admission and the per-process resource bounds live in [`admission`], which
 //! sheds load at the configured limit instead of queueing it.
+//!
+//! The HTTP exchange itself lives in [`http`], which streams a request body to
+//! the resolved endpoint under transport backpressure without reading it.
 
 pub mod admission;
 pub mod error;
 pub mod headers;
+pub mod http;
