@@ -11,8 +11,10 @@
 //! Admission and the per-process resource bounds live in [`admission`], which
 //! sheds load at the configured limit instead of queueing it.
 //!
-//! The HTTP exchange itself lives in [`http`], which streams a request body to
-//! the resolved endpoint under transport backpressure without reading it.
+//! The HTTP exchange itself lives in [`http`]: a request body is streamed to
+//! the resolved endpoint and the upstream response is relayed back with its
+//! body still streaming, both under transport backpressure and without reading
+//! the payload.
 
 pub mod admission;
 pub mod error;

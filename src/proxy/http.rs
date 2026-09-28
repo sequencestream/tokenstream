@@ -12,6 +12,11 @@
 //! failed connection becomes a sanitized upstream-connection failure and either
 //! deadline becomes a sanitized upstream timeout. Because no upstream response
 //! has been received at that point, a local error can still be sent downstream.
+//!
+//! The response travels back the same way through [`relay_response`]: its status
+//! and allowed end-to-end headers are forwarded immediately and its body stays a
+//! streaming value, so relayed chunks follow the downstream consumer's pace
+//! instead of accumulating in the gateway.
 
 use std::error::Error as StdError;
 use std::io;
@@ -28,7 +33,7 @@ use tokio::time::timeout;
 use crate::config::Config;
 use crate::domain::ProviderSnapshot;
 use crate::proxy::error::GatewayError;
-use crate::proxy::headers::build_upstream_request_headers;
+use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
 
 /// Streams one proxied HTTP request to its provider endpoint.
@@ -105,6 +110,24 @@ where
             Ok(Ok(response)) => Ok(response),
         }
     }
+}
+
+/// Relays an upstream response to the downstream client without buffering it.
+///
+/// The status and HTTP version are preserved, hop-by-hop headers and headers
+/// nominated by `Connection` are removed by the shared response policy, and
+/// every other end-to-end header is forwarded as received. The body is handed
+/// back as the upstream's own streaming body, so one frame crosses the gateway
+/// per downstream poll and a slow consumer exerts backpressure on the upstream
+/// socket rather than filling an in-memory buffer.
+///
+/// Nothing here reads the content type, the body, or any application field, so
+/// an SSE stream, a JSON document that happens to mention `stream`, and an
+/// upstream error body all relay identically.
+pub fn relay_response(upstream: Response<Incoming>) -> Response<Incoming> {
+    let (mut parts, body) = upstream.into_parts();
+    parts.headers = build_downstream_response_headers(&parts.headers);
+    Response::from_parts(parts, body)
 }
 
 impl<B> std::fmt::Debug for HttpProxy<B> {
