@@ -91,6 +91,7 @@ cargo test --locked --test gateway_load -- --nocapture
 stage "administration frontend"
 npm --prefix web ci
 npm --prefix web run check
+npm --prefix web run test
 npm --prefix web run build
 
 stage "pinned client compatibility"

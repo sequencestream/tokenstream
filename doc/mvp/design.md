@@ -68,7 +68,7 @@ Provider names, gateway-key lookup identifiers, and request IDs are unique. Prov
 
 The process module loads static settings, validates them before binding sockets, constructs dependencies, and coordinates graceful shutdown.
 
-Core settings include listen addresses, database URL, encryption master key, administrator password hash, upstream connect/header/idle timeouts, maximum WebSocket message size, maximum concurrent connections, HTTP body buffer bounds, log queue capacity, and log batch size. Secrets are not accepted from command-line flags because process listings may expose them.
+Core settings include listen addresses, database URL, encryption master key, administrator password hash, upstream connect/header/idle timeouts, maximum WebSocket message size, maximum concurrent connections, HTTP body buffer bounds, log queue capacity, and log batch size. A deployment may also name the directory holding the compiled administration page; an absent value serves the API alone, and a present value must be a non-empty path whose directory and entry document exist before either listener binds. Secrets are not accepted from command-line flags because process listings may expose them.
 
 ### 4.2 Gateway Authentication
 
@@ -153,6 +153,8 @@ Metrics are aggregated and contain no key IDs, URLs with queries, or other high-
 
 The administrator password hash is provided through deployment configuration. A successful sign-in creates a short-lived, HTTP-only, secure, same-site session cookie. State-changing endpoints require CSRF protection. General request rate limiting remains outside the MVP scope.
 
+The administration page and the administration API share one origin. The control-plane listener serves the page's entry document and its own compiled assets, so a deployment needs no second origin and no cross-site exception for the session cookie. Requests to the page are answered before a session exists, because the page itself must load in order to offer a sign-in; every administration API path stays behind session authentication regardless of the page. A deployment over plaintext has no secure origin to hold a `Secure` cookie on, so development mode drops only that attribute and retains the HTTP-only and same-site restrictions.
+
 The Vue application consumes only the administration API and never receives upstream secrets, gateway secrets after initial creation, password hashes, or encryption material.
 
 ## 5. Module Boundaries and Interfaces
@@ -235,6 +237,8 @@ Later reads omit `gateway_api_key`. An upstream-key update is write-only and nev
 ### 6.4 Request Log API and Gateway Errors
 
 `GET /admin/api/request-logs` accepts `after_id`, `limit`, `provider_id`, `transport_type`, `start_time_gte`, and `start_time_lt`. Results are ordered by `id ASC` and return rows with `id > after_id`; omit `after_id` to start from the beginning. The response contains `items` and `next_after_id`, set to the last returned ID or `null` when no rows are returned. `limit` defaults to 100 and cannot exceed 100. There are no page numbers, offsets, or total-page counts. The same cursor and limit rules apply to provider lists. Filter values remain fixed while advancing a cursor; callers restart from the beginning when filters change. The cursor is for list navigation, not a guaranteed change feed under concurrent writes.
+
+The page therefore keeps two filter states: the conditions being edited and the conditions that produced the rows currently displayed. Advancing the log list always uses the applied conditions together with the cursor those conditions produced, and changing or clearing the conditions restarts the list from the beginning. A half-edited form can never combine one condition set with another set's cursor.
 
 Gateway-generated failures use a small, stable envelope:
 
@@ -380,3 +384,4 @@ The process-level smoke contracts require Python 3 and OpenSSL to create ephemer
 5. **Security tests:** no secrets or bodies in logs/API responses, disabled and rotated keys fail, cross-provider routes are rejected before upstream contact, and error sanitization survives hostile upstream text.
 6. **Load tests:** the documented concurrency profile for long-lived HTTP/SSE and WebSocket sessions reaches stable memory use and respects all queue and semaphore bounds.
 7. **Compatibility gate:** run the version-controlled manifest of exact Codex CLI, OpenAI SDK, and Anthropic SDK versions against a controllable mock upstream. Live-provider smoke tests are optional and never the CI correctness dependency.
+8. **Administration page checks:** the page's own logic is exercised directly, covering that a cursor is only ever paired with the conditions that produced it. Page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are additionally accepted through real browser interaction against a running control plane, both with the page served by that plane and with the development server proxying the API. Type checking or a successful build never substitutes for that interaction.

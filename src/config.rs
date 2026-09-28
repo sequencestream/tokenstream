@@ -1,6 +1,7 @@
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MIN_TIMEOUT_MS: u64 = 1;
@@ -87,6 +88,7 @@ pub struct Config {
     downstream_header_timeout: Duration,
     admin_body_timeout: Duration,
     development_mode: bool,
+    admin_static_root: Option<PathBuf>,
 }
 
 impl Config {
@@ -242,6 +244,8 @@ impl Config {
         )?;
 
         let development_mode = parse_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE")?;
+        let admin_static_root =
+            parse_optional_text(&mut get, "TOKENSTREAM_ADMIN_STATIC_ROOT")?.map(PathBuf::from);
 
         Ok(Self {
             data_listen_addr,
@@ -269,6 +273,7 @@ impl Config {
             downstream_header_timeout,
             admin_body_timeout,
             development_mode,
+            admin_static_root,
         })
     }
 
@@ -369,6 +374,16 @@ impl Config {
     /// sets it to `true`.
     pub fn development_mode(&self) -> bool {
         self.development_mode
+    }
+
+    /// Directory holding the compiled administration page, when it is served.
+    ///
+    /// The value is read from configuration and never inferred from the
+    /// working directory, so a deployment states where the compiled page
+    /// lives instead of the process discovering it. The path is validated as
+    /// an existing directory during startup, before either listener binds.
+    pub fn admin_static_root(&self) -> Option<&Path> {
+        self.admin_static_root.as_deref()
     }
 }
 
@@ -477,6 +492,26 @@ fn parse_optional(
     match value {
         None => Ok(default),
         Some(value) => parse_bounded(&mut |_| Ok(Some(value.clone())), name, minimum, maximum),
+    }
+}
+
+/// Reads an optional non-empty text setting. An absent value disables the
+/// feature; an empty value is a configuration mistake rather than "unset".
+fn parse_optional_text(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    match get(name) {
+        Ok(None) => Ok(None),
+        Ok(Some(value)) if value.is_empty() => Err(ConfigError::Invalid {
+            name,
+            requirement: "must be a non-empty path when present",
+        }),
+        Ok(Some(value)) => Ok(Some(value)),
+        Err(()) => Err(ConfigError::Invalid {
+            name,
+            requirement: "must contain valid Unicode",
+        }),
     }
 }
 

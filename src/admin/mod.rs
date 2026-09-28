@@ -1,5 +1,7 @@
 //! Authenticated administration sessions and HTTP API.
 
+pub mod assets;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,6 +19,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::ControlPlaneService;
+use crate::admin::assets::{AdminAssets, PAGE_CONTENT_SECURITY_POLICY};
 use crate::crypto::{
     AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher,
 };
@@ -49,6 +52,8 @@ pub struct AdminApi<R, C, V> {
     connection_settings: crate::ConnectionSettings,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     session_ttl: Duration,
+    assets: Option<AdminAssets>,
+    development_mode: bool,
 }
 
 #[derive(Clone)]
@@ -70,14 +75,16 @@ where
         allow_insecure_endpoints: bool,
         password_hash: impl Into<Arc<str>>,
     ) -> Self {
-        Self::with_session_ttl(
+        let mut api = Self::with_session_ttl(
             repository,
             cipher,
             verifier,
             allow_insecure_endpoints,
             password_hash,
             DEFAULT_SESSION_TTL,
-        )
+        );
+        api.development_mode = allow_insecure_endpoints;
+        api
     }
 
     pub fn with_session_ttl(
@@ -102,6 +109,8 @@ where
             connection_settings: crate::ConnectionSettings::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_ttl,
+            assets: None,
+            development_mode: false,
         }
     }
 
@@ -116,7 +125,22 @@ where
             .set_password_work(work);
         self.body_timeout = config.admin_body_timeout();
         self.connection_settings = crate::ConnectionSettings::control(config);
+        self.development_mode = config.development_mode();
         self
+    }
+
+    /// Serves the compiled administration page from a configured directory.
+    pub fn with_assets(mut self, root: &std::path::Path) -> Self {
+        self.assets = Some(AdminAssets::new(root));
+        self
+    }
+
+    /// Confirms a configured administration page directory is usable.
+    pub fn verify_assets(&self) -> std::io::Result<()> {
+        match &self.assets {
+            Some(assets) => assets.verify(),
+            None => Ok(()),
+        }
     }
 
     pub async fn handle<B>(&self, request: Request<B>, metrics: Metrics) -> Response<ApiBody>
@@ -137,6 +161,12 @@ where
 
         if method == Method::POST && path == "/admin/api/session" {
             return self.sign_in(request).await;
+        }
+
+        if (method == Method::GET || method == Method::HEAD)
+            && let Some(response) = self.serve_page(&path)
+        {
+            return response;
         }
 
         let Some((session_token, session)) = self.authenticate(&request) else {
@@ -181,9 +211,7 @@ where
                 .status(StatusCode::NO_CONTENT)
                 .header(
                     SET_COOKIE,
-                    format!(
-                        "{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Strict"
-                    ),
+                    self.session_cookie(&format!("{SESSION_COOKIE}=; Max-Age=0")),
                 )
                 .body(Full::new(Bytes::new()))
                 .expect("logout response is valid");
@@ -223,6 +251,21 @@ where
         }
 
         api_error(StatusCode::NOT_FOUND, "not_found", "Resource not found.")
+    }
+
+    /// Serves a compiled page asset, when one is configured and the path names
+    /// one. The page and the API share this origin, so the page is reachable
+    /// before a session exists while every API path stays authenticated.
+    fn serve_page(&self, path: &str) -> Option<Response<ApiBody>> {
+        if path.starts_with("/admin/api/") || path == "/metrics" || path == "/healthz" {
+            return None;
+        }
+        let asset = self.assets.as_ref()?.resolve(path)?;
+        let mut response = asset.into_response();
+        response
+            .headers_mut()
+            .insert("content-security-policy", PAGE_CONTENT_SECURITY_POLICY);
+        Some(response)
     }
 
     async fn sign_in<B>(&self, request: Request<B>) -> Response<ApiBody>
@@ -288,13 +331,29 @@ where
         );
         response.headers_mut().insert(
             SET_COOKIE,
-            format!(
-                "{SESSION_COOKIE}={session_token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Strict"
-            )
+            self.session_cookie(&format!(
+                "{SESSION_COOKIE}={session_token}; Max-Age={max_age}"
+            ))
             .parse()
             .expect("session cookie is valid"),
         );
         response
+    }
+
+    /// Builds the session cookie for one response.
+    ///
+    /// A production deployment terminates TLS in front of this process and
+    /// marks the request as secure, so the cookie keeps its `Secure` flag. A
+    /// development deployment on plaintext localhost has no secure origin to
+    /// keep the cookie on; it drops only that flag and retains `HttpOnly` and
+    /// `SameSite=Strict`, which is what allows the same page to run locally.
+    fn session_cookie(&self, prefix: &str) -> String {
+        let secure = if self.development_mode {
+            ""
+        } else {
+            " Secure;"
+        };
+        format!("{prefix} Path=/; HttpOnly;{secure} SameSite=Strict")
     }
 
     fn authenticate<B>(&self, request: &Request<B>) -> Option<(String, Session)> {

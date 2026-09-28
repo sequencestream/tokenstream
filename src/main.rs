@@ -21,6 +21,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
     );
+    if let Some(root) = config.admin_static_root() {
+        eprintln!("Administration page served from {}", root.display());
+    }
     let database = Database::connect(
         config.database_url().expose(),
         config.database_max_connections(),
@@ -37,7 +40,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics.clone(),
     );
     let password_work = tokenstream::crypto::PasswordWork::new(config.password_max_concurrency());
-    let admin_api = AdminApi::new(
+    let mut admin_api = AdminApi::new(
         database.clone(),
         AesGcmCipher::new(config.master_key().expose()),
         Argon2GatewaySecretVerifier::new(),
@@ -45,6 +48,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.admin_password_hash().expose().to_owned(),
     )
     .with_runtime(&config, password_work.clone());
+    if let Some(root) = config.admin_static_root() {
+        admin_api = admin_api.with_assets(root);
+    }
+    // A configured page directory is confirmed before either listener binds, so
+    // a deployment never comes up claiming to serve a page it cannot serve.
+    admin_api.verify_assets()?;
     let gateway = Gateway::with_password_work(
         &config,
         database.clone(),
