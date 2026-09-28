@@ -10,6 +10,7 @@ argon2 = "0.5.3"
 base64 = "0.22.1"
 bytes = "1.12.1"
 chrono = { version = "0.4.42", default-features = false, features = ["clock", "serde"] }
+futures-util = { version = "0.3.31", features = ["sink"] }
 getrandom = "0.2.17"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
@@ -18,6 +19,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 url = "2.5.7"
 zeroize = "1.8.2"
 
