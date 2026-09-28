@@ -21,6 +21,7 @@ pub mod crypto;
 pub mod domain;
 pub mod persistence;
 pub mod providers;
+pub mod proxy;
 pub mod routing;
 
 type ResponseBody = Full<Bytes>;
