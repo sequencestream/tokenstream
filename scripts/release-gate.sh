@@ -77,6 +77,20 @@ if [ -z "${TOKENSTREAM_TEST_POSTGRES_URL:-}" ]; then
   export TOKENSTREAM_TEST_POSTGRES_URL
 fi
 
+# A supplied server must be reachable. An unreachable one is a gate failure,
+# not a reason for the dual-backend layers to be recorded as unexecuted.
+postgres_ready=false
+for isready in "${postgres_bin:-}/pg_isready" "$(command -v pg_isready 2>/dev/null || true)"; do
+  if [ -x "$isready" ] && "$isready" -q -d "$TOKENSTREAM_TEST_POSTGRES_URL" 2>/dev/null; then
+    postgres_ready=true
+    break
+  fi
+done
+if [ "$postgres_ready" != true ]; then
+  echo "TOKENSTREAM_TEST_POSTGRES_URL is set but no PostgreSQL server is reachable at it" >&2
+  exit 1
+fi
+
 stage "unit, repository, protocol, and security suites"
 cargo test --locked
 

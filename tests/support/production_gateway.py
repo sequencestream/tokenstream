@@ -266,7 +266,70 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
     wait_for(lambda: exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0] == 200, 'capacity not released')
 
 
+def start(directory, name, master_key, development=True):
+    """Starts a gateway process on its own ports and database, ready to serve."""
+    data_port, admin_port = free_port(), free_port()
+    values = {
+        'DATA_LISTEN_ADDR': f'127.0.0.1:{data_port}', 'ADMIN_LISTEN_ADDR': f'127.0.0.1:{admin_port}',
+        'DATABASE_URL': f'sqlite://{directory / (name + ".db")}', 'MASTER_KEY': master_key,
+        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'DEVELOPMENT_MODE': str(development).lower(),
+        'UPSTREAM_CONNECT_TIMEOUT_MS': '500', 'UPSTREAM_HEADER_TIMEOUT_MS': '1500',
+        'STREAM_IDLE_TIMEOUT_MS': '10000', 'SHUTDOWN_DRAIN_TIMEOUT_MS': '150', 'LOG_FLUSH_TIMEOUT_MS': '1000',
+        'DATABASE_MAX_CONNECTIONS': '4', 'MAX_PROXY_CONNECTIONS': '2', 'HTTP_BUFFER_BYTES': '65536',
+        'WEBSOCKET_MAX_FRAME_BYTES': '65536', 'WEBSOCKET_MAX_MESSAGE_BYTES': '65536',
+        'WEBSOCKET_QUEUE_CAPACITY': '4', 'LOG_QUEUE_CAPACITY': '128', 'LOG_BATCH_SIZE': '16',
+        'LOG_BATCH_INTERVAL_MS': '10',
+    }
+    env = dict(os.environ, **{f'TOKENSTREAM_{key}': value for key, value in values.items()})
+    process = subprocess.Popen([os.environ['GATEWAY_BINARY']], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def ready():
+        assert process.poll() is None, process.stderr.read().decode()
+        try:
+            return exchange(admin_port, 'GET', '/healthz')[0] == 200
+        except OSError:
+            return False
+    wait_for(ready, 'gateway did not listen')
+    return process, data_port, admin_port
+
+
+def stored_key_recovery(directory, plain):
+    """A stored provider stays usable after a restart under the same master key.
+
+    This is the process-level form of the stored-key recovery regression: a
+    process that cannot re-open its own stored upstream keys, or that serves no
+    request at all, is caught here rather than by a component test that never
+    restarts anything.
+    """
+    first, data_port, admin_port = start(directory, 'recovery-first', '22' * 32)
+    try:
+        status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', b'{"password":"test-admin"}')
+        assert status == 200, body
+        auth = {'Cookie': headers['set-cookie'].split(';')[0], 'x-csrf-token': json.loads(body)['csrf_token'], 'content-type': 'application/json'}
+        created = json.dumps(dict(name='recovery', protocol_type='openai',
+                                  endpoint=f'http://127.0.0.1:{plain.server_port}/prefix',
+                                  upstream_api_key='upstream-secret', status='enabled')).encode()
+        status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', created, auth)
+        assert status == 201, response
+        credential = json.loads(response)['gateway_api_key']
+        assert exchange(data_port, 'POST', '/v1/responses', PAYLOAD, {'authorization': 'Bearer ' + credential})[0] == 200
+    finally:
+        first.send_signal(signal.SIGINT)
+        assert first.wait(timeout=5) == 0
+
+    # A restart that loses the stored key, or that stops serving, must fail here.
+    second, data_port, admin_port = start(directory, 'recovery-first', '22' * 32)
+    try:
+        status, _, body = exchange(data_port, 'POST', '/v1/responses', PAYLOAD, {'authorization': 'Bearer ' + credential})
+        assert status == 200, (status, body)
+    finally:
+        second.send_signal(signal.SIGINT)
+        assert second.wait(timeout=5) == 0
+    print('passed stored upstream key recovery across a process restart')
+
+
 def run_case(directory, trusted, untrusted, plain, development, capacity=None):
+
     global records
     data_port, admin_port = free_port(), free_port()
     db = directory / ('development.db' if development else 'production.db')
@@ -412,6 +475,7 @@ with tempfile.TemporaryDirectory() as temp:
         run_case(directory, trusted, untrusted, plain, True)
         for capacity in [3, 70]:
             run_case(directory, trusted, untrusted, plain, True, capacity)
+        stored_key_recovery(directory, plain)
     finally:
         release.set()
         for srv in [trusted, untrusted, plain]:

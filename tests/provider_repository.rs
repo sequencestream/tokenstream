@@ -14,6 +14,9 @@ use tokenstream::persistence::{
 };
 use url::Url;
 
+mod support;
+use support::require_postgres_url;
+
 fn unique_value(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -334,13 +337,7 @@ async fn insert_sqlite_request_log(pool: &SqlitePool, provider_id: ProviderId, p
 
 #[tokio::test]
 async fn postgres_provider_repository_satisfies_contract() {
-    let Some(url) = std::env::var("TOKENSTREAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        eprintln!("skipping PostgreSQL repository test: TOKENSTREAM_TEST_POSTGRES_URL is not set");
-        return;
-    };
+    let url = require_postgres_url("the PostgreSQL provider repository layer");
     let database = PostgresDatabase::connect(&url, 2)
         .await
         .expect("connect to PostgreSQL");

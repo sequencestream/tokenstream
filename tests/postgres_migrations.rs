@@ -4,11 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{PgPool, Row};
 use tokenstream::persistence::postgres::PostgresDatabase;
 
-fn database_url() -> Option<String> {
-    std::env::var("TOKENSTREAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-}
+mod support;
+use support::require_postgres_url;
 
 fn unique_value(prefix: &str) -> String {
     let nanos = SystemTime::now()
@@ -35,10 +32,7 @@ async fn insert_provider(pool: &PgPool, name: &str, key_id: &str) -> i64 {
 
 #[tokio::test]
 async fn postgres_schema_matches_sqlite_constraints() {
-    let Some(url) = database_url() else {
-        eprintln!("skipping PostgreSQL migration test: TOKENSTREAM_TEST_POSTGRES_URL is not set");
-        return;
-    };
+    let url = require_postgres_url("the PostgreSQL migration layer");
     let database = PostgresDatabase::connect(&url, 2)
         .await
         .expect("connect to PostgreSQL");

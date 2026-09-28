@@ -21,6 +21,9 @@ use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{NewProvider, ProviderRepository, ProviderUpdate, RepositoryError};
 use url::Url;
 
+mod support;
+use support::require_postgres_url;
+
 fn unique_value(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -44,8 +47,19 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
     )
 }
 
-fn rename(number: usize) -> ProviderUpdate {
-    ProviderUpdate::new().with_name(format!("renamed-{number}"))
+/// Names a provider within one run.
+///
+/// A provider name is unique across the whole store, and the PostgreSQL layer
+/// shares one database between runs, so every name this contract writes carries
+/// the run's unique prefix. Without it a second run collides with the rows the
+/// first run left behind and fails on a uniqueness conflict that has nothing to
+/// do with the interleaving under test.
+fn renamed_name(prefix: &str, number: usize) -> String {
+    format!("{prefix}-renamed-{number}")
+}
+
+fn rename(prefix: &str, number: usize) -> ProviderUpdate {
+    ProviderUpdate::new().with_name(renamed_name(prefix, number))
 }
 
 fn disable() -> ProviderUpdate {
@@ -106,7 +120,7 @@ where
         let edit = async move {
             edit_barrier.arrive_and_wait().await;
             edit_repository
-                .update(id, rename(round))
+                .update(id, rename(prefix, round))
                 .await
                 .expect("rename during rotation")
         };
@@ -133,7 +147,7 @@ where
             stored.gateway_api_key_hash().expose(),
             expected_hash.expose()
         );
-        assert_eq!(stored.name(), format!("renamed-{round}"));
+        assert_eq!(stored.name(), renamed_name(prefix, round));
         assert!(
             repository
                 .find_by_key_id(
@@ -205,7 +219,7 @@ where
         .await
         .expect("create provider for disjoint field edits");
     repository
-        .update(provider.id(), rename(300))
+        .update(provider.id(), rename(prefix, 300))
         .await
         .expect("first field edit");
     repository
@@ -222,7 +236,7 @@ where
         .await
         .expect("reload provider")
         .expect("provider still exists");
-    assert_eq!(stored.name(), "renamed-300");
+    assert_eq!(stored.name(), renamed_name(prefix, 300));
     assert_eq!(stored.status(), ProviderStatus::Disabled);
     assert_eq!(
         stored.upstream_api_key_ciphertext().expose(),
@@ -272,7 +286,7 @@ where
         .expect("reload provider")
         .expect("provider still exists");
     assert_eq!(stored.status(), ProviderStatus::Enabled);
-    assert_eq!(stored.name(), "renamed-300");
+    assert_eq!(stored.name(), renamed_name(prefix, 300));
 }
 
 async fn sqlite_database(path: &Path) -> SqliteDatabase {
@@ -294,13 +308,7 @@ async fn sqlite_concurrent_edits_never_overlap_a_rotation_or_a_disable() {
 
 #[tokio::test]
 async fn postgres_concurrent_edits_never_overlap_a_rotation_or_a_disable() {
-    let Some(url) = std::env::var("TOKENSTREAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        eprintln!("skipping PostgreSQL concurrency test: TOKENSTREAM_TEST_POSTGRES_URL is not set");
-        return;
-    };
+    let url = require_postgres_url("the PostgreSQL concurrent administration layer");
     let database = PostgresDatabase::connect(&url, 4)
         .await
         .expect("connect to PostgreSQL");
@@ -317,7 +325,7 @@ async fn a_missing_provider_is_reported_instead_of_created_by_an_edit() {
         database
             .update(
                 ProviderId::try_from(i64::MAX).expect("positive ID"),
-                rename(999),
+                rename(&unique_value("missing-edit"), 999),
             )
             .await
             .expect_err("an edit never creates a provider"),

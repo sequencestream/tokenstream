@@ -13,6 +13,9 @@ use tokenstream::persistence::{
 };
 use url::Url;
 
+mod support;
+use support::require_postgres_url;
+
 fn unique_value(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -193,15 +196,7 @@ async fn sqlite_exhausted_pool_fails_closed() {
 
 #[tokio::test]
 async fn postgres_storage_times_round_trip() {
-    let Some(url) = std::env::var("TOKENSTREAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        eprintln!(
-            "skipping PostgreSQL storage time test: TOKENSTREAM_TEST_POSTGRES_URL is not set"
-        );
-        return;
-    };
+    let url = require_postgres_url("the PostgreSQL storage time layer");
     let database = PostgresDatabase::connect(&url, 2)
         .await
         .expect("connect to PostgreSQL");
@@ -211,15 +206,7 @@ async fn postgres_storage_times_round_trip() {
 
 #[tokio::test]
 async fn postgres_exhausted_pool_fails_closed() {
-    let Some(url) = std::env::var("TOKENSTREAM_TEST_POSTGRES_URL")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        eprintln!(
-            "skipping PostgreSQL pool exhaustion test: TOKENSTREAM_TEST_POSTGRES_URL is not set"
-        );
-        return;
-    };
+    let url = require_postgres_url("the PostgreSQL pool exhaustion layer");
     let database =
         PostgresDatabase::connect_with_acquire_timeout(&url, 1, Duration::from_millis(200))
             .await
