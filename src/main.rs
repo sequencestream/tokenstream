@@ -1,6 +1,7 @@
 use tokenstream::RejectAll;
 use tokenstream::config::Config;
 use tokenstream::persistence::Database;
+use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 
 #[tokio::main]
 async fn main() {
@@ -22,12 +23,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.database_max_connections(),
     )
     .await?;
+    let admission = AdmissionControl::new(ProxyLimits::from_config(&config));
     tokenstream::run(
         config.data_listen_addr(),
         config.admin_listen_addr(),
         database,
         RejectAll,
         RejectAll,
+        admission,
         tokio::signal::ctrl_c(),
         config.shutdown_drain_timeout(),
     )

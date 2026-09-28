@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use hyper::Request;
 use hyper::body::Incoming;
+use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::{ControlPlaneAuthenticator, DataPlaneAuthenticator, MigrationRunner};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -33,6 +34,12 @@ impl ControlPlaneAuthenticator for PlaneCredentials {
 }
 
 struct ImmediateMigrations;
+
+fn admission(max_connections: usize) -> AdmissionControl {
+    AdmissionControl::new(
+        ProxyLimits::new(max_connections, 65_536, 1_048_576, 8_388_608, 32).expect("valid bounds"),
+    )
+}
 
 impl MigrationRunner for ImmediateMigrations {
     async fn run(&self) -> io::Result<()> {
@@ -105,6 +112,7 @@ async fn migrations_finish_before_either_plane_binds() -> io::Result<()> {
         },
         PlaneCredentials,
         PlaneCredentials,
+        admission(64),
         async move {
             shutdown_rx.await.map_err(io::Error::other)?;
             Ok(())
@@ -139,6 +147,7 @@ async fn planes_have_independent_routes_and_credentials() -> io::Result<()> {
         ImmediateMigrations,
         PlaneCredentials,
         PlaneCredentials,
+        admission(64),
         async move {
             shutdown_rx.await.map_err(io::Error::other)?;
             Ok(())
@@ -197,6 +206,7 @@ async fn shutdown_stops_accepting_and_has_a_fixed_upper_bound() -> io::Result<()
         ImmediateMigrations,
         PlaneCredentials,
         PlaneCredentials,
+        admission(64),
         async move {
             shutdown_rx.await.map_err(io::Error::other)?;
             Ok(())

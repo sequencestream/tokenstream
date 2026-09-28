@@ -83,6 +83,29 @@ macro_rules! opaque_identifier {
 opaque_identifier!(RequestId);
 opaque_identifier!(GatewayKeyId);
 
+impl RequestId {
+    /// Generates a fresh, opaque internal request identifier.
+    ///
+    /// The value is 128 random bits rendered as lowercase hexadecimal behind a
+    /// short `req_` prefix. It is not secret, never serves as a database key,
+    /// and is the only caller-visible identifier a local gateway error echoes.
+    pub fn generate() -> Self {
+        const RANDOM_BYTES: usize = 16;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let mut random = [0u8; RANDOM_BYTES];
+        getrandom::getrandom(&mut random).expect("the operating system random source is available");
+
+        let mut value = String::with_capacity(4 + RANDOM_BYTES * 2);
+        value.push_str("req_");
+        for byte in random {
+            value.push(HEX[usize::from(byte >> 4)] as char);
+            value.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+        Self(value)
+    }
+}
+
 macro_rules! protected_string {
     ($name:ident) => {
         #[derive(Clone, Eq, PartialEq)]
@@ -538,6 +561,25 @@ mod tests {
         assert_eq!(request_id.as_str(), "req_01JTEST");
         assert_eq!(row_id.get(), 42);
         assert_eq!(RequestId::new(""), Err(EmptyOpaqueValueError));
+    }
+
+    #[test]
+    fn generated_request_identifiers_are_opaque_and_distinct() {
+        let generated: std::collections::BTreeSet<String> = (0..64)
+            .map(|_| RequestId::generate().as_str().to_owned())
+            .collect();
+
+        assert_eq!(generated.len(), 64);
+        for value in generated {
+            assert!(value.starts_with("req_"), "{value}");
+            assert_eq!(value.len(), 4 + 32, "{value}");
+            assert!(
+                value[4..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+                "{value}"
+            );
+        }
     }
 
     #[test]

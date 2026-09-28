@@ -15,6 +15,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::domain::RequestId;
+use crate::proxy::admission::AdmissionControl;
+use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
+
 pub mod auth;
 pub mod config;
 pub mod crypto;
@@ -75,12 +79,17 @@ pub struct BoundPlanes {
 }
 
 /// Runs migrations, binds both planes, and serves until shutdown has drained or timed out.
+///
+/// This composition root assembles one dependency per plane concern, so its
+/// explicit parameter list is intentionally longer than the lint default.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<M, D, C, S>(
     data_address: SocketAddr,
     control_address: SocketAddr,
     migrations: M,
     data_authenticator: D,
     control_authenticator: C,
+    admission: AdmissionControl,
     shutdown: S,
     drain_timeout: Duration,
 ) -> io::Result<BoundPlanes>
@@ -104,6 +113,7 @@ where
         control_listener,
         Arc::new(data_authenticator),
         Arc::new(control_authenticator),
+        Arc::new(admission),
         shutdown,
         drain_timeout,
     )
@@ -116,6 +126,7 @@ async fn serve<D, C, S>(
     control_listener: TcpListener,
     data_authenticator: Arc<D>,
     control_authenticator: Arc<C>,
+    admission: Arc<AdmissionControl>,
     shutdown: S,
     drain_timeout: Duration,
 ) -> io::Result<()>
@@ -143,6 +154,7 @@ where
                     &mut connections,
                     stream,
                     Arc::clone(&data_authenticator),
+                    Arc::clone(&admission),
                     stop_receiver.clone(),
                     permit,
                 );
@@ -186,6 +198,7 @@ fn spawn_data_connection<D>(
     connections: &mut JoinSet<()>,
     stream: TcpStream,
     authenticator: Arc<D>,
+    admission: Arc<AdmissionControl>,
     mut stop: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
 ) where
@@ -195,7 +208,9 @@ fn spawn_data_connection<D>(
         let _permit = permit;
         let connection = http1::Builder::new().serve_connection(
             TokioIo::new(stream),
-            service_fn(move |request| data_route(request, Arc::clone(&authenticator))),
+            service_fn(move |request| {
+                data_route(request, Arc::clone(&authenticator), Arc::clone(&admission))
+            }),
         );
         tokio::pin!(connection);
         tokio::select! {
@@ -234,9 +249,15 @@ fn spawn_control_connection<C>(
     });
 }
 
+/// Routes one data-plane request.
+///
+/// Admission precedes authentication so an overloaded gateway performs no
+/// credential lookup and never queues work. The permit is held for the whole
+/// request and released on every exit path, including cancellation.
 async fn data_route<D>(
     request: Request<Incoming>,
     authenticator: Arc<D>,
+    admission: Arc<AdmissionControl>,
 ) -> Result<Response<ResponseBody>, hyper::Error>
 where
     D: DataPlaneAuthenticator,
@@ -244,6 +265,10 @@ where
     if is_health_request(&request) {
         return Ok(text_response(StatusCode::OK, "data plane ok\n"));
     }
+    let _permit = match admission.try_admit() {
+        Ok(permit) => permit,
+        Err(error) => return Ok(local_error_response(error)),
+    };
     if !authenticator.authenticate(&request) {
         return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
     }
@@ -276,4 +301,14 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<ResponseBod
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from_static(body.as_bytes())))
         .expect("static response is valid")
+}
+
+/// Renders a gateway-originated failure as its stable, sanitized error envelope.
+fn local_error_response(error: GatewayError) -> Response<ResponseBody> {
+    let body = error.render(&RequestId::generate());
+    Response::builder()
+        .status(error.status())
+        .header("content-type", ERROR_CONTENT_TYPE)
+        .body(Full::new(body))
+        .expect("a local error response is valid")
 }
