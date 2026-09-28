@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use sqlx::FromRow;
@@ -13,9 +14,78 @@ use crate::domain::{
 
 pub mod postgres;
 pub mod sqlite;
+pub mod time;
+
+use postgres::PostgresDatabase;
+use sqlite::SqliteDatabase;
 
 pub const MAX_PROVIDER_PAGE_SIZE: usize = 100;
 pub const MAX_REQUEST_LOG_PAGE_SIZE: usize = 100;
+
+/// Longest a storage operation waits for a pooled connection before failing closed.
+///
+/// The pool's connection count is the hard upper bound; this deadline keeps an
+/// exhausted pool from blocking an authentication lookup indefinitely. Exhaustion
+/// surfaces as [`RepositoryError::Storage`], a sanitized failure.
+pub const DEFAULT_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Storage backend selected from the configured database URL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DatabaseBackend {
+    Sqlite,
+    Postgres,
+}
+
+impl DatabaseBackend {
+    /// Selects a backend from a validated database URL.
+    ///
+    /// SQLite URLs use the `sqlite:` scheme; every other accepted URL targets
+    /// PostgreSQL.
+    pub fn from_url(database_url: &str) -> Self {
+        if database_url.starts_with("sqlite:") {
+            Self::Sqlite
+        } else {
+            Self::Postgres
+        }
+    }
+}
+
+/// One storage handle whose concrete backend is chosen from the database URL.
+#[derive(Clone, Debug)]
+pub enum Database {
+    Sqlite(SqliteDatabase),
+    Postgres(PostgresDatabase),
+}
+
+impl Database {
+    /// Connects to the backend selected from `database_url` with a bounded pool.
+    pub async fn connect(database_url: &str, max_connections: usize) -> Result<Self, sqlx::Error> {
+        match DatabaseBackend::from_url(database_url) {
+            DatabaseBackend::Sqlite => Ok(Self::Sqlite(
+                SqliteDatabase::connect(database_url, max_connections).await?,
+            )),
+            DatabaseBackend::Postgres => Ok(Self::Postgres(
+                PostgresDatabase::connect(database_url, max_connections).await?,
+            )),
+        }
+    }
+
+    pub fn backend(&self) -> DatabaseBackend {
+        match self {
+            Self::Sqlite(_) => DatabaseBackend::Sqlite,
+            Self::Postgres(_) => DatabaseBackend::Postgres,
+        }
+    }
+}
+
+impl crate::MigrationRunner for Database {
+    async fn run(&self) -> std::io::Result<()> {
+        match self {
+            Self::Sqlite(database) => crate::MigrationRunner::run(database).await,
+            Self::Postgres(database) => crate::MigrationRunner::run(database).await,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NewProvider {
@@ -381,6 +451,75 @@ pub trait RequestLogRepository: Send + Sync {
     async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError>;
 }
 
+#[allow(async_fn_in_trait)]
+impl ProviderRepository for Database {
+    async fn find_by_key_id(
+        &self,
+        key_id: &GatewayKeyId,
+    ) -> Result<Option<Provider>, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.find_by_key_id(key_id).await,
+            Self::Postgres(database) => database.find_by_key_id(key_id).await,
+        }
+    }
+
+    async fn list(&self, request: ProviderListRequest) -> Result<ProviderPage, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.list(request).await,
+            Self::Postgres(database) => database.list(request).await,
+        }
+    }
+
+    async fn create(&self, provider: NewProvider) -> Result<Provider, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.create(provider).await,
+            Self::Postgres(database) => database.create(provider).await,
+        }
+    }
+
+    async fn update(
+        &self,
+        id: ProviderId,
+        update: ProviderUpdate,
+    ) -> Result<Provider, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.update(id, update).await,
+            Self::Postgres(database) => database.update(id, update).await,
+        }
+    }
+
+    async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.delete(id).await,
+            Self::Postgres(database) => database.delete(id).await,
+        }
+    }
+}
+
+#[allow(async_fn_in_trait)]
+impl RequestLogRepository for Database {
+    async fn insert_started(&self, event: RequestLogStarted) -> Result<(), RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.insert_started(event).await,
+            Self::Postgres(database) => database.insert_started(event).await,
+        }
+    }
+
+    async fn apply_completed(&self, event: RequestLogCompleted) -> Result<(), RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.apply_completed(event).await,
+            Self::Postgres(database) => database.apply_completed(event).await,
+        }
+    }
+
+    async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.query(query).await,
+            Self::Postgres(database) => database.query(query).await,
+        }
+    }
+}
+
 #[derive(FromRow)]
 struct ProviderRow {
     id: i64,
@@ -411,8 +550,7 @@ impl ProviderRow {
             "disabled" => ProviderStatus::Disabled,
             _ => return Err(RepositoryError::InvalidStoredData),
         };
-        let created_at = DateTime::from_timestamp_micros(self.created_at)
-            .ok_or(RepositoryError::InvalidStoredData)?;
+        let created_at = time::from_epoch_micros(self.created_at)?;
 
         Ok(Provider::new(
             id,
@@ -457,14 +595,8 @@ impl RequestLogRow {
             .status_code
             .map(|value| u16::try_from(value).map_err(|_| RepositoryError::InvalidStoredData))
             .transpose()?;
-        let start_time = DateTime::from_timestamp_micros(self.start_time)
-            .ok_or(RepositoryError::InvalidStoredData)?;
-        let end_time = self
-            .end_time
-            .map(|value| {
-                DateTime::from_timestamp_micros(value).ok_or(RepositoryError::InvalidStoredData)
-            })
-            .transpose()?;
+        let start_time = time::from_epoch_micros(self.start_time)?;
+        let end_time = self.end_time.map(time::from_epoch_micros).transpose()?;
 
         Ok(RequestLog::new(
             id,
