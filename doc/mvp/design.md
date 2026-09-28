@@ -118,6 +118,10 @@ The same principles apply to the WebSocket handshake, except required upgrade he
 
 The HTTP proxy builds the upstream URI from the configured endpoint plus the validated path and original query string. Endpoint configuration is an origin plus an optional base-path prefix; URI joining must reject path traversal and must not silently discard the prefix.
 
+Production HTTP/SSE upstream connections use TLS with certificate-chain and hostname verification against system trust roots. An explicitly configured system certificate bundle may supply private trust anchors; certificate verification cannot be disabled. Plain HTTP upstreams remain restricted to explicit development mode. TLS failures before an upstream response use the sanitized connection-failure contract.
+
+The formal data-plane listener composes admission, asynchronous authentication, immutable snapshots, route validation, and transport forwarding. The direct downstream socket address supplies forwarding metadata. An internally generated request identifier is returned with local errors and proxy responses and correlates lifecycle records. HTTP admission remains held until the streaming response ends or is dropped. Upgraded WebSocket work remains owned by the downstream connection supervisor, so shutdown drains or cancels both transports before closing the logging channel. Forced shutdown leaves unfinished WebSocket records incomplete rather than inventing a close event.
+
 Request and response bodies use bounded streaming with backpressure. The proxy does not coalesce SSE events, split on newlines, decompress content, inspect content types to alter behavior, or buffer a complete body. Client cancellation cancels the related upstream request. Upstream EOF, errors, and timeouts are propagated downstream as far as the HTTP state permits; no retry is attempted.
 
 ### 4.6 WebSocket Proxy
@@ -366,6 +370,8 @@ New requests using the old credential fail immediately after the committed chang
 ## 9. Verification Strategy
 
 The implementation is complete only when the following layers pass:
+
+The process-level smoke contracts require Python 3 and OpenSSL to create ephemeral local TLS fixtures. They start the production gateway, configure providers through its administration API, and exercise trusted and rejected certificates, HTTP/SSE, WebSocket, cancellation, overload, and bounded shutdown without external upstream services. These supplement the pinned-client and sustained-load gates; they do not replace them.
 
 1. **Unit tests:** credential parsing, hash verification, encryption round trips and tamper rejection, URI joining, route matrix, hop-by-hop header removal, redaction, cursor encoding, and state transitions.
 2. **Repository tests:** migrations and identical behavioral tests against SQLite and PostgreSQL, including uniqueness and delete restrictions.

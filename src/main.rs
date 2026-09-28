@@ -1,9 +1,9 @@
-use tokenstream::RejectAll;
 use tokenstream::admin::AdminApi;
 use tokenstream::config::Config;
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::persistence::Database;
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
+use tokenstream::proxy::gateway::Gateway;
 use tokenstream::telemetry::Metrics;
 
 #[tokio::main]
@@ -43,11 +43,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.development_mode(),
         config.admin_password_hash().expose().to_owned(),
     );
+    let gateway = Gateway::new(&config, database.clone(), log_sink.clone(), metrics.clone());
     tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),
         config.admin_listen_addr(),
         database,
-        RejectAll,
+        gateway,
         admin_api,
         admission,
         metrics,

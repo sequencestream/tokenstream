@@ -16,8 +16,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::domain::RequestId;
-use crate::proxy::admission::AdmissionControl;
-use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
+use crate::proxy::admission::{AdmissionControl, AdmissionPermit};
+use crate::proxy::error::GatewayError;
+use crate::proxy::gateway::{Exchange, Session, boxed, error_response};
 use crate::telemetry::{Metrics, ProxyFailureCategory};
 
 pub mod admin;
@@ -43,6 +44,41 @@ pub trait MigrationRunner: Send + Sync {
 /// Authenticates requests entering the data-plane route tree.
 pub trait DataPlaneAuthenticator: Send + Sync + 'static {
     fn authenticate(&self, request: &Request<Incoming>) -> bool;
+}
+
+/// Serves admitted requests and returns any connection-owned upgraded session.
+pub trait DataPlaneService: Send + Sync + 'static {
+    fn serve(
+        &self,
+        request: Request<Incoming>,
+        peer: SocketAddr,
+        permit: AdmissionPermit,
+        id: RequestId,
+        metrics: Metrics,
+    ) -> impl Future<Output = Exchange> + Send;
+}
+
+impl<T: DataPlaneAuthenticator> DataPlaneService for T {
+    async fn serve(
+        &self,
+        request: Request<Incoming>,
+        _peer: SocketAddr,
+        _permit: AdmissionPermit,
+        id: RequestId,
+        metrics: Metrics,
+    ) -> Exchange {
+        let error = if self.authenticate(&request) {
+            GatewayError::UnsupportedRoute
+        } else {
+            GatewayError::InvalidGatewayCredential
+        };
+        metrics.record_failure(if error == GatewayError::UnsupportedRoute {
+            ProxyFailureCategory::UnsupportedRoute
+        } else {
+            ProxyFailureCategory::InvalidGatewayCredential
+        });
+        (error_response(error, &id), None)
+    }
 }
 
 /// Authenticates requests entering the control-plane route tree.
@@ -119,7 +155,7 @@ pub async fn run<M, D, C, S>(
 ) -> io::Result<BoundPlanes>
 where
     M: MigrationRunner,
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneAuthenticator,
     S: Future<Output = io::Result<()>>,
 {
@@ -156,7 +192,7 @@ pub async fn run_with_logging<M, D, C, S, L>(
 ) -> io::Result<BoundPlanes>
 where
     M: MigrationRunner,
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneAuthenticator,
     S: Future<Output = io::Result<()>>,
     L: crate::logging::LogStore,
@@ -196,7 +232,7 @@ pub async fn run_with_control_and_logging<M, D, C, S, L>(
 ) -> io::Result<BoundPlanes>
 where
     M: MigrationRunner,
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneService,
     S: Future<Output = io::Result<()>>,
     L: crate::logging::LogStore,
@@ -244,7 +280,7 @@ async fn run_observed<M, D, C, S>(
 ) -> io::Result<BoundPlanes>
 where
     M: MigrationRunner,
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneAuthenticator,
     S: Future<Output = io::Result<()>>,
 {
@@ -276,7 +312,7 @@ async fn run_observed_with_control<M, D, C, S>(
 ) -> io::Result<BoundPlanes>
 where
     M: MigrationRunner,
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneService,
     S: Future<Output = io::Result<()>>,
 {
@@ -315,7 +351,7 @@ async fn serve<D, C, S>(
     drain_timeout: Duration,
 ) -> io::Result<()>
 where
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
     C: ControlPlaneService,
     S: Future<Output = io::Result<()>>,
 {
@@ -389,21 +425,35 @@ fn spawn_data_connection<D>(
     mut stop: watch::Receiver<bool>,
     permit: OwnedSemaphorePermit,
 ) where
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
 {
     connections.spawn(async move {
         let _permit = permit;
-        let connection = http1::Builder::new().serve_connection(
-            TokioIo::new(stream),
-            service_fn(move |request| {
-                data_route(
-                    request,
-                    Arc::clone(&authenticator),
-                    Arc::clone(&admission),
-                    metrics.clone(),
-                )
-            }),
-        );
+        let peer = match stream.peer_addr() {
+            Ok(peer) => peer,
+            Err(_) => return,
+        };
+        let session: Arc<std::sync::Mutex<Option<Session>>> = Arc::default();
+        let session_slot = session.clone();
+        let connection = http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(move |request| {
+                    let authenticator = authenticator.clone();
+                    let admission = admission.clone();
+                    let metrics = metrics.clone();
+                    let session_slot = session_slot.clone();
+                    async move {
+                        let (response, relay) =
+                            data_route(request, authenticator, admission, metrics, peer).await;
+                        if let Some(relay) = relay {
+                            *session_slot.lock().expect("session lock") = Some(relay);
+                        }
+                        Ok::<_, hyper::Error>(response)
+                    }
+                }),
+            )
+            .with_upgrades();
         tokio::pin!(connection);
         tokio::select! {
             _ = &mut connection => {}
@@ -411,6 +461,10 @@ fn spawn_data_connection<D>(
                 connection.as_mut().graceful_shutdown();
                 let _ = connection.await;
             }
+        }
+        let relay = session.lock().expect("session lock").take();
+        if let Some(relay) = relay {
+            relay.await;
         }
     });
 }
@@ -456,23 +510,25 @@ async fn data_route<D>(
     authenticator: Arc<D>,
     admission: Arc<AdmissionControl>,
     metrics: Metrics,
-) -> Result<Response<ResponseBody>, hyper::Error>
+    peer: SocketAddr,
+) -> Exchange
 where
-    D: DataPlaneAuthenticator,
+    D: DataPlaneService,
 {
     if is_health_request(&request) {
-        return Ok(text_response(StatusCode::OK, "data plane ok\n"));
+        return (
+            text_response(StatusCode::OK, "data plane ok\n").map(boxed),
+            None,
+        );
     }
-    let _permit = match admission.try_admit() {
+    let id = RequestId::generate();
+    let permit = match admission.try_admit() {
         Ok(permit) => permit,
-        Err(error) => return Ok(local_error_response(error)),
+        Err(error) => return (error_response(error, &id), None),
     };
-    if !authenticator.authenticate(&request) {
-        metrics.record_failure(ProxyFailureCategory::InvalidGatewayCredential);
-        return Ok(text_response(StatusCode::UNAUTHORIZED, "unauthorized\n"));
-    }
-    metrics.record_failure(ProxyFailureCategory::UnsupportedRoute);
-    Ok(text_response(StatusCode::NOT_FOUND, "not found\n"))
+    authenticator
+        .serve(request, peer, permit, id, metrics)
+        .await
 }
 
 async fn control_route<C>(
@@ -513,14 +569,4 @@ fn text_response(status: StatusCode, body: &'static str) -> Response<ResponseBod
         .header("content-type", "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from_static(body.as_bytes())))
         .expect("static response is valid")
-}
-
-/// Renders a gateway-originated failure as its stable, sanitized error envelope.
-fn local_error_response(error: GatewayError) -> Response<ResponseBody> {
-    let body = error.render(&RequestId::generate());
-    Response::builder()
-        .status(error.status())
-        .header("content-type", ERROR_CONTENT_TYPE)
-        .body(Full::new(body))
-        .expect("a local error response is valid")
 }

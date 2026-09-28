@@ -308,7 +308,7 @@ fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
 
 /// Response-body observer that completes an HTTP lifecycle on EOF, failure, or cancellation.
 pub struct LoggedBody<B> {
-    inner: B,
+    inner: Option<B>,
     lifecycle: RequestLogLifecycle,
     status: StatusCode,
     finished: bool,
@@ -321,7 +321,7 @@ where
     pub fn new(inner: B, lifecycle: RequestLogLifecycle, status: StatusCode) -> Self {
         let finished = inner.is_end_stream();
         let mut body = Self {
-            inner,
+            inner: Some(inner),
             lifecycle,
             status,
             finished: false,
@@ -335,6 +335,7 @@ where
     fn finish(&mut self, error: Option<&'static str>) {
         if !self.finished {
             self.finished = true;
+            drop(self.inner.take());
             self.lifecycle.complete(Some(self.status), error);
         }
     }
@@ -352,7 +353,10 @@ where
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
-        match Pin::new(&mut this.inner).poll_frame(context) {
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(inner).poll_frame(context) {
             Poll::Ready(None) => {
                 this.finish(None);
                 Poll::Ready(None)
@@ -361,16 +365,26 @@ where
                 this.finish(Some("stream_failed"));
                 Poll::Ready(Some(Err(error)))
             }
-            other => other,
+            Poll::Ready(Some(Ok(frame))) => {
+                if this.inner.as_ref().is_some_and(Body::is_end_stream) {
+                    this.finish(None);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.finished || self.inner.is_end_stream()
+        self.finished || self.inner.as_ref().is_none_or(Body::is_end_stream)
     }
 
     fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
+        self.inner.as_ref().map(Body::size_hint).unwrap_or_else(|| {
+            let mut hint = SizeHint::new();
+            hint.set_exact(0);
+            hint
+        })
     }
 }
 
@@ -378,6 +392,7 @@ impl<B> Drop for LoggedBody<B> {
     fn drop(&mut self) {
         if !self.finished {
             self.finished = true;
+            drop(self.inner.take());
             self.lifecycle
                 .complete(Some(self.status), Some("downstream_cancelled"));
         }

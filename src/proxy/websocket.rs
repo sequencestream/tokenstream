@@ -46,6 +46,8 @@ const NORMAL_CLOSE_CODE: u16 = 1000;
 const MESSAGE_TOO_LARGE_CODE: u16 = 1009;
 const MESSAGE_TOO_LARGE_REASON: &str = "message exceeds configured limit";
 
+pub type RelayFuture = std::pin::Pin<Box<dyn std::future::Future<Output = RelayOutcome> + Send>>;
+
 type UpstreamSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// Result of preparing a downstream WebSocket handshake.
 pub struct Handshake {
@@ -167,6 +169,24 @@ impl WebSocketProxy {
         downstream_peer: SocketAddr,
         request: &mut Request<Incoming>,
     ) -> Result<Handshake, GatewayError> {
+        let (response, relay) = self
+            .prepare(snapshot, route, query, downstream_peer, request)
+            .await?;
+        Ok(Handshake {
+            response,
+            relay: relay.map(tokio::spawn),
+        })
+    }
+
+    /// Prepares a relay owned and polled by the downstream connection supervisor.
+    pub async fn prepare(
+        &self,
+        snapshot: &ProviderSnapshot,
+        route: &ResolvedRoute,
+        query: Option<&str>,
+        downstream_peer: SocketAddr,
+        request: &mut Request<Incoming>,
+    ) -> Result<(Response<Full<Bytes>>, Option<RelayFuture>), GatewayError> {
         let downstream_key = single_header(request.headers(), SEC_WEBSOCKET_KEY)
             .ok_or(GatewayError::InvalidUpgrade)?
             .as_bytes()
@@ -205,25 +225,19 @@ impl WebSocketProxy {
             Err(_) => return Err(GatewayError::UpstreamTimeout),
             Ok(Ok(result)) => result,
             Ok(Err(WebSocketError::Http(response))) => {
-                return Ok(Handshake {
-                    response: rejected_response(*response),
-                    relay: None,
-                });
+                return Ok((rejected_response(*response), None));
             }
             Ok(Err(_)) => return Err(GatewayError::UpstreamConnectFailed),
         };
 
         let response = switching_protocols(&downstream_key, upstream_response.headers())?;
-        let relay = tokio::spawn(run_after_upgrade(
+        let relay: RelayFuture = Box::pin(run_after_upgrade(
             on_upgrade,
             upstream,
             self.config,
             self.idle_timeout,
         ));
-        Ok(Handshake {
-            response,
-            relay: Some(relay),
-        })
+        Ok((response, Some(relay)))
     }
 
     /// Performs the handshake while emitting start and completion metadata to

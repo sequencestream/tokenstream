@@ -14,6 +14,7 @@ futures-util = { version = "0.3.31", features = ["sink"] }
 getrandom = "0.2.17"
 http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

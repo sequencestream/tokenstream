@@ -49,7 +49,7 @@ use crate::telemetry::Metrics;
 /// pools transport connections but holds no credential: every call re-reads the
 /// request-local snapshot it is handed.
 pub struct HttpProxy<B> {
-    client: Client<HttpConnector, IdleTimeoutBody<B>>,
+    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, IdleTimeoutBody<B>>,
     header_timeout: Duration,
     idle_timeout: Duration,
     metrics: Metrics,
@@ -84,6 +84,13 @@ where
         let mut connector = HttpConnector::new();
         connector.set_connect_timeout(Some(connect_timeout));
         connector.set_nodelay(true);
+        connector.enforce_http(false);
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("system TLS trust roots must be available")
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(connector);
         let mut builder = Client::builder(TokioExecutor::new());
         builder.retry_canceled_requests(false);
         let client = builder.build(connector);

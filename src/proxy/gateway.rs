@@ -1,0 +1,213 @@
+//! Production data-plane composition with connection-owned streaming work.
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
+use hyper::body::{Body, Frame, Incoming, SizeHint};
+use hyper::{Request, Response};
+
+use crate::auth::GatewayAuthenticator;
+use crate::config::Config;
+use crate::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
+use crate::domain::{RequestId, TransportType};
+use crate::logging::{LogSink, RequestLogLifecycle, observe_response};
+use crate::persistence::Database;
+use crate::proxy::admission::{AdmissionPermit, ProxyLimits};
+use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
+use crate::proxy::http::HttpProxy;
+use crate::proxy::websocket::{RelayOutcome, WebSocketProxy};
+use crate::routing::resolve_route;
+use crate::telemetry::Metrics;
+
+pub type DataBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
+pub type Session = Pin<Box<dyn Future<Output = ()> + Send>>;
+pub type Exchange = (Response<DataBody>, Option<Session>);
+
+pub fn boxed<B>(body: B) -> DataBody
+where
+    B: Body<Data = Bytes> + Send + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    body.map_err(Into::into).boxed_unsync()
+}
+
+pub struct Gateway {
+    authenticator: GatewayAuthenticator<Database, AesGcmCipher, Argon2GatewaySecretVerifier>,
+    http: HttpProxy<Incoming>,
+    websocket: WebSocketProxy,
+    logs: LogSink,
+}
+
+impl Gateway {
+    pub fn new(config: &Config, database: Database, logs: LogSink, metrics: Metrics) -> Self {
+        Self {
+            authenticator: GatewayAuthenticator::new(
+                database,
+                AesGcmCipher::new(config.master_key().expose()),
+                Argon2GatewaySecretVerifier::new(),
+            ),
+            http: HttpProxy::with_metrics(
+                config.upstream_connect_timeout(),
+                config.upstream_header_timeout(),
+                config.stream_idle_timeout(),
+                metrics.clone(),
+            ),
+            websocket: WebSocketProxy::with_metrics(
+                config.upstream_connect_timeout(),
+                config.upstream_header_timeout(),
+                config.stream_idle_timeout(),
+                &ProxyLimits::from_config(config),
+                metrics,
+            ),
+            logs,
+        }
+    }
+
+    async fn forward(
+        &self,
+        mut request: Request<Incoming>,
+        peer: SocketAddr,
+        permit: AdmissionPermit,
+        id: RequestId,
+    ) -> Result<Exchange, GatewayError> {
+        let snapshot = self.authenticator.authenticate(request.headers()).await?;
+        let route = resolve_route(
+            snapshot.protocol_type(),
+            request.method(),
+            request.uri().path(),
+            request.headers(),
+        )?;
+        let query = request.uri().query().map(str::to_owned);
+        if route.transport() == TransportType::Http {
+            let response = self
+                .http
+                .forward_logged(
+                    &snapshot,
+                    &route,
+                    query.as_deref(),
+                    peer,
+                    request,
+                    self.logs.clone(),
+                    id,
+                )
+                .await?;
+            return Ok((
+                response.map(|body| {
+                    boxed(PermittedBody {
+                        inner: body,
+                        _permit: permit,
+                    })
+                }),
+                None,
+            ));
+        }
+        let mut lifecycle = RequestLogLifecycle::start(self.logs.clone(), id, &snapshot, &route)
+            .observe_websocket();
+        let (response, relay) = match self
+            .websocket
+            .prepare(&snapshot, &route, query.as_deref(), peer, &mut request)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                lifecycle.complete(None, Some(error.code()));
+                return Err(error);
+            }
+        };
+        let status = response.status();
+        match relay {
+            None => Ok((
+                observe_response(response, lifecycle).map(|inner| {
+                    boxed(PermittedBody {
+                        inner,
+                        _permit: permit,
+                    })
+                }),
+                None,
+            )),
+            Some(relay) => {
+                let session: Session = Box::pin(async move {
+                    let _permit = permit;
+                    let outcome = relay.await;
+                    let error = match outcome {
+                        RelayOutcome::Closed => None,
+                        RelayOutcome::MessageTooLarge => Some("message_too_large"),
+                        RelayOutcome::IdleTimeout => Some("idle_timeout"),
+                        RelayOutcome::Failed => Some("relay_failed"),
+                    };
+                    lifecycle.complete(Some(status), error);
+                });
+                Ok((response.map(boxed), Some(session)))
+            }
+        }
+    }
+}
+
+impl crate::DataPlaneService for Gateway {
+    async fn serve(
+        &self,
+        request: Request<Incoming>,
+        peer: SocketAddr,
+        permit: AdmissionPermit,
+        id: RequestId,
+        metrics: Metrics,
+    ) -> Exchange {
+        let mut result = match self.forward(request, peer, permit, id.clone()).await {
+            Ok(result) => result,
+            Err(error) => {
+                use crate::telemetry::ProxyFailureCategory as Category;
+                let category = match error {
+                    GatewayError::InvalidGatewayCredential => {
+                        Some(Category::InvalidGatewayCredential)
+                    }
+                    GatewayError::ProviderDisabled => Some(Category::ProviderDisabled),
+                    GatewayError::UnsupportedRoute => Some(Category::UnsupportedRoute),
+                    GatewayError::InvalidUpgrade => Some(Category::InvalidUpgrade),
+                    _ => None,
+                };
+                if let Some(category) = category {
+                    metrics.record_failure(category);
+                }
+                (error_response(error, &id), None)
+            }
+        };
+        result.0.headers_mut().insert(
+            "x-request-id",
+            id.as_str().parse().expect("generated request ID"),
+        );
+        result
+    }
+}
+
+pub fn error_response(error: GatewayError, id: &RequestId) -> Response<DataBody> {
+    Response::builder()
+        .status(error.status())
+        .header("content-type", ERROR_CONTENT_TYPE)
+        .header("x-request-id", id.as_str())
+        .body(boxed(Full::new(error.render(id))))
+        .expect("safe error response")
+}
+
+struct PermittedBody<B> {
+    inner: B,
+    _permit: AdmissionPermit,
+}
+impl<B: Body<Data = Bytes> + Unpin> Body for PermittedBody<B> {
+    type Data = Bytes;
+    type Error = B::Error;
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, B::Error>>> {
+        Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
+}
