@@ -143,6 +143,42 @@ where
     );
     assert_eq!(unchanged.status(), ProviderStatus::Enabled);
 
+    let rotated_key =
+        GatewayKeyId::new(format!("{prefix}-rotated-key-1")).expect("non-empty key ID");
+    let rotated_hash = PasswordHash::new(format!("{prefix}-rotated-hash-1"));
+    let rotated = repository
+        .rotate_gateway_key(second.id(), rotated_key.clone(), rotated_hash.clone())
+        .await
+        .expect("rotate gateway key");
+    assert_eq!(rotated.id(), second.id());
+    assert_eq!(rotated.gateway_key_id(), &rotated_key);
+    assert_eq!(
+        rotated.gateway_api_key_hash().expose(),
+        rotated_hash.expose()
+    );
+    assert_eq!(rotated.name(), format!("{prefix}-provider-1"));
+    assert_eq!(
+        rotated.endpoint().as_str(),
+        "https://provider-1.example.com/base"
+    );
+    assert_eq!(rotated.status(), ProviderStatus::Enabled);
+    assert!(
+        repository
+            .find_by_key_id(&second_original_key)
+            .await
+            .expect("retired key lookup")
+            .is_none()
+    );
+    assert_eq!(
+        repository
+            .find_by_key_id(&rotated_key)
+            .await
+            .expect("rotated key lookup")
+            .expect("rotated key resolves")
+            .id(),
+        second.id()
+    );
+
     let mut ids = vec![first.id(), second.id()];
     for number in 2..14 {
         ids.push(
@@ -216,6 +252,18 @@ where
             .expect_err("missing delete is rejected"),
         RepositoryError::NotFound
     );
+    assert_eq!(
+        repository
+            .rotate_gateway_key(
+                missing_id,
+                GatewayKeyId::new(format!("{prefix}-missing-key")).expect("non-empty key ID"),
+                PasswordHash::new(format!("{prefix}-missing-hash")),
+            )
+            .await
+            .expect_err("missing rotation is rejected"),
+        RepositoryError::NotFound
+    );
+
     ids
 }
 

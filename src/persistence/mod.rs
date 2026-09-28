@@ -441,6 +441,13 @@ pub trait ProviderRepository: Send + Sync {
         update: ProviderUpdate,
     ) -> Result<Provider, RepositoryError>;
 
+    async fn rotate_gateway_key(
+        &self,
+        id: ProviderId,
+        key_id: GatewayKeyId,
+        hash: PasswordHash,
+    ) -> Result<Provider, RepositoryError>;
+
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError>;
 }
 
@@ -494,6 +501,18 @@ impl ProviderRepository for Database {
         match self {
             Self::Sqlite(database) => database.update(id, update).await,
             Self::Postgres(database) => database.update(id, update).await,
+        }
+    }
+
+    async fn rotate_gateway_key(
+        &self,
+        id: ProviderId,
+        key_id: GatewayKeyId,
+        hash: PasswordHash,
+    ) -> Result<Provider, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.rotate_gateway_key(id, key_id, hash).await,
+            Self::Postgres(database) => database.rotate_gateway_key(id, key_id, hash).await,
         }
     }
 

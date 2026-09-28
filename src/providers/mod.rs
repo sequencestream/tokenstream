@@ -154,6 +154,38 @@ impl CreatedProvider {
     }
 }
 
+/// The stored provider record together with its freshly rotated credential.
+///
+/// The new credential is returned here and only here. The previous credential
+/// stops authenticating as soon as the replacement is committed, while any
+/// snapshot already handed to an active stream or connection is unaffected.
+#[derive(Debug)]
+pub struct RotatedProvider {
+    provider: Provider,
+    gateway_credential: GatewayCredential,
+}
+
+impl RotatedProvider {
+    fn new(provider: Provider, gateway_credential: GatewayCredential) -> Self {
+        Self {
+            provider,
+            gateway_credential,
+        }
+    }
+
+    pub fn provider(&self) -> &Provider {
+        &self.provider
+    }
+
+    pub fn gateway_credential(&self) -> &GatewayCredential {
+        &self.gateway_credential
+    }
+
+    pub fn into_parts(self) -> (Provider, GatewayCredential) {
+        (self.provider, self.gateway_credential)
+    }
+}
+
 /// A provider service failure that carries no name, endpoint, key, or hash.
 ///
 /// Every variant renders as a stable, non-sensitive description so a failure
@@ -273,6 +305,35 @@ where
             .map_err(map_repository_error)?;
 
         Ok(CreatedProvider::new(provider, gateway_credential))
+    }
+
+    /// Issues a new gateway credential and replaces the stored key material.
+    ///
+    /// The key identifier and its hash are replaced together in one storage
+    /// write, so a concurrent reader never observes a half-rotated provider.
+    /// The new credential is returned once; requests that used the previous
+    /// one fail after the replacement is committed, while snapshots already
+    /// held by active streams or connections keep working.
+    pub async fn rotate_gateway_credential(
+        &self,
+        id: ProviderId,
+    ) -> Result<RotatedProvider, ProviderServiceError> {
+        let (gateway_credential, gateway_api_key_hash) = self
+            .verifier
+            .issue()
+            .map_err(|_| ProviderServiceError::Credential)?;
+
+        let provider = self
+            .repository
+            .rotate_gateway_key(
+                id,
+                gateway_credential.key_id().clone(),
+                gateway_api_key_hash,
+            )
+            .await
+            .map_err(map_repository_error)?;
+
+        Ok(RotatedProvider::new(provider, gateway_credential))
     }
 
     /// Applies a partial edit, committing only the named fields.

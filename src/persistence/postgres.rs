@@ -5,7 +5,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::MigrationRunner;
-use crate::domain::{GatewayKeyId, Provider, ProviderId};
+use crate::domain::{GatewayKeyId, PasswordHash, Provider, ProviderId};
 
 use super::time::to_epoch_micros;
 use super::{
@@ -168,6 +168,29 @@ impl ProviderRepository for PostgresDatabase {
         .bind(update.gateway_key_id.as_str())
         .bind(update.gateway_api_key_hash.expose())
         .bind(status_value(update.status))
+        .bind(id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_write_error)?
+        .ok_or(RepositoryError::NotFound)?
+        .into_provider()
+    }
+
+    async fn rotate_gateway_key(
+        &self,
+        id: ProviderId,
+        key_id: GatewayKeyId,
+        hash: PasswordHash,
+    ) -> Result<Provider, RepositoryError> {
+        sqlx::query_as::<_, ProviderRow>(
+            "UPDATE provider
+             SET gateway_key_id = $1, gateway_api_key_hash = $2
+             WHERE id = $3
+             RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+                       gateway_key_id, gateway_api_key_hash, status, created_at",
+        )
+        .bind(key_id.as_str())
+        .bind(hash.expose())
         .bind(id.get())
         .fetch_optional(&self.pool)
         .await
