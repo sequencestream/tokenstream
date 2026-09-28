@@ -346,6 +346,70 @@ def stored_key_recovery(directory, plain):
     print('passed stored upstream key recovery across a process restart')
 
 
+def shutdown_by_signal(directory, plain, stop, label):
+    """A real process receiving SIGINT or SIGTERM enters the same drain path.
+
+    Held HTTP/SSE and WebSocket work may finish inside the drain window; once
+    that window ends they are cancelled. Forced cancellation must not invent a
+    WebSocket completion, and both listeners must stop accepting.
+    """
+    process, data_port, admin_port = start(directory, f'shutdown-{label}', '22' * 32)
+    opened = []
+    try:
+        status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', b'{"password":"test-admin"}')
+        assert status == 200, body
+        auth = {'Cookie': headers['set-cookie'].split(';')[0], 'x-csrf-token': json.loads(body)['csrf_token'], 'content-type': 'application/json'}
+        created = json.dumps(dict(name=f'shutdown-{label}', protocol_type='openai',
+                                  endpoint=f'http://127.0.0.1:{plain.server_port}',
+                                  upstream_api_key='upstream-secret', status='enabled')).encode()
+        status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', created, auth)
+        assert status == 201, response
+        credential = json.loads(response)['gateway_api_key']
+        baseline = active
+        sock, stream = websocket(data_port, credential)
+        opened += [stream, sock]
+        hold = http.client.HTTPConnection('127.0.0.1', data_port, timeout=5)
+        hold.request('POST', '/v1/responses', PAYLOAD, {'authorization': 'Bearer ' + credential, 'x-test-mode': 'hold'})
+        held = hold.getresponse()
+        assert held.status == 200
+        assert held.read(3) == SSE[:3], 'SSE must arrive while upstream remains open'
+        opened += [held, hold]
+        wait_for(lambda: active >= baseline + 2, 'held sessions did not register with upstream')
+        assert exchange(data_port, 'GET', '/healthz')[0] == 200
+        started = time.monotonic()
+        process.send_signal(stop)
+        assert process.wait(timeout=4) == 0
+        assert time.monotonic() - started < 3, 'shutdown must keep a process-level upper bound'
+        wait_for(lambda: active <= baseline, 'shutdown left upstream sessions alive')
+
+        def listeners_closed():
+            for port in (data_port, admin_port):
+                try:
+                    socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
+                    return False
+                except OSError:
+                    continue
+            return True
+
+        wait_for(listeners_closed, 'shutdown left a listener accepting connections')
+        rows = sqlite3.connect(directory / f'shutdown-{label}.db').execute(
+            'select request_id, transport_type, path, end_time, error_msg from request_log'
+        ).fetchall()
+        assert rows, 'shutdown must flush started request logs'
+        assert all(row[3] is not None for row in rows if row[1] == 'http')
+        websocket_rows = [row for row in rows if row[1] == 'websocket']
+        assert len(websocket_rows) == 1
+        assert websocket_rows[0][3] is None, 'forced shutdown must not invent completion'
+        assert any(row[4] == 'downstream_cancelled' for row in rows if row[1] == 'http')
+        print('passed', label, 'graceful shutdown')
+    finally:
+        for item in opened:
+            item.close()
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+
 def refused_handshake_body(data_port, credential):
     """A refused upgrade relays its whole body through the production entry.
 
@@ -537,6 +601,7 @@ with tempfile.TemporaryDirectory() as temp:
         for capacity in [3, 70]:
             run_case(directory, trusted, untrusted, plain, True, capacity)
         stored_key_recovery(directory, plain)
+        shutdown_by_signal(directory, plain, signal.SIGTERM, 'term')
     finally:
         release.set()
         for srv in [trusted, untrusted, plain]:

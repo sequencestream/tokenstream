@@ -69,7 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         admin_api,
         admission,
         metrics,
-        tokio::signal::ctrl_c(),
+        tokenstream::wait_for_shutdown_signal(),
         config.shutdown_drain_timeout(),
         log_sink,
         log_worker,

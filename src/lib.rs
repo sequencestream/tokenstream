@@ -176,6 +176,29 @@ pub struct BoundPlanes {
     pub control: SocketAddr,
 }
 
+/// Completes when the process should enter graceful shutdown.
+///
+/// Unix deployments treat SIGINT and SIGTERM as the same stop request, so
+/// interactive interrupt and orchestrated termination share drain and flush.
+/// Other platforms wait for the interactive interrupt equivalent.
+pub async fn wait_for_shutdown_signal() -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
+}
+
 /// Runs migrations, binds both planes, and serves until shutdown has drained or timed out.
 ///
 /// This composition root assembles one dependency per plane concern, so its
