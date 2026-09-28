@@ -253,6 +253,80 @@ impl ProviderSnapshot {
     }
 }
 
+/// Separator between the key identifier and the secret in the external
+/// credential representation.
+pub const GATEWAY_CREDENTIAL_SEPARATOR: char = '.';
+
+/// Random bytes in a generated gateway key identifier.
+pub const GATEWAY_KEY_ID_BYTES: usize = 16;
+
+/// Random bytes in a generated gateway secret: 256 bits of entropy.
+pub const GATEWAY_SECRET_BYTES: usize = 32;
+
+/// Encoded length of a generated key identifier in the credential format.
+pub const GATEWAY_KEY_ID_LENGTH: usize = encoded_credential_length(GATEWAY_KEY_ID_BYTES);
+
+/// Encoded length of a generated secret in the credential format.
+pub const GATEWAY_SECRET_LENGTH: usize = encoded_credential_length(GATEWAY_SECRET_BYTES);
+
+/// Longest external credential the parser will consider.
+pub const MAX_GATEWAY_CREDENTIAL_LEN: usize = MAX_KEY_ID_LEN + 1 + MAX_SECRET_LEN;
+
+const MIN_SECRET_LEN: usize = GATEWAY_SECRET_LENGTH;
+const MAX_KEY_ID_LEN: usize = 128;
+const MAX_SECRET_LEN: usize = 128;
+
+/// Length of `bytes` once encoded as URL-safe base64 without padding.
+const fn encoded_credential_length(bytes: usize) -> usize {
+    bytes / 3 * 4
+        + match bytes % 3 {
+            0 => 0,
+            1 => 2,
+            _ => 3,
+        }
+}
+
+/// Rejection reason for an external credential that is not a well-formed
+/// `<key-id>.<secret>` pair. It never carries credential characters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CredentialFormatError {
+    /// The credential is empty.
+    Empty,
+    /// The credential or one of its components exceeds the accepted length.
+    TooLong,
+    /// The credential does not contain the key-id/secret separator.
+    MissingSeparator,
+    /// The key identifier or secret component is empty.
+    EmptyComponent,
+    /// The key identifier is not a valid non-secret lookup identifier.
+    InvalidKeyId,
+    /// The secret is shorter than 256 bits or uses characters outside the format.
+    InvalidSecret,
+}
+
+impl fmt::Display for CredentialFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::Empty => "credential must not be empty",
+            Self::TooLong => "credential exceeds the accepted length",
+            Self::MissingSeparator => "credential must contain a key-id/secret separator",
+            Self::EmptyComponent => "credential components must not be empty",
+            Self::InvalidKeyId => "credential key identifier is malformed",
+            Self::InvalidSecret => "credential secret is malformed or too short",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl Error for CredentialFormatError {}
+
+/// True when every byte is URL-safe base64 without padding, the credential alphabet.
+fn is_credential_alphabet(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 #[derive(Debug)]
 pub struct GatewayCredential {
     key_id: GatewayKeyId,
@@ -270,6 +344,55 @@ impl GatewayCredential {
 
     pub fn secret(&self) -> &SecretString {
         &self.secret
+    }
+
+    /// Renders the external `<key-id>.<secret>` representation.
+    ///
+    /// The secret it contains is shown only at issuance or rotation; callers
+    /// must not persist or log the rendered value.
+    pub fn render(&self) -> String {
+        let mut rendered = String::with_capacity(
+            self.key_id.as_str().len()
+                + GATEWAY_CREDENTIAL_SEPARATOR.len_utf8()
+                + self.secret.expose().len(),
+        );
+        rendered.push_str(self.key_id.as_str());
+        rendered.push(GATEWAY_CREDENTIAL_SEPARATOR);
+        rendered.push_str(self.secret.expose());
+        rendered
+    }
+
+    /// Parses and validates the external `<key-id>.<secret>` representation.
+    ///
+    /// The key identifier is a random, non-secret lookup value and the secret
+    /// carries at least 256 bits of entropy. Inputs outside the accepted format
+    /// or length bounds are rejected before any lookup.
+    pub fn parse(raw: &str) -> Result<Self, CredentialFormatError> {
+        if raw.is_empty() {
+            return Err(CredentialFormatError::Empty);
+        }
+        if raw.len() > MAX_GATEWAY_CREDENTIAL_LEN {
+            return Err(CredentialFormatError::TooLong);
+        }
+
+        let (key_id, secret) = raw
+            .split_once(GATEWAY_CREDENTIAL_SEPARATOR)
+            .ok_or(CredentialFormatError::MissingSeparator)?;
+        if key_id.is_empty() || secret.is_empty() {
+            return Err(CredentialFormatError::EmptyComponent);
+        }
+        if key_id.len() > MAX_KEY_ID_LEN || secret.len() > MAX_SECRET_LEN {
+            return Err(CredentialFormatError::TooLong);
+        }
+        if !is_credential_alphabet(key_id) {
+            return Err(CredentialFormatError::InvalidKeyId);
+        }
+        if secret.len() < MIN_SECRET_LEN || !is_credential_alphabet(secret) {
+            return Err(CredentialFormatError::InvalidSecret);
+        }
+
+        let key_id = GatewayKeyId::new(key_id).map_err(|_| CredentialFormatError::InvalidKeyId)?;
+        Ok(Self::new(key_id, SecretString::new(secret)))
     }
 }
 
