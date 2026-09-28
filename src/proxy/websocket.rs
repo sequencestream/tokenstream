@@ -5,9 +5,12 @@
 //! WebSocket client handshake. That boundary is what makes both outcomes
 //! transparent: an upstream rejection stays an ordinary HTTP response whose
 //! body is relayed as a live stream under the consumer's pace instead of a
-//! buffer of whatever had already been read, while a `101` ends the exchange
-//! and hands the untouched stream — together with any bytes the peer sent past
-//! the handshake head — to the relay.
+//! buffer of whatever had already been read, while a `101` is accepted only
+//! after the upgrade headers, unique matching accept, and any selected
+//! subprotocol have been verified. The verified `101` then hands the untouched
+//! stream — together with any bytes the peer sent past the handshake head —
+//! to the relay. An invalid `101` closes the upstream connection and becomes a
+//! local handshake failure instead of a downstream upgrade.
 //!
 //! Transport failures are reduced to the stable local gateway error classes.
 //! Once both peers are upgraded, each direction moves one complete library
@@ -29,9 +32,12 @@ use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Body, Frame, Incoming};
-use hyper::header::{CONNECTION, HeaderValue, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE};
+use hyper::header::{
+    CONNECTION, HeaderName, HeaderValue, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_EXTENSIONS,
+    SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_PROTOCOL, UPGRADE,
+};
 use hyper::upgrade::OnUpgrade;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Sleep, timeout};
@@ -204,6 +210,7 @@ impl WebSocketProxy {
             .ok_or(GatewayError::InvalidUpgrade)?
             .as_bytes()
             .to_vec();
+        let offered_protocols = protocol_tokens(request.headers());
         let upstream_uri = build_upstream_uri(snapshot.endpoint(), route, query)?;
         let upstream_path = upstream_uri
             .path_and_query()
@@ -217,24 +224,23 @@ impl WebSocketProxy {
             "sec-websocket-version",
             HeaderValue::from_static(WEBSOCKET_VERSION),
         );
+        // The gateway does not translate extensions, so it never offers them.
+        headers.remove(SEC_WEBSOCKET_EXTENSIONS);
         // The downstream key must not reach the upstream. The gateway performs
         // its own client handshake toward the upstream, so the two peers'
         // handshake values are independent and the accept values differ.
+        let upstream_key = generate_key();
         headers.remove(SEC_WEBSOCKET_KEY);
         headers.insert(
             SEC_WEBSOCKET_KEY,
-            HeaderValue::from_str(&generate_key()).map_err(|_| GatewayError::InternalError)?,
+            HeaderValue::from_str(&upstream_key).map_err(|_| GatewayError::InternalError)?,
         );
         let mut upstream_request = Request::builder()
             .method(Method::GET)
             .uri(upstream_path)
             .body(Full::new(Bytes::new()))
             .map_err(|_| GatewayError::InternalError)?;
-        for (name, value) in headers {
-            if let Some(name) = name {
-                upstream_request.headers_mut().append(name, value);
-            }
-        }
+        *upstream_request.headers_mut() = headers;
 
         let on_upgrade = hyper::upgrade::on(request);
         let started = tokio::time::Instant::now();
@@ -294,7 +300,22 @@ impl WebSocketProxy {
             ));
         }
 
-        let response = switching_protocols(&downstream_key, upstream_response.headers())?;
+        let selected_protocol = match validate_upstream_switch(
+            upstream_response.headers(),
+            upstream_key.as_bytes(),
+            &offered_protocols,
+        ) {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                upstream_connection.abort();
+                return Err(error);
+            }
+        };
+        let response = switching_protocols(
+            &downstream_key,
+            upstream_response.headers(),
+            selected_protocol,
+        )?;
         let relay: RelayFuture = Box::pin(run_after_upgrade(
             on_upgrade,
             upstream_connection,
@@ -353,10 +374,7 @@ impl WebSocketProxy {
     }
 }
 
-fn single_header(
-    headers: &hyper::HeaderMap,
-    name: hyper::header::HeaderName,
-) -> Option<&HeaderValue> {
+fn single_header(headers: &HeaderMap, name: HeaderName) -> Option<&HeaderValue> {
     let mut values = headers.get_all(name).iter();
     match (values.next(), values.next()) {
         (Some(value), None) => Some(value),
@@ -364,14 +382,90 @@ fn single_header(
     }
 }
 
+fn protocol_tokens(headers: &HeaderMap) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for value in headers.get_all(SEC_WEBSOCKET_PROTOCOL) {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for token in text.split(',') {
+            let token = token.trim();
+            if !token.is_empty() {
+                tokens.push(token.to_owned());
+            }
+        }
+    }
+    tokens
+}
+
+fn header_has_token(headers: &HeaderMap, name: HeaderName, expected: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|text| {
+            text.split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+    })
+}
+
+/// Verifies a `101` against the key and subprotocols of this upstream handshake.
+///
+/// Missing, duplicate, or mismatched accept values, missing upgrade tokens,
+/// an unrequested subprotocol, or any extension fail closed. The selected
+/// subprotocol is returned only when it was offered by the client.
+fn validate_upstream_switch(
+    headers: &HeaderMap,
+    upstream_key: &[u8],
+    offered_protocols: &[String],
+) -> Result<Option<HeaderValue>, GatewayError> {
+    if !header_has_token(headers, UPGRADE, "websocket")
+        || !header_has_token(headers, CONNECTION, "Upgrade")
+    {
+        return Err(GatewayError::UpstreamConnectFailed);
+    }
+    let accept =
+        single_header(headers, SEC_WEBSOCKET_ACCEPT).ok_or(GatewayError::UpstreamConnectFailed)?;
+    let received = accept
+        .to_str()
+        .map_err(|_| GatewayError::UpstreamConnectFailed)?
+        .trim();
+    if received != derive_accept_key(upstream_key) {
+        return Err(GatewayError::UpstreamConnectFailed);
+    }
+    if headers.contains_key(SEC_WEBSOCKET_EXTENSIONS) {
+        return Err(GatewayError::UpstreamConnectFailed);
+    }
+    let mut protocols = headers.get_all(SEC_WEBSOCKET_PROTOCOL).iter();
+    match (protocols.next(), protocols.next()) {
+        (None, _) => Ok(None),
+        (Some(value), None) => {
+            let selected = value
+                .to_str()
+                .map_err(|_| GatewayError::UpstreamConnectFailed)?
+                .trim();
+            if selected.is_empty()
+                || selected.contains(',')
+                || !offered_protocols.iter().any(|offered| offered == selected)
+            {
+                return Err(GatewayError::UpstreamConnectFailed);
+            }
+            Ok(Some(value.clone()))
+        }
+        (Some(_), Some(_)) => Err(GatewayError::UpstreamConnectFailed),
+    }
+}
+
 /// Rebuilds the accepted upgrade response from the upstream handshake head.
 ///
 /// The protocol-required upgrade headers are regenerated for the downstream
 /// peer, every other allowed end-to-end header is preserved, and the hop-by-hop
-/// set together with headers nominated by `Connection` is dropped.
+/// set together with headers nominated by `Connection` is dropped. Handshake
+/// negotiation fields are not copied: accept is derived from the downstream
+/// key, and a subprotocol is included only after it was verified against the
+/// client's offer.
 fn switching_protocols(
     downstream_key: &[u8],
-    upstream_headers: &hyper::HeaderMap,
+    upstream_headers: &HeaderMap,
+    selected_protocol: Option<HeaderValue>,
 ) -> Result<Response<HandshakeBody>, GatewayError> {
     let accept = HeaderValue::from_str(&derive_accept_key(downstream_key))
         .map_err(|_| GatewayError::InternalError)?;
@@ -382,12 +476,15 @@ fn switching_protocols(
     {
         let headers = response.headers_mut();
         headers.extend(build_downstream_response_headers(upstream_headers));
+        headers.remove(SEC_WEBSOCKET_ACCEPT);
+        headers.remove(SEC_WEBSOCKET_PROTOCOL);
+        headers.remove(SEC_WEBSOCKET_EXTENSIONS);
         headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
         headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
         headers.insert(SEC_WEBSOCKET_ACCEPT, accept);
-    }
-    if upstream_headers.contains_key("sec-websocket-extensions") {
-        return Err(GatewayError::UpstreamConnectFailed);
+        if let Some(protocol) = selected_protocol {
+            headers.insert(SEC_WEBSOCKET_PROTOCOL, protocol);
+        }
     }
     Ok(response)
 }
@@ -742,4 +839,195 @@ where
     )
     .await
     .map_err(|_| WebSocketError::ConnectionClosed)?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_KEY: &[u8] = b"dGhlIHNhbXBsZSBub25jZQ==";
+
+    fn valid_switch() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+        headers.insert(
+            SEC_WEBSOCKET_ACCEPT,
+            HeaderValue::from_str(&derive_accept_key(SAMPLE_KEY)).expect("accept"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_matching_unique_accept_is_accepted() {
+        assert_eq!(
+            validate_upstream_switch(&valid_switch(), SAMPLE_KEY, &[]),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_missing_or_duplicate_or_wrong_accept_is_rejected() {
+        let mut missing = valid_switch();
+        missing.remove(SEC_WEBSOCKET_ACCEPT);
+        assert_eq!(
+            validate_upstream_switch(&missing, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+
+        let mut duplicated = valid_switch();
+        let accept = duplicated
+            .get(SEC_WEBSOCKET_ACCEPT)
+            .expect("accept")
+            .clone();
+        duplicated.append(SEC_WEBSOCKET_ACCEPT, accept);
+        assert_eq!(
+            validate_upstream_switch(&duplicated, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+
+        let mut wrong = valid_switch();
+        wrong.insert(
+            SEC_WEBSOCKET_ACCEPT,
+            HeaderValue::from_static("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        );
+        assert_eq!(
+            validate_upstream_switch(&wrong, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+    }
+
+    #[test]
+    fn invalid_upgrade_headers_are_rejected() {
+        let mut missing_upgrade = valid_switch();
+        missing_upgrade.remove(UPGRADE);
+        assert_eq!(
+            validate_upstream_switch(&missing_upgrade, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+
+        let mut wrong_upgrade = valid_switch();
+        wrong_upgrade.insert(UPGRADE, HeaderValue::from_static("h2c"));
+        assert_eq!(
+            validate_upstream_switch(&wrong_upgrade, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+
+        let mut missing_connection = valid_switch();
+        missing_connection.remove(CONNECTION);
+        assert_eq!(
+            validate_upstream_switch(&missing_connection, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+    }
+
+    #[test]
+    fn an_unrequested_or_duplicate_subprotocol_is_rejected() {
+        let mut unrequested = valid_switch();
+        unrequested.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("openai-realtime-v1"),
+        );
+        assert_eq!(
+            validate_upstream_switch(&unrequested, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+
+        let mut duplicated = unrequested;
+        duplicated.append(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("openai-realtime-v1"),
+        );
+        assert_eq!(
+            validate_upstream_switch(&duplicated, SAMPLE_KEY, &["openai-realtime-v1".to_owned()]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+    }
+
+    #[test]
+    fn an_offered_subprotocol_is_selected() {
+        let mut headers = valid_switch();
+        headers.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("openai-realtime-v1"),
+        );
+        let selected = validate_upstream_switch(
+            &headers,
+            SAMPLE_KEY,
+            &[
+                "openai-beta.realtime".to_owned(),
+                "openai-realtime-v1".to_owned(),
+            ],
+        )
+        .expect("offered protocol is valid");
+        assert_eq!(
+            selected.expect("selected protocol").to_str().expect("text"),
+            "openai-realtime-v1"
+        );
+    }
+
+    #[test]
+    fn any_extension_is_rejected() {
+        let mut headers = valid_switch();
+        headers.insert(
+            SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static("permessage-deflate"),
+        );
+        assert_eq!(
+            validate_upstream_switch(&headers, SAMPLE_KEY, &[]),
+            Err(GatewayError::UpstreamConnectFailed)
+        );
+    }
+
+    #[test]
+    fn protocol_offers_preserve_repeated_and_listed_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.append(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("openai-beta.realtime, openai-realtime-v1"),
+        );
+        headers.append(SEC_WEBSOCKET_PROTOCOL, HeaderValue::from_static("chat"));
+        assert_eq!(
+            protocol_tokens(&headers),
+            ["openai-beta.realtime", "openai-realtime-v1", "chat"]
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_protocols_rebuilds_accept_for_the_downstream_key() {
+        let mut upstream = valid_switch();
+        upstream.insert("x-upstream-negotiated", HeaderValue::from_static("kept"));
+        upstream.insert(
+            SEC_WEBSOCKET_PROTOCOL,
+            HeaderValue::from_static("openai-realtime-v1"),
+        );
+        let other_key = b"another-nonce-key==";
+        let response = switching_protocols(
+            other_key,
+            &upstream,
+            Some(HeaderValue::from_static("openai-realtime-v1")),
+        )
+        .expect("downstream upgrade");
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_ACCEPT)
+                .expect("accept"),
+            derive_accept_key(other_key).as_str()
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-upstream-negotiated")
+                .expect("retained"),
+            "kept"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(SEC_WEBSOCKET_PROTOCOL)
+                .expect("protocol"),
+            "openai-realtime-v1"
+        );
+    }
 }

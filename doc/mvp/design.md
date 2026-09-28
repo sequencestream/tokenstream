@@ -110,9 +110,9 @@ For HTTP requests, the proxy:
 - replaces the gateway key in that same native header with `Authorization: Bearer <upstream-key>` for OpenAI or `x-api-key: <upstream-key>` for Anthropic;
 - sets the upstream authority/host from the configured endpoint;
 - replaces untrusted inbound forwarding headers with a single value derived from the direct downstream peer under the fixed trusted-proxy policy; and
-- preserves other end-to-end headers, including provider version or beta headers.
+- preserves other end-to-end headers, including provider version or beta headers, and keeps every value of a repeated header in the original order.
 
-The same principles apply to the WebSocket handshake, except required upgrade headers are reconstructed by the WebSocket implementation. Client-supplied forwarding chains are not accepted. Upstream response headers are relayed after removing hop-by-hop headers. The gateway does not rewrite upstream error bodies.
+The same principles apply to the WebSocket handshake, except required upgrade headers are reconstructed by the WebSocket implementation. Reconstruction must retain every allowed repeated value. Client-supplied forwarding chains are not accepted. Upstream response headers are relayed after removing hop-by-hop headers. The gateway does not rewrite upstream error bodies.
 
 ### 4.5 HTTP and SSE Proxy
 
@@ -127,6 +127,8 @@ Request and response bodies use bounded streaming with backpressure. The proxy d
 ### 4.6 WebSocket Proxy
 
 The WebSocket proxy establishes the upstream WebSocket before accepting the downstream upgrade. If the upstream handshake fails, it returns a normal downstream HTTP failure, allowing the client to decide whether to fall back to HTTP/SSE.
+
+A `101` is a valid handshake only when the upgrade headers are present, `Sec-WebSocket-Accept` appears exactly once and matches the key used for that upstream handshake, any selected subprotocol was offered by the client, and no extensions are negotiated. An invalid `101` is a handshake failure: the downstream upgrade is not accepted, the upstream connection is closed, and the client receives a sanitized local failure rather than a successful upgrade. An ordinary non-upgrade HTTP rejection still streams through unchanged.
 
 After both handshakes succeed, two relay tasks run concurrently:
 

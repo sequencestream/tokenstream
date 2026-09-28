@@ -29,6 +29,7 @@ use tokenstream::routing::resolve_route;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
@@ -177,6 +178,81 @@ fn boxed_full(response: Response<Full<Bytes>>) -> Response<UnsyncBoxBody<Bytes, 
 fn boxed_handshake(response: Response<RejectionBody>) -> Response<UnsyncBoxBody<Bytes, io::Error>> {
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, body.map_err(io::Error::other).boxed_unsync())
+}
+
+fn header_values<'a>(head: &'a str, name: &str) -> Vec<&'a str> {
+    let needle = format!("{name}:");
+    head.split("\r\n")
+        .filter(|line| {
+            line.len() >= needle.len() && line[..needle.len()].eq_ignore_ascii_case(&needle)
+        })
+        .map(|line| line[needle.len()..].trim())
+        .collect()
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> &'a str {
+    let values = header_values(head, name);
+    assert_eq!(values.len(), 1, "expected one {name} in {head}");
+    values[0]
+}
+
+async fn handshake_status_for_upstream_101(
+    build: impl FnOnce(&str) -> String + Send + 'static,
+    extra_client_headers: &str,
+) -> (StatusCode, String) {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.expect("accept upstream");
+        let head = read_http_head(&mut socket).await;
+        let key = header_value(&head, "sec-websocket-key");
+        socket
+            .write_all(build(key).as_bytes())
+            .await
+            .expect("write handshake head");
+        let _ = socket;
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    client
+        .write_all(
+            format!(
+                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n{extra_client_headers}\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send handshake request");
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+        if received.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    drop(client);
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
+    let text = String::from_utf8_lossy(&received).into_owned();
+    let status_line = text.lines().next().unwrap_or(&text);
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .map(StatusCode::from_u16)
+        .and_then(Result::ok)
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, text)
 }
 
 #[tokio::test]
@@ -1006,8 +1082,8 @@ async fn an_accepted_upgrade_keeps_allowed_headers_and_rebuilds_the_upgrade() {
     let upstream_address = upstream_listener.local_addr().expect("upstream address");
     let upstream = tokio::spawn(async move {
         let (mut socket, _) = upstream_listener.accept().await.expect("accept upstream");
-        read_http_head(&mut socket).await;
-        let accept = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+        let head = read_http_head(&mut socket).await;
+        let accept = derive_accept_key(header_value(&head, "sec-websocket-key").as_bytes());
         socket
             .write_all(
                 format!(
@@ -1027,7 +1103,7 @@ async fn an_accepted_upgrade_keeps_allowed_headers_and_rebuilds_the_upgrade() {
     client
         .write_all(
             format!(
-                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nsec-websocket-protocol: openai-realtime-v1\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -1071,4 +1147,135 @@ async fn an_accepted_upgrade_keeps_allowed_headers_and_rebuilds_the_upgrade() {
 
     upstream.await.expect("upstream task");
     let _ = gateway.await;
+}
+
+#[tokio::test]
+async fn repeated_end_to_end_handshake_headers_reach_upstream_in_order() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind upstream");
+    let upstream_address = upstream_listener.local_addr().expect("upstream address");
+    let (observed_tx, observed_rx) = oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = upstream_listener.accept().await.expect("accept upstream");
+        let head = read_http_head(&mut socket).await;
+        observed_tx
+            .send(head.clone())
+            .expect("observe upstream head");
+        let accept = derive_accept_key(header_value(&head, "sec-websocket-key").as_bytes());
+        socket
+            .write_all(
+                format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write upgrade head");
+        let _ = socket;
+    });
+    let (gateway_address, gateway) = spawn_gateway(upstream_address).await;
+    let mut client = TcpStream::connect(gateway_address)
+        .await
+        .expect("connect to gateway");
+    client
+        .write_all(
+            format!(
+                "GET /v1/responses HTTP/1.1\r\nhost: {gateway_address}\r\nauthorization: Bearer gateway-id.gateway-secret\r\nconnection: Upgrade\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\nx-end-to-end: first\r\nx-end-to-end: second\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("send handshake request");
+
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match tokio::time::timeout_at(deadline, client.read(&mut buffer)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(count)) => received.extend_from_slice(&buffer[..count]),
+            Ok(Err(_)) => break,
+        }
+        if received.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&received).to_ascii_lowercase();
+    assert!(
+        text.starts_with("http/1.1 101 switching protocols"),
+        "{text}"
+    );
+    let upstream_head = observed_rx.await.expect("upstream head");
+    assert_eq!(
+        header_values(&upstream_head, "x-end-to-end"),
+        ["first", "second"]
+    );
+
+    upstream.await.expect("upstream task");
+    let _ = gateway.await;
+}
+
+fn invalid_switch_head(case: &'static str, key: &str) -> String {
+    let accept = derive_accept_key(key.as_bytes());
+    match case {
+        "missing accept" => {
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\n\r\n"
+                .to_owned()
+        }
+        "duplicate accept" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        ),
+        "wrong accept" => {
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+                .to_owned()
+        }
+        "missing upgrade" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        ),
+        "wrong upgrade" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: h2c\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        ),
+        "connection without upgrade" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: keep-alive\r\nsec-websocket-accept: {accept}\r\n\r\n"
+        ),
+        "unrequested subprotocol" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-protocol: openai-realtime-v1\r\n\r\n"
+        ),
+        "unsupported extension" => format!(
+            "HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-accept: {accept}\r\nsec-websocket-extensions: permessage-deflate\r\n\r\n"
+        ),
+        _ => panic!("unknown invalid handshake case {case}"),
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_upstream_switch_does_not_complete_the_downstream_upgrade() {
+    for name in [
+        "missing accept",
+        "duplicate accept",
+        "wrong accept",
+        "missing upgrade",
+        "wrong upgrade",
+        "connection without upgrade",
+        "unrequested subprotocol",
+        "unsupported extension",
+    ] {
+        let (status, text) =
+            handshake_status_for_upstream_101(move |key| invalid_switch_head(name, key), "").await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "{name} must not upgrade downstream: {text}"
+        );
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("upstream_connect_failed"),
+            "{name} must report a local handshake failure: {text}"
+        );
+        assert!(
+            !text.to_ascii_lowercase().starts_with("http/1.1 101 "),
+            "{name} must not complete the downstream upgrade: {text}"
+        );
+    }
 }

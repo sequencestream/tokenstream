@@ -37,7 +37,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 - The gateway runs an explicit allowlist over provider, HTTP method, normalized path, and transport. Every other combination — including a path valid for one provider presented to another — is rejected before any upstream contact.
 - Path matching uses the normalized path only. The original query string is forwarded unchanged and is never logged.
 - Streaming mode is never inferred from application fields such as a JSON `stream` flag. SSE is simply an upstream HTTP response body and content type, streamed transparently.
-- For WebSocket routes, the upstream handshake is established before the downstream upgrade is accepted; an upstream handshake failure becomes a normal downstream HTTP failure so the client can choose its own fallback. The gateway never reconnects an upstream WebSocket.
+- For WebSocket routes, the upstream handshake is established before the downstream upgrade is accepted; an upstream handshake failure — including an invalid upgrade response — becomes a normal downstream HTTP failure so the client can choose its own fallback. The gateway never reconnects an upstream WebSocket.
 
 The route allowlist is:
 
@@ -55,9 +55,9 @@ Any addition, removal, or change to an allowed route is an architectural change,
 - Remove hop-by-hop headers per RFC connection semantics, including headers nominated by the `Connection` header, and remove `Proxy-Authorization`.
 - Require the provider-native downstream credential header (`Authorization: Bearer` for OpenAI, `x-api-key` for Anthropic), replace its gateway key with the upstream key in that same header, and reject duplicate or conflicting credential headers. Set the upstream authority/host from the configured endpoint.
 - Replace untrusted inbound forwarding headers with a single value derived from the direct downstream peer, according to one fixed, documented trusted-proxy policy.
-- Preserve all other end-to-end headers, including provider version and beta headers.
+- Preserve all other end-to-end headers, including provider version and beta headers and every value of a repeated header in the original order.
 - Relay upstream response headers after removing hop-by-hop headers, and never rewrite upstream error bodies.
-- The same principles govern the WebSocket handshake, except that required upgrade headers are reconstructed by the WebSocket implementation.
+- The same principles govern the WebSocket handshake, except that required upgrade headers are reconstructed by the WebSocket implementation. A `101` is accepted only after those reconstructed headers, a unique matching accept value, and any selected subprotocol have been verified; unsupported extensions are rejected.
 
 ## 7. Component Boundaries
 

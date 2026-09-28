@@ -140,6 +140,34 @@ fn version_and_beta_headers_are_preserved() {
 }
 
 #[test]
+fn repeated_end_to_end_headers_keep_every_value_and_order() {
+    let snapshot = snapshot(ProtocolType::OpenAi, "https://api.example.com", "up-openai");
+    let mut inbound = openai_inbound();
+    inbound.append("x-end-to-end", "first".parse().expect("header"));
+    inbound.append("x-end-to-end", "second".parse().expect("header"));
+
+    let outbound = build_upstream_request_headers(&snapshot, &inbound, peer())
+        .expect("headers are forwardable");
+    let values: Vec<_> = outbound
+        .get_all("x-end-to-end")
+        .iter()
+        .map(|value| value.to_str().expect("text"))
+        .collect();
+    assert_eq!(values, ["first", "second"]);
+
+    let mut upstream = HeaderMap::new();
+    upstream.append("x-end-to-end", "first".parse().expect("header"));
+    upstream.append("x-end-to-end", "second".parse().expect("header"));
+    let downstream = build_downstream_response_headers(&upstream);
+    let values: Vec<_> = downstream
+        .get_all("x-end-to-end")
+        .iter()
+        .map(|value| value.to_str().expect("text"))
+        .collect();
+    assert_eq!(values, ["first", "second"]);
+}
+
+#[test]
 fn the_forwarding_chain_is_replaced_by_one_peer_value() {
     let snapshot = snapshot(ProtocolType::OpenAi, "https://api.example.com", "up-openai");
     let mut inbound = openai_inbound();
