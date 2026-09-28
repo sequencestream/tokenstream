@@ -15,11 +15,11 @@ http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["http1", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite"] }
 tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2.5.7"
 zeroize = "1.8.2"
 
 [dev-dependencies]
-serde_json = "1.0.145"
 tempfile = "3.23.0"
