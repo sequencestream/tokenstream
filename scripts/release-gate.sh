@@ -80,10 +80,13 @@ fi
 stage "unit, repository, protocol, and security suites"
 cargo test --locked
 
-stage "mixed HTTP/SSE and WebSocket load profile"
+stage "mixed HTTP/SSE and WebSocket component load profile"
 cargo test --locked --test release_load_profile \
   mixed_long_lived_transports_reach_stable_bounded_memory \
   -- --ignored --exact --nocapture
+
+stage "sustained mixed load against the real gateway process"
+cargo test --locked --test gateway_load -- --nocapture
 
 stage "administration frontend"
 npm --prefix web ci
@@ -93,5 +96,8 @@ npm --prefix web run build
 stage "pinned client compatibility"
 npm --prefix compatibility ci --ignore-scripts
 npm --prefix compatibility test
+
+stage "pinned clients through the production gateway"
+npm --prefix compatibility run test:gateway
 
 stage "release gate passed"

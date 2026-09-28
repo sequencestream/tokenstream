@@ -70,3 +70,12 @@ cd web && npm ci && npm run check && npm run build
 ```
 
 The compiled frontend is in `web/dist/`. It is not served by the Rust process yet. Basic checks are `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, and, in `web/`, `npm run check` and `npm run build`.
+
+## Release verification
+
+`scripts/release-gate.sh` runs the full release gate: formatting and strict static analysis, the unit, repository, protocol, and security suites, a fast component load profile, a sustained mixed load profile measured against a real gateway process, the administration frontend checks and production build, the pinned client suite, and the pinned clients driven through a real gateway process. The gate provisions an ephemeral PostgreSQL server when one is not supplied through `TOKENSTREAM_TEST_POSTGRES_URL`, and fails rather than skipping when no server is available.
+
+The real-process stages start the compiled binary, configure providers through the administration API, and measure the gateway's own resource use:
+
+- `cargo test --locked --test gateway_load` sustains HTTP, SSE, and WebSocket traffic through the formal listeners, samples the gateway process for steady state, and exercises slow consumers, authentication pressure, logging saturation, bounded capacity, and a storage fault.
+- `npm --prefix compatibility run test:gateway` runs the pinned OpenAI and Anthropic SDKs and the pinned Codex CLI through the production entry points, including a WebSocket success path and the client's own fallback when the upstream refuses the handshake, and requires every route to be refused when no gateway is listening.
