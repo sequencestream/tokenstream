@@ -83,6 +83,21 @@ impl ProviderRepository for PostgresDatabase {
         .transpose()
     }
 
+    async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
+        sqlx::query_as::<_, ProviderRow>(
+            "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+                    gateway_key_id, gateway_api_key_hash, status, created_at
+             FROM provider
+             WHERE id = $1",
+        )
+        .bind(id.get())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_storage_error)?
+        .map(ProviderRow::into_provider)
+        .transpose()
+    }
+
     async fn list(&self, request: ProviderListRequest) -> Result<ProviderPage, RepositoryError> {
         let after_id = request.after_id().map_or(0, |cursor| cursor.get());
         let fetch_limit =

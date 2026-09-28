@@ -13,8 +13,10 @@ use chrono::Utc;
 use url::Url;
 
 use crate::crypto::{GatewaySecretVerifier, SecretCipher};
-use crate::domain::{GatewayCredential, ProtocolType, Provider, ProviderStatus, SecretString};
-use crate::persistence::{NewProvider, ProviderRepository, RepositoryError};
+use crate::domain::{
+    GatewayCredential, ProtocolType, Provider, ProviderId, ProviderStatus, SecretString,
+};
+use crate::persistence::{NewProvider, ProviderRepository, ProviderUpdate, RepositoryError};
 
 /// Longest accepted provider name, counted in Unicode scalar values.
 pub const MAX_PROVIDER_NAME_LEN: usize = 128;
@@ -60,6 +62,62 @@ impl fmt::Debug for CreateProviderRequest {
             .field("protocol_type", &self.protocol_type)
             .field("endpoint", &"[REDACTED]")
             .field("upstream_api_key", &"[REDACTED]")
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// Fields to change on an existing provider.
+///
+/// Every field is optional: an absent field keeps its stored value, so a caller
+/// changes only what it names. The upstream API key stays write-only; it is
+/// re-encrypted on edit and never returned. The protocol type and gateway
+/// credential are not editable values.
+#[derive(Default)]
+pub struct UpdateProviderRequest {
+    name: Option<String>,
+    endpoint: Option<String>,
+    upstream_api_key: Option<SecretString>,
+    status: Option<ProviderStatus>,
+}
+
+impl UpdateProviderRequest {
+    /// Starts an empty change that keeps every stored value.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = Some(endpoint.into());
+        self
+    }
+
+    pub fn with_upstream_api_key(mut self, upstream_api_key: SecretString) -> Self {
+        self.upstream_api_key = Some(upstream_api_key);
+        self
+    }
+
+    pub fn with_status(mut self, status: ProviderStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+}
+
+impl fmt::Debug for UpdateProviderRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UpdateProviderRequest")
+            .field("name", &self.name)
+            .field("endpoint", &self.endpoint.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "upstream_api_key",
+                &self.upstream_api_key.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("status", &self.status)
             .finish()
     }
@@ -116,6 +174,10 @@ pub enum ProviderServiceError {
     Cipher,
     /// A provider with the same name or gateway key identifier already exists.
     Conflict,
+    /// No provider exists for the given identifier.
+    NotFound,
+    /// The provider is referenced by request logs and cannot be deleted.
+    InUse,
     /// The record could not be persisted.
     Storage,
 }
@@ -130,6 +192,8 @@ impl fmt::Display for ProviderServiceError {
             Self::Credential => "gateway credential generation failed",
             Self::Cipher => "upstream credential encryption failed",
             Self::Conflict => "provider conflicts with existing data",
+            Self::NotFound => "provider was not found",
+            Self::InUse => "provider is referenced by request logs",
             Self::Storage => "provider could not be persisted",
         };
         formatter.write_str(message)
@@ -210,6 +274,82 @@ where
 
         Ok(CreatedProvider::new(provider, gateway_credential))
     }
+
+    /// Applies a partial edit, committing only the named fields.
+    ///
+    /// Validation and re-encryption happen before the single storage write, so
+    /// a rejected edit leaves the stored record untouched. The gateway
+    /// credential is unchanged; rotating it is a separate operation. Requests
+    /// admitted before the commit keep their immutable snapshot.
+    pub async fn update(
+        &self,
+        id: ProviderId,
+        request: UpdateProviderRequest,
+    ) -> Result<Provider, ProviderServiceError> {
+        let current = self
+            .repository
+            .find_by_id(id)
+            .await
+            .map_err(map_repository_error)?
+            .ok_or(ProviderServiceError::NotFound)?;
+
+        let name = match request.name {
+            Some(name) => validate_name(&name)?,
+            None => current.name().to_owned(),
+        };
+        let endpoint = match request.endpoint.as_deref() {
+            Some(endpoint) => validate_endpoint(endpoint, self.allow_insecure_endpoints)?,
+            None => current.endpoint().clone(),
+        };
+        let upstream_api_key_ciphertext = match request.upstream_api_key {
+            Some(upstream_api_key) => {
+                validate_upstream_api_key(&upstream_api_key)?;
+                self.cipher
+                    .encrypt(&upstream_api_key)
+                    .map_err(|_| ProviderServiceError::Cipher)?
+            }
+            None => current.upstream_api_key_ciphertext().clone(),
+        };
+        let status = request.status.unwrap_or(current.status());
+
+        let update = ProviderUpdate::new(
+            name,
+            current.protocol_type(),
+            endpoint,
+            upstream_api_key_ciphertext,
+            current.gateway_key_id().clone(),
+            current.gateway_api_key_hash().clone(),
+            status,
+        );
+        self.repository
+            .update(id, update)
+            .await
+            .map_err(map_repository_error)
+    }
+
+    /// Atomically sets a provider to enabled or disabled.
+    ///
+    /// A disabled provider rejects new requests while streams already admitted
+    /// continue on their snapshot.
+    pub async fn set_status(
+        &self,
+        id: ProviderId,
+        status: ProviderStatus,
+    ) -> Result<Provider, ProviderServiceError> {
+        self.update(id, UpdateProviderRequest::new().with_status(status))
+            .await
+    }
+
+    /// Deletes a provider that no request log references.
+    ///
+    /// A referenced provider is refused with [`ProviderServiceError::InUse`] so
+    /// the administrator can disable it instead.
+    pub async fn delete(&self, id: ProviderId) -> Result<(), ProviderServiceError> {
+        self.repository
+            .delete(id)
+            .await
+            .map_err(map_repository_error)
+    }
 }
 
 fn validate_name(raw: &str) -> Result<String, ProviderServiceError> {
@@ -258,6 +398,8 @@ fn validate_endpoint(raw: &str, allow_insecure: bool) -> Result<Url, ProviderSer
 fn map_repository_error(error: RepositoryError) -> ProviderServiceError {
     match error {
         RepositoryError::Conflict => ProviderServiceError::Conflict,
+        RepositoryError::ProviderInUse => ProviderServiceError::InUse,
+        RepositoryError::NotFound => ProviderServiceError::NotFound,
         _ => ProviderServiceError::Storage,
     }
 }

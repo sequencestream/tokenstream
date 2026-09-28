@@ -76,6 +76,14 @@ where
     assert_eq!(found.id(), first.id());
     assert_eq!(found.name(), format!("{prefix}-provider-0"));
 
+    let found_by_id = repository
+        .find_by_id(first.id())
+        .await
+        .expect("find provider by id")
+        .expect("provider exists");
+    assert_eq!(found_by_id.id(), first.id());
+    assert_eq!(found_by_id.name(), format!("{prefix}-provider-0"));
+
     assert_eq!(
         repository
             .create(new_provider(prefix, 0))
@@ -184,6 +192,13 @@ where
     ids.push(after_delete.id());
 
     let missing_id = ProviderId::try_from(i64::MAX).expect("positive ID");
+    assert!(
+        repository
+            .find_by_id(missing_id)
+            .await
+            .expect("find missing provider")
+            .is_none()
+    );
     assert_eq!(
         repository
             .update(
@@ -201,7 +216,6 @@ where
             .expect_err("missing delete is rejected"),
         RepositoryError::NotFound
     );
-
     ids
 }
 

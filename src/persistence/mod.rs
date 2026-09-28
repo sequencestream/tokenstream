@@ -429,6 +429,8 @@ pub trait ProviderRepository: Send + Sync {
         key_id: &GatewayKeyId,
     ) -> Result<Option<Provider>, RepositoryError>;
 
+    async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError>;
+
     async fn list(&self, request: ProviderListRequest) -> Result<ProviderPage, RepositoryError>;
 
     async fn create(&self, provider: NewProvider) -> Result<Provider, RepositoryError>;
@@ -460,6 +462,13 @@ impl ProviderRepository for Database {
         match self {
             Self::Sqlite(database) => database.find_by_key_id(key_id).await,
             Self::Postgres(database) => database.find_by_key_id(key_id).await,
+        }
+    }
+
+    async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.find_by_id(id).await,
+            Self::Postgres(database) => database.find_by_id(id).await,
         }
     }
 
