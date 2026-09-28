@@ -246,10 +246,7 @@ impl ProviderRepository for PostgresDatabase {
             .execute(&self.pool)
             .await
             .map_err(|error| {
-                if error
-                    .as_database_error()
-                    .is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation)
-                {
+                if is_provider_reference_violation(&error) {
                     RepositoryError::ProviderInUse
                 } else {
                     RepositoryError::Storage
@@ -351,14 +348,27 @@ fn map_write_error(error: sqlx::Error) -> RepositoryError {
         .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
     {
         RepositoryError::Conflict
-    } else if error
-        .as_database_error()
-        .is_some_and(sqlx::error::DatabaseError::is_foreign_key_violation)
-    {
+    } else if is_foreign_key_violation(&error) {
         RepositoryError::NotFound
     } else {
         RepositoryError::Storage
     }
+}
+
+fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
+    error.as_database_error().is_some_and(|database_error| {
+        database_error.is_foreign_key_violation()
+            || database_error.code().as_deref() == Some("23503")
+    })
+}
+
+fn is_provider_reference_violation(error: &sqlx::Error) -> bool {
+    is_foreign_key_violation(error)
+        || error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref()
+            == Some("23001")
 }
 
 fn map_storage_error(_: sqlx::Error) -> RepositoryError {

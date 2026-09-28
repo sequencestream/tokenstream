@@ -1,0 +1,14 @@
+{
+  "name": "tokenstream-client-compatibility",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node clients.mjs"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "0.128.0",
+    "@openai/codex": "0.158.0",
+    "openai": "7.23.0"
+  }
+}
