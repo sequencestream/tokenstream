@@ -39,21 +39,41 @@ pub struct Gateway {
     http: HttpProxy<Incoming>,
     websocket: WebSocketProxy,
     logs: LogSink,
+    settings: crate::ConnectionSettings,
 }
 
 impl Gateway {
     pub fn new(config: &Config, database: Database, logs: LogSink, metrics: Metrics) -> Self {
+        Self::with_password_work(
+            config,
+            database,
+            logs,
+            metrics,
+            crate::crypto::PasswordWork::default(),
+        )
+    }
+
+    pub fn with_password_work(
+        config: &Config,
+        database: Database,
+        logs: LogSink,
+        metrics: Metrics,
+        work: crate::crypto::PasswordWork,
+    ) -> Self {
         Self {
+            settings: crate::ConnectionSettings::data(config),
             authenticator: GatewayAuthenticator::new(
                 database,
                 AesGcmCipher::new(config.master_key().expose()),
                 Argon2GatewaySecretVerifier::new(),
-            ),
-            http: HttpProxy::with_metrics(
+            )
+            .with_password_work(work),
+            http: HttpProxy::with_buffer(
                 config.upstream_connect_timeout(),
                 config.upstream_header_timeout(),
                 config.stream_idle_timeout(),
                 metrics.clone(),
+                config.http_buffer_bytes(),
             ),
             websocket: WebSocketProxy::with_metrics(
                 config.upstream_connect_timeout(),
@@ -147,6 +167,9 @@ impl Gateway {
 }
 
 impl crate::DataPlaneService for Gateway {
+    fn connection_settings(&self) -> crate::ConnectionSettings {
+        self.settings
+    }
     async fn serve(
         &self,
         request: Request<Incoming>,

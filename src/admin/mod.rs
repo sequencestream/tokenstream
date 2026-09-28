@@ -44,6 +44,9 @@ pub struct AdminApi<R, C, V> {
     repository: R,
     providers: Arc<ProviderService<R, C, V>>,
     password_hash: Arc<str>,
+    password_work: crate::crypto::PasswordWork,
+    body_timeout: Duration,
+    connection_settings: crate::ConnectionSettings,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     session_ttl: Duration,
 }
@@ -58,7 +61,7 @@ impl<R, C, V> AdminApi<R, C, V>
 where
     R: ProviderRepository + RequestLogRepository + Clone,
     C: SecretCipher,
-    V: GatewaySecretVerifier,
+    V: GatewaySecretVerifier + 'static,
 {
     pub fn new(
         repository: R,
@@ -94,9 +97,26 @@ where
             )),
             repository,
             password_hash: password_hash.into(),
+            password_work: crate::crypto::PasswordWork::default(),
+            body_timeout: Duration::from_secs(30),
+            connection_settings: crate::ConnectionSettings::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_ttl,
         }
+    }
+
+    pub fn with_runtime(
+        mut self,
+        config: &crate::config::Config,
+        work: crate::crypto::PasswordWork,
+    ) -> Self {
+        self.password_work = work.clone();
+        Arc::get_mut(&mut self.providers)
+            .expect("unshared provider service")
+            .set_password_work(work);
+        self.body_timeout = config.admin_body_timeout();
+        self.connection_settings = crate::ConnectionSettings::control(config);
+        self
     }
 
     pub async fn handle<B>(&self, request: Request<B>, metrics: Metrics) -> Response<ApiBody>
@@ -210,10 +230,24 @@ where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let Ok(input) = read_json::<_, SignInRequest>(request.into_body()).await else {
+        let Ok(input) = read_json::<_, SignInRequest>(request.into_body(), self.body_timeout).await
+        else {
             return invalid_input("A valid JSON password is required.");
         };
-        if !verify_password(&input.password, &self.password_hash) {
+        let hash = self.password_hash.clone();
+        let password = SecretString::new(input.password);
+        let verified = self
+            .password_work
+            .run(move || verify_password(password.expose(), &hash))
+            .await;
+        let Ok(verified) = verified else {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "password_work_unavailable",
+                "Password processing is unavailable.",
+            );
+        };
+        if !verified {
             return api_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_credentials",
@@ -297,7 +331,9 @@ where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let Ok(input) = read_json::<_, CreateProviderBody>(request.into_body()).await else {
+        let Ok(input) =
+            read_json::<_, CreateProviderBody>(request.into_body(), self.body_timeout).await
+        else {
             return invalid_input("Invalid provider configuration.");
         };
         let Some(protocol_type) = parse_protocol(&input.protocol_type) else {
@@ -340,7 +376,9 @@ where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let Ok(input) = read_json::<_, UpdateProviderBody>(request.into_body()).await else {
+        let Ok(input) =
+            read_json::<_, UpdateProviderBody>(request.into_body(), self.body_timeout).await
+        else {
             return invalid_input("Invalid provider configuration.");
         };
         let mut change = UpdateProviderRequest::new();
@@ -413,6 +451,9 @@ where
 }
 
 impl ControlPlaneService for AdminApi<Database, AesGcmCipher, Argon2GatewaySecretVerifier> {
+    fn connection_settings(&self) -> crate::ConnectionSettings {
+        self.connection_settings
+    }
     async fn serve(&self, request: Request<Incoming>, metrics: Metrics) -> Response<ApiBody> {
         self.handle(request, metrics).await
     }
@@ -511,15 +552,15 @@ struct ErrorBody<'a> {
     message: &'a str,
 }
 
-async fn read_json<B, T>(body: B) -> Result<T, ()>
+async fn read_json<B, T>(body: B, deadline: Duration) -> Result<T, ()>
 where
     B: Body<Data = Bytes> + Send + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T: for<'de> Deserialize<'de>,
 {
-    let bytes = Limited::new(body, MAX_ADMIN_BODY_BYTES)
-        .collect()
+    let bytes = tokio::time::timeout(deadline, Limited::new(body, MAX_ADMIN_BODY_BYTES).collect())
         .await
+        .map_err(|_| ())?
         .map_err(|_| ())?
         .to_bytes();
     serde_json::from_slice(&bytes).map_err(|_| ())

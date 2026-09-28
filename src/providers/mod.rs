@@ -6,8 +6,10 @@
 //! only from the creation result; it is never stored, logged, or rendered by
 //! diagnostics.
 
+use crate::crypto::PasswordWork;
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 use chrono::Utc;
 use url::Url;
@@ -241,7 +243,8 @@ impl Error for ProviderServiceError {}
 pub struct ProviderService<R, C, V> {
     repository: R,
     cipher: C,
-    verifier: V,
+    verifier: Arc<V>,
+    password_work: PasswordWork,
     allow_insecure_endpoints: bool,
 }
 
@@ -249,7 +252,7 @@ impl<R, C, V> ProviderService<R, C, V>
 where
     R: ProviderRepository,
     C: SecretCipher,
-    V: GatewaySecretVerifier,
+    V: GatewaySecretVerifier + 'static,
 {
     /// Returns one provider for administration without exposing stored secrets.
     pub async fn get(&self, id: ProviderId) -> Result<Provider, ProviderServiceError> {
@@ -279,9 +282,19 @@ where
         Self {
             repository,
             cipher,
-            verifier,
+            verifier: Arc::new(verifier),
+            password_work: PasswordWork::default(),
             allow_insecure_endpoints,
         }
+    }
+
+    pub fn set_password_work(&mut self, work: PasswordWork) {
+        self.password_work = work;
+    }
+
+    pub fn with_password_work(mut self, password_work: PasswordWork) -> Self {
+        self.password_work = password_work;
+        self
     }
 
     /// Reports whether plain-HTTP provider endpoints are admitted.
@@ -302,9 +315,12 @@ where
         let endpoint = validate_endpoint(&request.endpoint, self.allow_insecure_endpoints)?;
         validate_upstream_api_key(&request.upstream_api_key)?;
 
+        let verifier = self.verifier.clone();
         let (gateway_credential, gateway_api_key_hash) = self
-            .verifier
-            .issue()
+            .password_work
+            .run(move || verifier.issue())
+            .await
+            .map_err(|_| ProviderServiceError::Credential)?
             .map_err(|_| ProviderServiceError::Credential)?;
         let upstream_api_key_ciphertext = self
             .cipher
@@ -341,9 +357,12 @@ where
         &self,
         id: ProviderId,
     ) -> Result<RotatedProvider, ProviderServiceError> {
+        let verifier = self.verifier.clone();
         let (gateway_credential, gateway_api_key_hash) = self
-            .verifier
-            .issue()
+            .password_work
+            .run(move || verifier.issue())
+            .await
+            .map_err(|_| ProviderServiceError::Credential)?
             .map_err(|_| ProviderServiceError::Credential)?;
 
         let provider = self

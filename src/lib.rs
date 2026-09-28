@@ -34,7 +34,39 @@ pub mod routing;
 pub mod telemetry;
 
 pub type ResponseBody = Full<Bytes>;
-const MAX_SCAFFOLD_CONNECTIONS_PER_PLANE: usize = 64;
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectionSettings {
+    pub capacity: usize,
+    pub buffer_bytes: usize,
+    pub header_timeout: Duration,
+    pub idle_timeout: Duration,
+}
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self {
+            capacity: 128,
+            buffer_bytes: 65536,
+            header_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(60),
+        }
+    }
+}
+impl ConnectionSettings {
+    pub fn data(config: &config::Config) -> Self {
+        Self {
+            capacity: config.data_max_connections(),
+            buffer_bytes: config.http_buffer_bytes(),
+            header_timeout: config.downstream_header_timeout(),
+            idle_timeout: config.stream_idle_timeout(),
+        }
+    }
+    pub fn control(config: &config::Config) -> Self {
+        Self {
+            capacity: config.admin_max_connections(),
+            ..Self::data(config)
+        }
+    }
+}
 
 /// Applies all registered schema migrations before either listening socket is bound.
 pub trait MigrationRunner: Send + Sync {
@@ -48,6 +80,9 @@ pub trait DataPlaneAuthenticator: Send + Sync + 'static {
 
 /// Serves admitted requests and returns any connection-owned upgraded session.
 pub trait DataPlaneService: Send + Sync + 'static {
+    fn connection_settings(&self) -> ConnectionSettings {
+        ConnectionSettings::default()
+    }
     fn serve(
         &self,
         request: Request<Incoming>,
@@ -88,6 +123,9 @@ pub trait ControlPlaneAuthenticator: Send + Sync + 'static {
 
 /// Serves one request on the isolated administration plane.
 pub trait ControlPlaneService: Send + Sync + 'static {
+    fn connection_settings(&self) -> ConnectionSettings {
+        ConnectionSettings::default()
+    }
     fn serve(
         &self,
         request: Request<Incoming>,
@@ -357,8 +395,12 @@ where
 {
     let mut connections = JoinSet::new();
     let (stop_connections, stop_receiver) = watch::channel(false);
-    let data_permits = Arc::new(Semaphore::new(MAX_SCAFFOLD_CONNECTIONS_PER_PLANE));
-    let control_permits = Arc::new(Semaphore::new(MAX_SCAFFOLD_CONNECTIONS_PER_PLANE));
+    let data_permits = Arc::new(Semaphore::new(
+        data_authenticator.connection_settings().capacity,
+    ));
+    let control_permits = Arc::new(Semaphore::new(
+        control_authenticator.connection_settings().capacity,
+    ));
     tokio::pin!(shutdown);
 
     let shutdown_result = loop {
@@ -435,9 +477,19 @@ fn spawn_data_connection<D>(
         };
         let session: Arc<std::sync::Mutex<Option<Session>>> = Arc::default();
         let session_slot = session.clone();
-        let connection = http1::Builder::new()
+        let settings = authenticator.connection_settings();
+        let mut builder = http1::Builder::new();
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(settings.header_timeout)
+            .max_buf_size(settings.buffer_bytes.max(8192));
+        let connection = builder
             .serve_connection(
-                TokioIo::new(stream),
+                TokioIo::new(crate::proxy::transport::BoundedIo::new(
+                    stream,
+                    settings.buffer_bytes,
+                    settings.idle_timeout,
+                )),
                 service_fn(move |request| {
                     let authenticator = authenticator.clone();
                     let admission = admission.clone();
@@ -481,8 +533,18 @@ fn spawn_control_connection<C>(
 {
     connections.spawn(async move {
         let _permit = permit;
-        let connection = http1::Builder::new().serve_connection(
-            TokioIo::new(stream),
+        let settings = authenticator.connection_settings();
+        let mut builder = http1::Builder::new();
+        builder
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(settings.header_timeout)
+            .max_buf_size(settings.buffer_bytes.max(8192));
+        let connection = builder.serve_connection(
+            TokioIo::new(crate::proxy::transport::BoundedIo::new(
+                stream,
+                settings.buffer_bytes,
+                settings.idle_timeout,
+            )),
             service_fn(move |request| {
                 let authenticator = Arc::clone(&authenticator);
                 let metrics = metrics.clone();

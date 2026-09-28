@@ -23,3 +23,5 @@ pub mod http;
 pub mod websocket;
 
 pub mod gateway;
+
+pub mod transport;

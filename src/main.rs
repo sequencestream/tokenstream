@@ -36,14 +36,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.log_batch_interval(),
         metrics.clone(),
     );
+    let password_work = tokenstream::crypto::PasswordWork::new(config.password_max_concurrency());
     let admin_api = AdminApi::new(
         database.clone(),
         AesGcmCipher::new(config.master_key().expose()),
         Argon2GatewaySecretVerifier::new(),
         config.development_mode(),
         config.admin_password_hash().expose().to_owned(),
+    )
+    .with_runtime(&config, password_work.clone());
+    let gateway = Gateway::with_password_work(
+        &config,
+        database.clone(),
+        log_sink.clone(),
+        metrics.clone(),
+        password_work,
     );
-    let gateway = Gateway::new(&config, database.clone(), log_sink.clone(), metrics.clone());
     tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),
         config.admin_listen_addr(),

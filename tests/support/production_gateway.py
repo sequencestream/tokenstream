@@ -1,4 +1,5 @@
 """Offline process contracts: real administration, proxy, TLS and shutdown."""
+import concurrent.futures
 import base64
 import hashlib
 import http.client
@@ -40,8 +41,17 @@ class Upstream(http.server.BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
 
+    def handle_one_request(self):
+        # Peers that abandon a bounded connection are expected, not a fault.
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, BrokenPipeError, ssl.SSLError, TimeoutError):
+            self.close_connection = True
+
     def do_POST(self):
         global active
+        if self.headers.get('x-test-mode') == 'slow-head':
+            time.sleep(.6)
         body = exact(self.rfile, int(self.headers.get('content-length', '0')))
         records.append((self.path, dict(self.headers), body))
         with lock:
@@ -71,6 +81,8 @@ class Upstream(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         global active
         records.append((self.path, dict(self.headers), b''))
+        if self.headers.get('x-test-mode') == 'slow-head':
+            time.sleep(.6)
         key = self.headers['Sec-WebSocket-Key']
         accept = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
         self.send_response(101)
@@ -152,7 +164,109 @@ def websocket(port, credential):
     return sock, stream
 
 
-def run_case(directory, trusted, untrusted, plain, development):
+def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, provider):
+    headers = {'authorization': 'Bearer ' + credential}
+    # Both planes close incomplete headers; an idle keep-alive also has a bound.
+    for port in [data_port, admin_port]:
+        sock = socket.create_connection(('127.0.0.1', port), timeout=2)
+        sock.sendall(b'GET /healthz HTTP/1.1\r\nHost:')
+        started = time.monotonic()
+        try:
+            received = sock.recv(4096)
+            assert not received or b'408' in received
+        except ConnectionResetError:
+            pass
+        assert .25 < time.monotonic() - started < 1.5
+        sock.close()
+    sock = socket.create_connection(('127.0.0.1', admin_port), timeout=2)
+    sock.sendall(b'POST /admin/api/session HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\n\r\n{')
+    started = time.monotonic()
+    assert b'400' in sock.recv(4096)
+    assert .1 < time.monotonic() - started < 1
+    sock.close()
+
+    for method in ['POST', 'GET']:
+        slow = dict(headers, **{'x-test-mode': 'slow-head'})
+        if method == 'GET':
+            slow.update({'Connection': 'Upgrade', 'Upgrade': 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ=='})
+        started = time.monotonic()
+        status, _, body = exchange(data_port, method, '/v1/responses', b'', slow)
+        assert status == 504, (status, body)
+        assert time.monotonic() - started < .55, 'header deadline must not include connect allowance'
+
+    # A TCP peer that never speaks TLS exercises the connection deadline.
+    listener = socket.socket()
+    listener.bind(('127.0.0.1', 0))
+    listener.listen()
+    stalled = []
+    def stall():
+        for _ in range(2):
+            peer, _ = listener.accept()
+            stalled.append(peer)
+    thread = threading.Thread(target=stall, daemon=True)
+    thread.start()
+    key = provider('stalled-tls', 'openai', f'https://localhost:{listener.getsockname()[1]}')
+    try:
+        for method in ['POST', 'GET']:
+            request_headers = {'authorization': 'Bearer ' + key}
+            if method == 'GET':
+                request_headers.update({'Connection': 'Upgrade', 'Upgrade': 'websocket', 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ=='})
+            started = time.monotonic()
+            status, _, body = exchange(data_port, method, '/v1/responses', b'', request_headers)
+            assert status == 504, (status, body)
+            assert .2 < time.monotonic() - started < .65
+    finally:
+        listener.close()
+        for peer in stalled:
+            peer.close()
+
+    sock, stream = websocket(data_port, credential)
+    opened += [stream, sock]
+    held = []
+    for _ in range(capacity - 2):
+        connection = http.client.HTTPConnection('127.0.0.1', data_port, timeout=4)
+        connection.request('POST', '/v1/responses', PAYLOAD, dict(headers, **{'x-test-mode': 'hold'}))
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read(3) == SSE[:3]
+        opened += [response, connection]
+        held.append((response, connection))
+    # Leave one proxy slot for authentication and saturate the independent password budget.
+    barrier = threading.Barrier(17)
+    def authenticate(index):
+        barrier.wait(timeout=5)
+        if index % 2:
+            password = 'test-admin' if index % 4 == 1 else 'wrong-password'
+            return exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'password': password}).encode())[0]
+        return exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
+        futures = [executor.submit(authenticate, index) for index in range(16)]
+        barrier.wait(timeout=5)
+        # Existing transports make progress while correct and wrong password work runs.
+        sock.sendall(b'\x89\x84abcd' + bytes(v ^ b'abcd'[i % 4] for i, v in enumerate(b'ping')))
+        assert exact(stream, 2) == b'\x8a\x04'
+        assert exact(stream, 4) == b'ping'
+        assert held[0][0].read(1) == SSE[3:4]
+        statuses = [future.result(timeout=5) for future in futures]
+        assert all(status in (200, 401, 500, 503) for status in statuses), statuses
+        assert 503 in statuses, statuses
+    extra = http.client.HTTPConnection('127.0.0.1', data_port, timeout=4)
+    extra.request('POST', '/v1/responses', PAYLOAD, dict(headers, **{'x-test-mode': 'hold'}))
+    response = extra.getresponse()
+    assert response.status == 200
+    opened += [response, extra]
+    response.read(3)
+    status, _, body = exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)
+    assert status == 503 and b'connection_limit_reached' in body
+    metrics = exchange(admin_port, 'GET', '/metrics', headers=auth)[2]
+    assert f'tokenstream_active_http_requests {capacity - 1}\n'.encode() in metrics, metrics
+    assert b'tokenstream_active_websockets 1\n' in metrics, metrics
+    response.close()
+    extra.close()
+    wait_for(lambda: exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0] == 200, 'capacity not released')
+
+
+def run_case(directory, trusted, untrusted, plain, development, capacity=None):
     global records
     data_port, admin_port = free_port(), free_port()
     db = directory / ('development.db' if development else 'production.db')
@@ -167,6 +281,14 @@ def run_case(directory, trusted, untrusted, plain, development):
         'WEBSOCKET_QUEUE_CAPACITY': '4', 'LOG_QUEUE_CAPACITY': '128', 'LOG_BATCH_SIZE': '16',
         'LOG_BATCH_INTERVAL_MS': '10',
     }
+    if capacity:
+        db = directory / f'capacity-{capacity}.db'
+        values.update(DATABASE_URL=f'sqlite://{db}', MAX_PROXY_CONNECTIONS=str(capacity),
+                      DATA_MAX_CONNECTIONS=str(capacity + 16), ADMIN_MAX_CONNECTIONS='80',
+                      PASSWORD_MAX_CONCURRENCY='2', HTTP_BUFFER_BYTES='1024',
+                      DOWNSTREAM_HEADER_TIMEOUT_MS='500', ADMIN_BODY_TIMEOUT_MS='200',
+                      UPSTREAM_CONNECT_TIMEOUT_MS='250', UPSTREAM_HEADER_TIMEOUT_MS='200',
+                      STREAM_IDLE_TIMEOUT_MS='30000')
     env = dict(os.environ, **{f'TOKENSTREAM_{key}': value for key, value in values.items()})
     env['SSL_CERT_FILE'] = str(directory / 'trusted.pem')
     env['SSL_CERT_DIR'] = str(directory / 'empty-roots')
@@ -191,6 +313,10 @@ def run_case(directory, trusted, untrusted, plain, development):
         endpoint = f'http://127.0.0.1:{plain.server_port}' if development else f'https://localhost:{trusted.server_port}'
         openai = provider('openai', 'openai', endpoint + '/prefix')
         anthropic = provider('anthropic', 'anthropic', endpoint + '/prefix')
+        if capacity:
+            runtime_bounds(data_port, admin_port, openai, auth, capacity, opened, provider)
+            print('passed runtime resource bounds', capacity)
+            return
         for path, key, native in [('/v1/chat/completions', openai, 'authorization'), ('/v1/responses', openai, 'authorization'), ('/v1/messages', anthropic, 'x-api-key')]:
             for mode in ['ordinary', 'sse', 'error']:
                 request_headers = {native: f'Bearer {key}' if native == 'authorization' else key, 'x-test-mode': mode, 'x-forwarded-for': 'forged'}
@@ -284,6 +410,8 @@ with tempfile.TemporaryDirectory() as temp:
     try:
         run_case(directory, trusted, untrusted, plain, False)
         run_case(directory, trusted, untrusted, plain, True)
+        for capacity in [3, 70]:
+            run_case(directory, trusted, untrusted, plain, True, capacity)
     finally:
         release.set()
         for srv in [trusted, untrusted, plain]:

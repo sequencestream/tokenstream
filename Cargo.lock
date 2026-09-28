@@ -1854,6 +1854,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tower-service",
  "url",
  "zeroize",
 ]

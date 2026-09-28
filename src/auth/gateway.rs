@@ -13,6 +13,7 @@
 //! any upstream is contacted and never carry credential, hash, or ciphertext
 //! material.
 
+use crate::crypto::PasswordWork;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -95,22 +96,29 @@ impl Error for GatewayAuthError {}
 pub struct GatewayAuthenticator<R, C, V> {
     repository: R,
     cipher: C,
-    verifier: V,
+    verifier: Arc<V>,
+    password_work: PasswordWork,
 }
 
 impl<R, C, V> GatewayAuthenticator<R, C, V>
 where
     R: ProviderRepository,
     C: SecretCipher,
-    V: GatewaySecretVerifier,
+    V: GatewaySecretVerifier + 'static,
 {
     /// Builds an authenticator over the given storage and cryptographic collaborators.
     pub fn new(repository: R, cipher: C, verifier: V) -> Self {
         Self {
             repository,
             cipher,
-            verifier,
+            verifier: Arc::new(verifier),
+            password_work: PasswordWork::default(),
         }
+    }
+
+    pub fn with_password_work(mut self, password_work: PasswordWork) -> Self {
+        self.password_work = password_work;
+        self
     }
 
     /// Authenticates `headers` and returns an immutable provider snapshot.
@@ -141,9 +149,14 @@ where
             return Err(GatewayAuthError::ProviderDisabled);
         }
 
+        let verifier = self.verifier.clone();
+        let secret = credential.secret().clone();
+        let hash = provider.gateway_api_key_hash().clone();
         let verified = self
-            .verifier
-            .verify(credential.secret(), provider.gateway_api_key_hash())
+            .password_work
+            .run(move || verifier.verify(&secret, &hash))
+            .await
+            .map_err(|_| GatewayAuthError::Unavailable)?
             .map_err(|_| GatewayAuthError::Unavailable)?;
         if !verified {
             return Err(GatewayAuthError::InvalidCredential);

@@ -27,10 +27,11 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::proxy::transport::UpstreamConnector;
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::capture_connection;
 use hyper_util::rt::TokioExecutor;
 use tokio::time::{Instant, Sleep, timeout};
 
@@ -49,7 +50,7 @@ use crate::telemetry::Metrics;
 /// pools transport connections but holds no credential: every call re-reads the
 /// request-local snapshot it is handed.
 pub struct HttpProxy<B> {
-    client: Client<hyper_rustls::HttpsConnector<HttpConnector>, IdleTimeoutBody<B>>,
+    client: Client<UpstreamConnector, IdleTimeoutBody<B>>,
     header_timeout: Duration,
     idle_timeout: Duration,
     metrics: Metrics,
@@ -81,18 +82,28 @@ where
         idle_timeout: Duration,
         metrics: Metrics,
     ) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_connect_timeout(Some(connect_timeout));
-        connector.set_nodelay(true);
-        connector.enforce_http(false);
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("system TLS trust roots must be available")
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(connector);
+        Self::with_buffer(
+            connect_timeout,
+            header_timeout,
+            idle_timeout,
+            metrics,
+            65536,
+        )
+    }
+
+    pub fn with_buffer(
+        connect_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
+        metrics: Metrics,
+        buffer_bytes: usize,
+    ) -> Self {
+        let connector = UpstreamConnector::new(connect_timeout);
         let mut builder = Client::builder(TokioExecutor::new());
-        builder.retry_canceled_requests(false);
+        builder
+            .retry_canceled_requests(false)
+            .http1_read_buf_exact_size(buffer_bytes)
+            .pool_max_idle_per_host(0);
         let client = builder.build(connector);
         Self {
             client,
@@ -104,10 +115,12 @@ where
 
     /// Builds a proxy from the already-validated startup configuration.
     pub fn from_config(config: &Config) -> Self {
-        Self::new(
+        Self::with_buffer(
             config.upstream_connect_timeout(),
             config.upstream_header_timeout(),
             config.stream_idle_timeout(),
+            Metrics::default(),
+            config.http_buffer_bytes(),
         )
     }
 
@@ -143,10 +156,17 @@ where
         *upstream.headers_mut() = headers;
 
         let started = Instant::now();
-        let result = match timeout(self.header_timeout, self.client.request(upstream)).await {
-            Err(_elapsed) => Err(GatewayError::UpstreamTimeout),
-            Ok(Err(error)) => Err(classify(&error)),
-            Ok(Ok(response)) => Ok(response),
+        let mut captured = capture_connection(&mut upstream);
+        let exchange = self.client.request(upstream);
+        tokio::pin!(exchange);
+        let result = tokio::select! {
+            result = &mut exchange => result.map_err(|error| classify(&error)),
+            _ = async { drop(captured.wait_for_connection_metadata().await); } => {
+                match timeout(self.header_timeout, &mut exchange).await {
+                    Err(_) => Err(GatewayError::UpstreamTimeout),
+                    Ok(result) => result.map_err(|error| classify(&error)),
+                }
+            }
         };
         self.metrics.observe_upstream_latency(started.elapsed());
         result

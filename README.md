@@ -41,6 +41,11 @@ export TOKENSTREAM_SHUTDOWN_DRAIN_TIMEOUT_MS=30000
 export TOKENSTREAM_LOG_FLUSH_TIMEOUT_MS=5000
 export TOKENSTREAM_DATABASE_MAX_CONNECTIONS=16
 export TOKENSTREAM_MAX_PROXY_CONNECTIONS=4096
+export TOKENSTREAM_PASSWORD_MAX_CONCURRENCY=4
+export TOKENSTREAM_DATA_MAX_CONNECTIONS=4160
+export TOKENSTREAM_ADMIN_MAX_CONNECTIONS=128
+export TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS=10000
+export TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS=30000
 export TOKENSTREAM_HTTP_BUFFER_BYTES=65536
 export TOKENSTREAM_WEBSOCKET_MAX_FRAME_BYTES=1048576
 export TOKENSTREAM_WEBSOCKET_MAX_MESSAGE_BYTES=8388608
@@ -52,7 +57,9 @@ cargo run --locked
 cd web && npm ci && npm run dev
 ```
 
-The data-plane and control-plane health endpoints are `http://127.0.0.1:3000/healthz` and `http://127.0.0.1:3001/healthz`. Vite prints the local address of the administration page. Startup migrations finish before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout. Every setting above is required and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted only through the environment (or an environment populated by a secret manager), never command-line flags.
+The data-plane and control-plane health endpoints are `http://127.0.0.1:3000/healthz` and `http://127.0.0.1:3001/healthz`. Vite prints the local address of the administration page. Startup migrations finish before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout.
+
+Password hashing and verification run on a dedicated blocking budget of at most `TOKENSTREAM_PASSWORD_MAX_CONCURRENCY` concurrent computations shared by administration sign-in, credential issuance, credential rotation, and gateway verification. Admission never queues: when the budget is exhausted the request is rejected, and a request that is cancelled while its computation runs keeps holding capacity until that computation finishes, so slow hashing cannot block traffic that is already streaming. `TOKENSTREAM_DATA_MAX_CONNECTIONS` and `TOKENSTREAM_ADMIN_MAX_CONNECTIONS` bound the accepted connections of each plane; the data plane defaults to the proxy capacity plus an overload-rejection margin and never accepts a value below it. `TOKENSTREAM_HTTP_BUFFER_BYTES` also bounds each connection's actual read chunk and upstream read buffer, and `TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS` and `TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS` bound unfinished request headers and management bodies. Each of these settings, and every setting above, is required or defaulted and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted only through the environment (or an environment populated by a secret manager), never command-line flags.
 
 Production build and launch of the current scaffold:
 

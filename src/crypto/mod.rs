@@ -8,6 +8,8 @@
 
 mod aes_gcm;
 mod gateway_secret;
+mod password_work;
+pub use password_work::PasswordWork;
 
 use std::error::Error;
 use std::fmt;

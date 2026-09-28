@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::proxy::transport::{UpstreamConnector, UpstreamStream};
 use bytes::Bytes;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use http_body_util::Full;
@@ -29,7 +30,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Utf8Bytes};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
+use tokio_tungstenite::{WebSocketStream, client_async_with_config};
+use tower_service::Service;
 use url::Url;
 
 use crate::config::Config;
@@ -48,7 +50,7 @@ const MESSAGE_TOO_LARGE_REASON: &str = "message exceeds configured limit";
 
 pub type RelayFuture = std::pin::Pin<Box<dyn std::future::Future<Output = RelayOutcome> + Send>>;
 
-type UpstreamSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+type UpstreamSocket = WebSocketStream<TokioIo<UpstreamStream>>;
 /// Result of preparing a downstream WebSocket handshake.
 pub struct Handshake {
     response: Response<Full<Bytes>>,
@@ -213,11 +215,21 @@ impl WebSocketProxy {
         }
 
         let on_upgrade = hyper::upgrade::on(request);
-        let connect = connect_async_with_config(upstream_request, Some(self.config), false);
         let started = tokio::time::Instant::now();
+        let mut connector = UpstreamConnector::new(self.connect_timeout);
+        let stream = connector.call(upstream_uri).await.map_err(|error| {
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            {
+                GatewayError::UpstreamTimeout
+            } else {
+                GatewayError::UpstreamConnectFailed
+            }
+        })?;
         let connected = timeout(
-            self.connect_timeout.saturating_add(self.header_timeout),
-            connect,
+            self.header_timeout,
+            client_async_with_config(upstream_request, TokioIo::new(stream), Some(self.config)),
         )
         .await;
         self.metrics.observe_upstream_latency(started.elapsed());

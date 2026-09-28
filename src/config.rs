@@ -81,6 +81,11 @@ pub struct Config {
     log_queue_capacity: usize,
     log_batch_size: usize,
     log_batch_interval: Duration,
+    password_max_concurrency: usize,
+    data_max_connections: usize,
+    admin_max_connections: usize,
+    downstream_header_timeout: Duration,
+    admin_body_timeout: Duration,
     development_mode: bool,
 }
 
@@ -152,6 +157,36 @@ impl Config {
             1,
             MAX_PROXY_CONNECTIONS,
         )?;
+        let password_max_concurrency =
+            parse_optional(&mut get, "TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", 4, 1, 64)?;
+        let data_max_connections = parse_optional(
+            &mut get,
+            "TOKENSTREAM_DATA_MAX_CONNECTIONS",
+            max_proxy_connections.saturating_add(64),
+            max_proxy_connections.saturating_add(1),
+            MAX_PROXY_CONNECTIONS + 1024,
+        )?;
+        let admin_max_connections = parse_optional(
+            &mut get,
+            "TOKENSTREAM_ADMIN_MAX_CONNECTIONS",
+            128,
+            1,
+            MAX_PROXY_CONNECTIONS,
+        )?;
+        let downstream_header_timeout = Duration::from_millis(parse_optional(
+            &mut get,
+            "TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS",
+            10000,
+            1,
+            300000,
+        )? as u64);
+        let admin_body_timeout = Duration::from_millis(parse_optional(
+            &mut get,
+            "TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS",
+            30000,
+            1,
+            300000,
+        )? as u64);
         let http_buffer_bytes = parse_bounded(
             &mut get,
             "TOKENSTREAM_HTTP_BUFFER_BYTES",
@@ -228,10 +263,30 @@ impl Config {
             log_queue_capacity,
             log_batch_size,
             log_batch_interval,
+            password_max_concurrency,
+            data_max_connections,
+            admin_max_connections,
+            downstream_header_timeout,
+            admin_body_timeout,
             development_mode,
         })
     }
 
+    pub fn password_max_concurrency(&self) -> usize {
+        self.password_max_concurrency
+    }
+    pub fn data_max_connections(&self) -> usize {
+        self.data_max_connections
+    }
+    pub fn admin_max_connections(&self) -> usize {
+        self.admin_max_connections
+    }
+    pub fn downstream_header_timeout(&self) -> Duration {
+        self.downstream_header_timeout
+    }
+    pub fn admin_body_timeout(&self) -> Duration {
+        self.admin_body_timeout
+    }
     pub fn data_listen_addr(&self) -> SocketAddr {
         self.data_listen_addr
     }
@@ -406,6 +461,23 @@ fn parse_bounded(
         });
     }
     Ok(value)
+}
+
+fn parse_optional(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+) -> Result<usize, ConfigError> {
+    let value = get(name).map_err(|_| ConfigError::Invalid {
+        name,
+        requirement: "must contain valid Unicode",
+    })?;
+    match value {
+        None => Ok(default),
+        Some(value) => parse_bounded(&mut |_| Ok(Some(value.clone())), name, minimum, maximum),
+    }
 }
 
 fn parse_flag(
@@ -662,6 +734,12 @@ mod tests {
             ("TOKENSTREAM_LOG_QUEUE_CAPACITY", "1000001"),
             ("TOKENSTREAM_LOG_BATCH_SIZE", "0"),
             ("TOKENSTREAM_LOG_BATCH_INTERVAL_MS", "60001"),
+            ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "0"),
+            ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "65"),
+            ("TOKENSTREAM_DATA_MAX_CONNECTIONS", "4096"),
+            ("TOKENSTREAM_ADMIN_MAX_CONNECTIONS", "0"),
+            ("TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS", "0"),
+            ("TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS", "300001"),
         ] {
             let mut values = valid_values();
             values.insert(name, invalid.into());
@@ -669,6 +747,37 @@ mod tests {
                 matches!(load(&values), Err(ConfigError::Invalid { name: actual, .. }) if actual == name)
             );
         }
+    }
+
+    #[test]
+    fn derives_runtime_bounds_from_the_proxy_capacity() {
+        let config = load(&valid_values()).expect("valid configuration");
+
+        assert_eq!(config.password_max_concurrency(), 4);
+        assert_eq!(config.admin_max_connections(), 128);
+        assert_eq!(config.downstream_header_timeout().as_millis(), 10000);
+        assert_eq!(config.admin_body_timeout().as_millis(), 30000);
+        assert!(
+            config.data_max_connections() > config.max_proxy_connections(),
+            "the data plane must keep room to reject overload before the proxy limit"
+        );
+
+        let mut explicit = valid_values();
+        for (name, value) in [
+            ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "12"),
+            ("TOKENSTREAM_DATA_MAX_CONNECTIONS", "5000"),
+            ("TOKENSTREAM_ADMIN_MAX_CONNECTIONS", "64"),
+            ("TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS", "1500"),
+            ("TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS", "2000"),
+        ] {
+            explicit.insert(name, value.into());
+        }
+        let config = load(&explicit).expect("valid configuration");
+        assert_eq!(config.password_max_concurrency(), 12);
+        assert_eq!(config.data_max_connections(), 5000);
+        assert_eq!(config.admin_max_connections(), 64);
+        assert_eq!(config.downstream_header_timeout().as_millis(), 1500);
+        assert_eq!(config.admin_body_timeout().as_millis(), 2000);
     }
 
     #[test]
