@@ -19,6 +19,7 @@ pub mod config;
 pub mod crypto;
 pub mod domain;
 pub mod persistence;
+pub mod providers;
 
 type ResponseBody = Full<Bytes>;
 const MAX_SCAFFOLD_CONNECTIONS_PER_PLANE: usize = 64;

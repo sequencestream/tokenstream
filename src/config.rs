@@ -81,6 +81,7 @@ pub struct Config {
     log_queue_capacity: usize,
     log_batch_size: usize,
     log_batch_interval: Duration,
+    development_mode: bool,
 }
 
 impl Config {
@@ -205,6 +206,8 @@ impl Config {
             MAX_LOG_BATCH_INTERVAL_MS,
         )?;
 
+        let development_mode = parse_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE")?;
+
         Ok(Self {
             data_listen_addr,
             admin_listen_addr,
@@ -225,6 +228,7 @@ impl Config {
             log_queue_capacity,
             log_batch_size,
             log_batch_interval,
+            development_mode,
         })
     }
 
@@ -302,6 +306,14 @@ impl Config {
 
     pub fn log_batch_interval(&self) -> Duration {
         self.log_batch_interval
+    }
+
+    /// True when non-HTTPS provider endpoints are explicitly permitted.
+    ///
+    /// This is an opt-in development setting; it is off unless the deployment
+    /// sets it to `true`.
+    pub fn development_mode(&self) -> bool {
+        self.development_mode
     }
 }
 
@@ -394,6 +406,20 @@ fn parse_bounded(
         });
     }
     Ok(value)
+}
+
+fn parse_flag(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+) -> Result<bool, ConfigError> {
+    match required(get, name)?.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(ConfigError::Invalid {
+            name,
+            requirement: "must be either true or false",
+        }),
+    }
 }
 
 fn validate_database_url(value: &str) -> Result<(), ConfigError> {
@@ -541,6 +567,7 @@ mod tests {
             ("TOKENSTREAM_LOG_QUEUE_CAPACITY", "8192".into()),
             ("TOKENSTREAM_LOG_BATCH_SIZE", "128".into()),
             ("TOKENSTREAM_LOG_BATCH_INTERVAL_MS", "100".into()),
+            ("TOKENSTREAM_DEVELOPMENT_MODE", "false".into()),
         ])
     }
 
@@ -576,6 +603,7 @@ mod tests {
         assert_eq!(config.log_queue_capacity(), 8192);
         assert_eq!(config.log_batch_size(), 128);
         assert_eq!(config.log_batch_interval().as_millis(), 100);
+        assert!(!config.development_mode());
     }
 
     #[test]
@@ -588,6 +616,17 @@ mod tests {
     }
 
     #[test]
+    fn development_mode_is_explicitly_opt_in() {
+        let mut values = valid_values();
+        values.insert("TOKENSTREAM_DEVELOPMENT_MODE", "true".into());
+        assert!(
+            load(&values)
+                .expect("valid configuration")
+                .development_mode()
+        );
+    }
+
+    #[test]
     fn rejects_invalid_formats_without_echoing_values() {
         for (name, invalid) in [
             ("TOKENSTREAM_DATA_LISTEN_ADDR", "secret-address"),
@@ -596,6 +635,7 @@ mod tests {
             ("TOKENSTREAM_ADMIN_PASSWORD_HASH", "secret-password-hash"),
             ("TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS", "secret-timeout"),
             ("TOKENSTREAM_MAX_PROXY_CONNECTIONS", "secret-count"),
+            ("TOKENSTREAM_DEVELOPMENT_MODE", "secret-mode"),
         ] {
             let mut values = valid_values();
             values.insert(name, invalid.into());
