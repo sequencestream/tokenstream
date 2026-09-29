@@ -6,6 +6,7 @@ Entry point for agents and contributors. Defines the rules governing Tokenstream
 
 > **Core Constraint**: Documentation and source code must remain independent and self-consistent.
 
+- Docs capture architecture-level concepts, flows, rules, and constraints; they do not describe implementation.
 - Docs must not reference code files, functions, types, or line numbers.
 - Code must not reference docs — no comments pointing to documentation.
 - Each artifact stands on its own. When they diverge, reconcile both.
