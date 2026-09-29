@@ -210,7 +210,8 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
         started = time.monotonic()
         status, _, body = exchange(data_port, method, '/v1/responses', b'', slow)
         assert status == 504, (status, body)
-        assert time.monotonic() - started < .55, 'header deadline must not include connect allowance'
+        # Auth plus the 200ms header wait, never the 1.5s connect allowance.
+        assert time.monotonic() - started < 1.2, 'header deadline must not include connect allowance'
 
     # A TCP peer that never speaks TLS exercises the connection deadline.
     listener = socket.socket()
@@ -232,7 +233,7 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
             started = time.monotonic()
             status, _, body = exchange(data_port, method, '/v1/responses', b'', request_headers)
             assert status == 504, (status, body)
-            assert .2 < time.monotonic() - started < .65
+            assert 1.2 < time.monotonic() - started < 3
     finally:
         listener.close()
         for peer in stalled:
@@ -471,7 +472,7 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
                       DATA_MAX_CONNECTIONS=str(capacity + 16), ADMIN_MAX_CONNECTIONS='80',
                       PASSWORD_MAX_CONCURRENCY='2', HTTP_BUFFER_BYTES='1024',
                       DOWNSTREAM_HEADER_TIMEOUT_MS='500', ADMIN_BODY_TIMEOUT_MS='200',
-                      UPSTREAM_CONNECT_TIMEOUT_MS='250', UPSTREAM_HEADER_TIMEOUT_MS='200',
+                      UPSTREAM_CONNECT_TIMEOUT_MS='1500', UPSTREAM_HEADER_TIMEOUT_MS='200',
                       STREAM_IDLE_TIMEOUT_MS='30000')
     env = dict(os.environ, **{f'TOKENSTREAM_{key}': value for key, value in values.items()})
     env['SSL_CERT_FILE'] = str(directory / 'trusted.pem')
