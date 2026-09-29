@@ -22,16 +22,21 @@ const settingDrafts = ref<Record<string, string>>({})
 
 const providerPage = ref<ProviderPage>({ ...emptyProviderPage })
 const editingProviderId = ref<number | null>(null)
+const creatingProvider = ref(false)
 const oneTimeCredential = ref<string | null>(null)
 const credentialAction = ref('')
 
-const createForm = reactive({
-  name: '',
-  protocol_type: 'openai' as ProtocolType,
-  endpoint: 'https://',
-  upstream_api_key: '',
-  status: 'enabled' as ProviderStatus,
-})
+function emptyCreateForm() {
+  return {
+    name: '',
+    protocol_type: 'openai' as ProtocolType,
+    endpoint: 'https://',
+    upstream_api_key: '',
+    status: 'enabled' as ProviderStatus,
+  }
+}
+
+const createForm = reactive(emptyCreateForm())
 const editForm = reactive({
   name: '',
   endpoint: '',
@@ -73,6 +78,7 @@ async function runAction(action: () => Promise<void>) {
     if (!session.signedIn.value) {
       providerPage.value = { ...emptyProviderPage }
       logPage.value = { items: [], cursor: null, exhausted: true }
+      cancelCreate()
       dismissCredential()
     }
   } finally {
@@ -117,6 +123,7 @@ async function signOut() {
     await session.signOut()
     providerPage.value = { ...emptyProviderPage }
     logPage.value = { items: [], cursor: null, exhausted: true }
+    cancelCreate()
     dismissCredential()
   })
 }
@@ -127,17 +134,23 @@ async function loadMoreProviders() {
   })
 }
 
+function beginCreate() {
+  Object.assign(createForm, emptyCreateForm())
+  creatingProvider.value = true
+  clearFeedback()
+}
+
+function cancelCreate() {
+  Object.assign(createForm, emptyCreateForm())
+  creatingProvider.value = false
+}
+
 async function createProvider() {
   await runAction(async () => {
     const created = await api.createProvider({ ...createForm })
     showCredential(created.gateway_api_key, `Credential for ${created.provider.name}`)
-    Object.assign(createForm, {
-      name: '',
-      protocol_type: 'openai' as ProtocolType,
-      endpoint: 'https://',
-      upstream_api_key: '',
-      status: 'enabled' as ProviderStatus,
-    })
+    Object.assign(createForm, emptyCreateForm())
+    creatingProvider.value = false
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -275,9 +288,26 @@ async function saveSettings() {
 function formatDate(value: string | null) {
   if (!value) return '—'
   return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'medium',
+    year: 'numeric',
+    month: 'short',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
   }).format(new Date(value))
+}
+
+function viewTitle(view: typeof activeView.value) {
+  if (view === 'logs') return 'Request logs'
+  if (view === 'settings') return 'Settings'
+  return 'Providers'
+}
+
+function viewLede(view: typeof activeView.value) {
+  if (view === 'logs') return 'Transport metadata for proxied requests. Payloads are not stored.'
+  if (view === 'settings') return 'Process configuration. Secrets are write-only; bind-time values apply after restart.'
+  return 'Upstream identities, endpoints, and gateway credentials.'
 }
 
 onMounted(restoreSession)
@@ -290,7 +320,24 @@ onMounted(restoreSession)
         <span class="brand-mark">T</span>
         <span>Tokenstream</span>
       </a>
-      <button v-if="session.signedIn.value" class="button ghost" :disabled="busy" @click="signOut">Sign out</button>
+      <nav v-if="session.signedIn.value" class="tabs" aria-label="Administration views">
+        <button
+          :class="{ active: activeView === 'providers' }"
+          :aria-current="activeView === 'providers' ? 'page' : undefined"
+          @click="activeView = 'providers'"
+        >Providers</button>
+        <button
+          :class="{ active: activeView === 'logs' }"
+          :aria-current="activeView === 'logs' ? 'page' : undefined"
+          @click="activeView = 'logs'"
+        >Request logs</button>
+        <button
+          :class="{ active: activeView === 'settings' }"
+          :aria-current="activeView === 'settings' ? 'page' : undefined"
+          @click="activeView = 'settings'"
+        >Settings</button>
+      </nav>
+      <button v-if="session.signedIn.value" class="button ghost sign-out" :disabled="busy" @click="signOut">Sign out</button>
     </header>
 
     <main v-if="session.checking.value" class="center-card" aria-live="polite">
@@ -299,14 +346,9 @@ onMounted(restoreSession)
     </main>
 
     <main v-else-if="!session.signedIn.value" class="login-layout">
-      <section class="login-copy">
-        <p class="eyebrow">Transparent AI gateway</p>
-        <h1>Operate every upstream from one quiet control plane.</h1>
-        <p>Manage providers and inspect transport metadata without exposing request payloads or upstream secrets.</p>
-      </section>
       <form class="card login-card" @submit.prevent="signIn">
-        <p class="eyebrow">Administration</p>
         <h2>Sign in</h2>
+        <p class="login-note">Administrator access to this control plane.</p>
         <label>
           Password
           <input v-model="password" type="password" autocomplete="current-password" required autofocus />
@@ -319,14 +361,16 @@ onMounted(restoreSession)
     <main v-else class="workspace">
       <section class="page-heading">
         <div>
-          <p class="eyebrow">Administration</p>
-          <h1>{{ activeView === 'providers' ? 'Providers' : activeView === 'logs' ? 'Request logs' : 'Settings' }}</h1>
+          <h1>{{ viewTitle(activeView) }}</h1>
+          <p class="lede">{{ viewLede(activeView) }}</p>
         </div>
-        <nav class="tabs" aria-label="Administration views">
-          <button :class="{ active: activeView === 'providers' }" @click="activeView = 'providers'">Providers</button>
-          <button :class="{ active: activeView === 'logs' }" @click="activeView = 'logs'">Request logs</button>
-          <button :class="{ active: activeView === 'settings' }" @click="activeView = 'settings'">Settings</button>
-        </nav>
+        <button
+          v-if="activeView === 'providers' && !creatingProvider"
+          class="button primary"
+          type="button"
+          :disabled="busy"
+          @click="beginCreate"
+        >New provider</button>
       </section>
 
       <p v-if="errorMessage" class="alert error" role="alert">{{ errorMessage }}</p>
@@ -334,9 +378,8 @@ onMounted(restoreSession)
 
       <section v-if="oneTimeCredential" class="credential-card" aria-live="assertive">
         <div>
-          <p class="eyebrow">Shown once</p>
           <h2>{{ credentialAction }}</h2>
-          <p>Copy this credential now. It will disappear when dismissed or when the page is refreshed.</p>
+          <p>Shown once. Copy it now; it disappears when dismissed or when the page is refreshed.</p>
         </div>
         <code>{{ oneTimeCredential }}</code>
         <div class="actions">
@@ -346,63 +389,93 @@ onMounted(restoreSession)
       </section>
 
       <template v-if="activeView === 'providers'">
-        <section class="card create-card">
+        <section v-if="creatingProvider" class="card create-card">
           <div class="section-title">
-            <div>
-              <p class="eyebrow">New upstream</p>
-              <h2>Add provider</h2>
-            </div>
+            <h2>Add provider</h2>
             <span class="section-note">The upstream key is write-only.</span>
           </div>
           <form class="provider-form" @submit.prevent="createProvider">
             <label>Name<input v-model="createForm.name" maxlength="128" required placeholder="primary-openai" /></label>
             <label>Protocol<select v-model="createForm.protocol_type"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></label>
+            <label>Status<select v-model="createForm.status"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
             <label class="wide">Endpoint<input v-model="createForm.endpoint" type="url" required placeholder="https://api.example.com" /></label>
             <label class="wide">Upstream API key<input v-model="createForm.upstream_api_key" type="password" autocomplete="new-password" required /></label>
-            <label>Status<select v-model="createForm.status"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
-            <button class="button primary align-end" :disabled="busy">Create provider</button>
+            <div class="actions wide">
+              <button class="button primary" :disabled="busy">Create provider</button>
+              <button class="button ghost" type="button" @click="cancelCreate">Cancel</button>
+            </div>
           </form>
         </section>
 
-        <section class="provider-list" aria-label="Providers">
-          <article v-for="provider in providers" :key="provider.id" class="card provider-card">
-            <template v-if="editingProviderId === provider.id">
-              <form class="provider-form" @submit.prevent="saveProvider(provider.id)">
-                <label>Name<input v-model="editForm.name" maxlength="128" required /></label>
-                <label>Status<select v-model="editForm.status"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
-                <label class="wide">Endpoint<input v-model="editForm.endpoint" type="url" required /></label>
-                <label class="wide">Replace upstream API key <span>(optional)</span><input v-model="editForm.upstream_api_key" type="password" autocomplete="new-password" /></label>
-                <div class="actions wide">
-                  <button class="button primary" :disabled="busy">Save changes</button>
-                  <button class="button ghost" type="button" @click="editingProviderId = null">Cancel</button>
-                </div>
-              </form>
-            </template>
-            <template v-else>
-              <div class="provider-summary">
-                <div>
-                  <div class="title-row">
-                    <h2>{{ provider.name }}</h2>
-                    <span class="badge" :class="provider.status">{{ provider.status }}</span>
-                    <span class="badge neutral">{{ provider.protocol_type }}</span>
-                  </div>
-                  <p class="endpoint">{{ provider.endpoint }}</p>
-                </div>
-                <div class="provider-id">#{{ provider.id }}</div>
-              </div>
-              <dl class="metadata">
-                <div><dt>Gateway key ID</dt><dd><code>{{ provider.gateway_key_id }}</code></dd></div>
-                <div><dt>Upstream key</dt><dd>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</dd></div>
-                <div><dt>Created</dt><dd>{{ formatDate(provider.created_at) }}</dd></div>
-              </dl>
-              <div class="actions">
-                <button class="button ghost" @click="beginEdit(provider.id, provider)">Edit</button>
-                <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
-                <button class="button ghost" :disabled="busy" @click="rotateCredential(provider.id, provider.name)">Rotate credential</button>
-                <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">Delete</button>
-              </div>
-            </template>
-          </article>
+        <section class="card table-card" aria-label="Providers">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Name</th>
+                  <th>Protocol</th>
+                  <th>Status</th>
+                  <th class="fill">Endpoint</th>
+                  <th>Gateway key ID</th>
+                  <th>Upstream key</th>
+                  <th>Created</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="provider in providers" :key="provider.id">
+                  <tr v-if="editingProviderId === provider.id">
+                    <td>{{ provider.id }}</td>
+                    <td><input v-model="editForm.name" maxlength="128" required aria-label="Name" /></td>
+                    <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
+                    <td>
+                      <select v-model="editForm.status" aria-label="Status">
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </td>
+                    <td class="fill"><input v-model="editForm.endpoint" type="url" required aria-label="Endpoint" /></td>
+                    <td><code>{{ provider.gateway_key_id }}</code></td>
+                    <td>
+                      <input
+                        v-model="editForm.upstream_api_key"
+                        type="password"
+                        autocomplete="new-password"
+                        placeholder="unchanged"
+                        aria-label="Replace upstream API key"
+                      />
+                    </td>
+                    <td>{{ formatDate(provider.created_at) }}</td>
+                    <td class="row-actions">
+                      <div class="actions">
+                        <button class="button primary" :disabled="busy" @click="saveProvider(provider.id)">Save changes</button>
+                        <button class="button ghost" type="button" @click="editingProviderId = null">Cancel</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr v-else>
+                    <td>{{ provider.id }}</td>
+                    <td>{{ provider.name }}</td>
+                    <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
+                    <td><span class="badge" :class="provider.status">{{ provider.status }}</span></td>
+                    <td class="fill">{{ provider.endpoint }}</td>
+                    <td><code>{{ provider.gateway_key_id }}</code></td>
+                    <td>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</td>
+                    <td>{{ formatDate(provider.created_at) }}</td>
+                    <td class="row-actions">
+                      <div class="actions">
+                        <button class="button ghost" @click="beginEdit(provider.id, provider)">Edit</button>
+                        <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
+                        <button class="button ghost" :disabled="busy" @click="rotateCredential(provider.id, provider.name)">Rotate credential</button>
+                        <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
           <div v-if="providers.length === 0" class="empty-state">No providers configured.</div>
           <button v-if="!providerPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreProviders">Load more</button>
         </section>
@@ -425,14 +498,14 @@ onMounted(restoreSession)
         <section class="card table-card">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Request</th><th>Provider</th><th>Transport</th><th>Route</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead>
+              <thead><tr><th>Request</th><th>Provider</th><th>Transport</th><th class="fill">Route</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead>
               <tbody>
                 <tr v-for="log in logPage.items" :key="log.id">
                   <td><code>{{ log.request_id }}</code></td>
                   <td>{{ providerById.get(log.provider_id)?.name ?? `#${log.provider_id}` }}</td>
                   <td>{{ log.transport_type }}</td>
-                  <td><code>{{ log.path }}</code></td>
-                  <td><span v-if="log.incomplete" class="badge incomplete">Incomplete</span><span v-else>{{ log.status_code ?? '—' }}</span><small v-if="log.error_msg">{{ log.error_msg }}</small></td>
+                  <td class="fill"><code>{{ log.path }}</code></td>
+                  <td><span v-if="log.incomplete" class="badge incomplete">Incomplete</span><span v-else>{{ log.status_code ?? '—' }}</span><small v-if="log.error_msg" class="row-error">{{ log.error_msg }}</small></td>
                   <td>{{ formatDate(log.start_time) }}</td>
                   <td>{{ formatDate(log.end_time) }}</td>
                 </tr>
@@ -446,19 +519,12 @@ onMounted(restoreSession)
 
       <template v-else>
         <section class="card table-card">
-          <div class="section-title settings-heading">
-            <div>
-              <p class="eyebrow">Process</p>
-              <h2>Settings</h2>
-            </div>
-            <span class="section-note">Secrets are write-only. Bind-time values apply after restart.</span>
-          </div>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>Setting</th>
-                  <th>Value</th>
+                  <th class="fill">Value</th>
                   <th>Applies</th>
                 </tr>
               </thead>
@@ -468,7 +534,7 @@ onMounted(restoreSession)
                     <strong>{{ item.label }}</strong>
                     <small>{{ item.name }}</small>
                   </td>
-                  <td>
+                  <td class="fill">
                     <input
                       v-model="settingDrafts[item.name]"
                       :type="item.secret ? 'password' : 'text'"
@@ -496,207 +562,334 @@ onMounted(restoreSession)
 
 <style>
 :root {
-  color: #17211c;
-  background: #f1f3ed;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --color-ink: #1a211d;
+  --color-muted: #5d6a63;
+  --color-line: #d7dcd6;
+  --color-fill: #f3f4f1;
+  --color-paper: #fcfdfb;
+  --color-control-fill: #f7f8f5;
+  --color-control-ink: #24352b;
+  --color-accent: #1d6b49;
+  --color-accent-ink: #154e35;
+  --color-on-accent: #ffffff;
+  --color-inverse: #173d2a;
+  --color-on-inverse: #effff4;
+  --color-credential-fill: #e7f3e4;
+  --color-credential-line: #c3dcc0;
+  --color-danger: #8d2e27;
+  --color-danger-fill: #fff8f7;
+  --color-danger-line: #e3c4bf;
+  --color-danger-wash: #fce8e5;
+  --color-success: #24593c;
+  --color-success-fill: #e3f1e7;
+  --color-success-line: #c2dfca;
+  --color-warning: #7c570e;
+  --color-warning-fill: #f7e9bc;
+  --color-enabled: #20613f;
+  --color-enabled-fill: #d9efdf;
+  --color-neutral: #47584d;
+  --color-neutral-fill: #e8ece6;
+  --color-focus: rgba(29, 107, 73, .14);
+  --opacity-disabled: .58;
+
+  --font-ui: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  --font-size-root: 13px;
+  --font-size-page: 15px;
+  --font-size-title: 12px;
+  --font-size-body: 12px;
+  --font-size-ui: 11px;
+  --font-size-meta: 10px;
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 700;
+  --line-height: 1.4;
+  --tracking-tight: -.03em;
+  --tracking-meta: .05em;
+
+  --space-1: 4px;
+  --space-compact: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  --radius-sm: 3px;
+  --radius-md: 5px;
+  --control-height: 24px;
+  --control-height-lg: 28px;
+  --masthead-height: 44px;
+  --page-min-width: 1024px;
+  --login-width: 352px;
+  --mark-size: 18px;
+  --z-masthead: 10;
+
+  font-size: var(--font-size-root);
+  color: var(--color-ink);
+  background: var(--color-fill);
+  font-family: var(--font-ui);
+  line-height: var(--line-height);
   font-synthesis: none;
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; }
+html, body { min-width: var(--page-min-width); }
+body { margin: 0; min-height: 100vh; }
 button, input, select { font: inherit; }
 button { cursor: pointer; }
-button:disabled { cursor: wait; opacity: .58; }
-code { font-family: "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
+button:disabled { cursor: wait; opacity: var(--opacity-disabled); }
+code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere; }
 
-.shell { min-height: 100vh; background: radial-gradient(circle at 10% 0%, #dce8d7 0, transparent 26rem), #f1f3ed; }
-.masthead { height: 72px; padding: 0 clamp(1.25rem, 4vw, 4rem); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #d9ddd4; background: rgba(248, 249, 245, .82); backdrop-filter: blur(14px); }
-.brand { display: inline-flex; align-items: center; gap: .7rem; color: inherit; text-decoration: none; font-weight: 760; letter-spacing: -.02em; }
-.brand-mark { display: grid; place-items: center; width: 2rem; height: 2rem; color: #f8fff8; background: #1e6a48; border-radius: .55rem; }
-.workspace { width: min(1180px, calc(100% - 2rem)); margin: 0 auto; padding: 3.5rem 0 5rem; }
-.page-heading { display: flex; align-items: end; justify-content: space-between; gap: 2rem; margin-bottom: 2rem; }
+.shell { min-width: var(--page-min-width); min-height: 100vh; background: var(--color-fill); }
+.masthead {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-masthead);
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: stretch;
+  column-gap: var(--space-3);
+  min-height: var(--masthead-height);
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--color-line);
+  background: var(--color-paper);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: inherit;
+  text-decoration: none;
+  font-size: var(--font-size-title);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -.02em;
+}
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: var(--mark-size);
+  height: var(--mark-size);
+  color: var(--color-on-inverse);
+  background: var(--color-accent);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-meta);
+  font-weight: var(--font-weight-bold);
+}
+.tabs { display: flex; align-items: stretch; min-width: 0; }
+.tabs button {
+  padding: 0 var(--space-3);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--color-muted);
+  background: transparent;
+  font-size: var(--font-size-ui);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+.tabs button:hover { color: var(--color-ink); }
+.tabs button.active {
+  color: var(--color-accent-ink);
+  border-bottom-color: var(--color-accent);
+  font-weight: var(--font-weight-semibold);
+}
+.workspace {
+  width: 100%;
+  min-width: var(--page-min-width);
+  padding: var(--space-4) var(--space-5) var(--space-8);
+}
+.page-heading {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.page-heading > .button { flex-shrink: 0; }
 h1, h2, p { margin-top: 0; }
-h1 { margin-bottom: .25rem; font-size: clamp(2.2rem, 6vw, 4.6rem); line-height: .95; letter-spacing: -.055em; }
-h2 { margin-bottom: .35rem; font-size: 1.15rem; letter-spacing: -.02em; }
-.eyebrow { margin-bottom: .7rem; color: #347052; font-size: .72rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
-.card { background: rgba(255, 255, 252, .92); border: 1px solid #d6dbd1; border-radius: 1rem; box-shadow: 0 16px 40px rgba(34, 51, 40, .06); }
-.tabs { display: flex; padding: .25rem; background: #e3e7df; border-radius: .75rem; }
-.tabs button { padding: .65rem 1rem; border: 0; border-radius: .55rem; color: #536058; background: transparent; }
-.tabs button.active { color: #173d2a; background: #fff; box-shadow: 0 2px 8px rgba(20, 45, 30, .1); }
-.button { min-height: 2.55rem; padding: .65rem 1rem; border: 1px solid #c9d0c7; border-radius: .65rem; color: #24352b; background: #f9faf7; font-weight: 680; }
-.button.primary { border-color: #1e6a48; color: white; background: #1e6a48; }
-.button.danger { border-color: #ebc8c3; color: #9a3028; background: #fff7f6; }
+h1 {
+  margin-bottom: 0;
+  font-size: var(--font-size-page);
+  line-height: 1.25;
+  letter-spacing: var(--tracking-tight);
+  font-weight: var(--font-weight-semibold);
+}
+h2 {
+  margin-bottom: 0;
+  font-size: var(--font-size-title);
+  letter-spacing: -.01em;
+  font-weight: var(--font-weight-semibold);
+}
+.lede { margin: var(--space-1) 0 0; color: var(--color-muted); font-size: var(--font-size-ui); }
+.card {
+  background: var(--color-paper);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+.button {
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  color: var(--color-control-ink);
+  background: var(--color-control-fill);
+  font-size: var(--font-size-ui);
+  font-weight: var(--font-weight-semibold);
+}
+.button.primary { border-color: var(--color-accent); color: var(--color-on-accent); background: var(--color-accent); }
+.button.danger { border-color: var(--color-danger-line); color: var(--color-danger); background: var(--color-danger-fill); }
 .button.ghost { background: transparent; }
-.center-card { min-height: calc(100vh - 72px); display: grid; place-content: center; justify-items: center; color: #536058; }
-.spinner { width: 2rem; height: 2rem; border: 3px solid #cbd5cc; border-top-color: #1e6a48; border-radius: 50%; animation: spin .8s linear infinite; }
+.button.sign-out { align-self: center; border-color: transparent; }
+.center-card {
+  min-height: calc(100vh - var(--masthead-height));
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  color: var(--color-muted);
+}
+.spinner {
+  width: var(--mark-size);
+  height: var(--mark-size);
+  border: 2px solid var(--color-line);
+  border-top-color: var(--color-accent);
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
 @keyframes spin { to { transform: rotate(360deg); } }
-.login-layout { width: min(1080px, calc(100% - 2rem)); min-height: calc(100vh - 72px); margin: auto; display: grid; grid-template-columns: 1.3fr .7fr; align-items: center; gap: clamp(3rem, 8vw, 8rem); }
-.login-copy h1 { max-width: 13ch; }
-.login-copy > p:last-child { max-width: 55ch; color: #59665e; font-size: 1.05rem; line-height: 1.7; }
-.login-card { padding: 2rem; }
-label { display: grid; gap: .45rem; color: #48554d; font-size: .76rem; font-weight: 760; letter-spacing: .025em; }
-label span { font-weight: 500; }
-input, select { width: 100%; min-height: 2.75rem; padding: .7rem .8rem; border: 1px solid #cbd2c9; border-radius: .55rem; color: #17211c; background: #fff; outline: none; }
-input:focus, select:focus { border-color: #287653; box-shadow: 0 0 0 3px rgba(40, 118, 83, .12); }
-.login-card label { margin: 1.5rem 0 1rem; }
-.login-card .button { width: 100%; }
-.alert { padding: .85rem 1rem; border-radius: .65rem; font-size: .9rem; }
-.alert.error { color: #85251f; background: #fce8e5; border: 1px solid #efcbc6; }
-.alert.success { color: #24593c; background: #e3f1e7; border: 1px solid #c2dfca; }
-.credential-card { display: grid; grid-template-columns: 1fr auto; gap: 1rem 2rem; margin-bottom: 1.5rem; padding: 1.5rem; color: #153825; background: #ddefd9; border: 1px solid #b9d7b7; border-radius: 1rem; }
-.credential-card code { grid-column: 1 / -1; padding: 1rem; color: #effff4; background: #173d2a; border-radius: .6rem; }
-.actions { display: flex; flex-wrap: wrap; gap: .55rem; }
+.login-layout {
+  display: grid;
+  place-items: center;
+  min-height: calc(100vh - var(--masthead-height));
+  padding: var(--space-5);
+}
+.login-card { width: min(var(--login-width), 100%); padding: var(--space-4) var(--space-5); }
+.login-card h2 { margin-bottom: var(--space-1); }
+.login-note { margin: 0 0 var(--space-3); color: var(--color-muted); font-size: var(--font-size-ui); }
+label {
+  display: grid;
+  gap: var(--space-1);
+  color: var(--color-muted);
+  font-size: var(--font-size-meta);
+  font-weight: var(--font-weight-semibold);
+}
+label span { font-weight: var(--font-weight-medium); }
+input, select {
+  width: 100%;
+  min-height: var(--control-height);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+  color: var(--color-ink);
+  background: var(--color-paper);
+  outline: none;
+}
+input:focus, select:focus {
+  border-color: var(--color-accent);
+  box-shadow: 0 0 0 2px var(--color-focus);
+}
+.login-card label { margin-bottom: var(--space-3); }
+.login-card .button { width: 100%; min-height: var(--control-height-lg); }
+.alert {
+  margin: 0 0 var(--space-2);
+  padding: var(--space-compact) var(--space-2);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-ui);
+}
+.alert.error { color: var(--color-danger); background: var(--color-danger-wash); border: 1px solid var(--color-danger-line); }
+.alert.success { color: var(--color-success); background: var(--color-success-fill); border: 1px solid var(--color-success-line); }
+.credential-card {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  padding: var(--space-3);
+  color: var(--color-accent-ink);
+  background: var(--color-credential-fill);
+  border: 1px solid var(--color-credential-line);
+  border-radius: var(--radius-md);
+}
+.credential-card p { margin: var(--space-1) 0 0; color: var(--color-muted); font-size: var(--font-size-ui); }
+.credential-card code {
+  grid-column: 1 / -1;
+  padding: var(--space-compact) var(--space-2);
+  color: var(--color-on-inverse);
+  background: var(--color-inverse);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-ui);
+}
+.actions { display: flex; flex-wrap: wrap; gap: var(--space-compact); }
 .credential-card .actions { grid-column: 1 / -1; }
-.create-card, .filters-card { margin-bottom: 1.25rem; padding: 1.5rem; }
-.section-title { display: flex; align-items: start; justify-content: space-between; gap: 1rem; margin-bottom: 1.25rem; }
-.section-note { color: #6a756e; font-size: .82rem; }
-.provider-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.create-card, .filters-card { width: 100%; margin-bottom: var(--space-2); padding: var(--space-3); }
+.section-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+.section-note { color: var(--color-muted); font-size: var(--font-size-ui); }
+.provider-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2) var(--space-3); }
 .provider-form .wide { grid-column: 1 / -1; }
-.align-end { align-self: end; }
-.provider-list { display: grid; gap: 1rem; }
-.provider-card { padding: 1.5rem; }
-.provider-summary, .title-row { display: flex; align-items: start; gap: .7rem; }
-.provider-summary { justify-content: space-between; }
-.provider-summary h2 { font-size: 1.35rem; }
-.provider-id { color: #7b857e; font: .8rem "SFMono-Regular", Consolas, monospace; }
-.endpoint { margin: .35rem 0 0; color: #627068; }
-.badge { display: inline-flex; padding: .25rem .5rem; border-radius: 999px; font-size: .68rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
-.badge.enabled { color: #20613f; background: #d9efdf; }
-.badge.disabled { color: #8a4337; background: #f6e2de; }
-.badge.neutral { color: #47584d; background: #e8ece6; }
-.badge.incomplete { color: #7c570e; background: #f7e9bc; }
-.metadata { display: grid; grid-template-columns: 1.3fr .7fr 1fr; gap: 1rem; margin: 1.4rem 0; padding: 1rem 0; border-top: 1px solid #e3e7e0; border-bottom: 1px solid #e3e7e0; }
-.metadata div { min-width: 0; }
-.metadata dt { margin-bottom: .35rem; color: #7a857d; font-size: .7rem; font-weight: 760; text-transform: uppercase; }
-.metadata dd { margin: 0; font-size: .9rem; }
-.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
-.filter-actions { grid-column: 1 / -1; }
-.table-card { overflow: hidden; }
+.badge {
+  display: inline-flex;
+  padding: 1px var(--space-compact);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-meta);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: var(--tracking-meta);
+  text-transform: uppercase;
+}
+.badge.enabled { color: var(--color-enabled); background: var(--color-enabled-fill); }
+.badge.disabled { color: var(--color-danger); background: var(--color-danger-fill); }
+.badge.neutral { color: var(--color-neutral); background: var(--color-neutral-fill); }
+.badge.incomplete { color: var(--color-warning); background: var(--color-warning-fill); }
+.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: var(--space-2) var(--space-3); align-items: end; }
+.filter-actions { padding-bottom: 1px; }
+.table-card { overflow: hidden; width: 100%; }
 .table-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
-th, td { padding: .9rem 1rem; border-bottom: 1px solid #e4e7e2; text-align: left; vertical-align: top; white-space: nowrap; }
-th { color: #6c7870; background: #f8f9f6; font-size: .68rem; letter-spacing: .06em; text-transform: uppercase; }
-td small { display: block; margin-top: .35rem; color: #9a3d33; }
-.empty-state { padding: 3rem 1rem; color: #738078; text-align: center; }
-.load-more { display: block; margin: 1rem auto; }
-.filters-pending { margin-top: 1rem; color: #6a756e; font-size: .82rem; }
-.settings-heading { padding: 1.5rem 1.5rem 0; }
-.settings-actions { padding: 1rem 1.5rem 1.5rem; }
-td input { min-width: 16rem; }
-td small { display: block; margin-top: .35rem; color: #7a857d; font-weight: 500; letter-spacing: 0; text-transform: none; }
+table { width: 100%; border-collapse: collapse; font-size: var(--font-size-body); }
+th, td {
+  padding: var(--space-compact) var(--space-3);
+  border-bottom: 1px solid var(--color-line);
+  text-align: left;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+th {
+  color: var(--color-muted);
+  background: var(--color-control-fill);
+  font-size: var(--font-size-meta);
+  font-weight: var(--font-weight-bold);
+  letter-spacing: var(--tracking-meta);
+  text-transform: uppercase;
+}
+td input, td select { min-width: 8rem; width: 100%; }
+th.fill, td.fill { width: 100%; }
+.row-actions { width: 1%; }
+.row-actions .actions { flex-wrap: nowrap; }
+.row-error { display: block; margin-top: var(--space-1); color: var(--color-danger); }
+.empty-state { padding: var(--space-6) var(--space-4); color: var(--color-muted); text-align: center; font-size: var(--font-size-ui); }
+.load-more { display: block; margin: var(--space-2) auto; }
+.filters-pending { margin: var(--space-2) 0 0; color: var(--color-muted); font-size: var(--font-size-ui); }
+.settings-actions { padding: var(--space-2) var(--space-3) var(--space-3); }
+td small { display: block; margin-top: var(--space-1); color: var(--color-muted); font-weight: var(--font-weight-medium); letter-spacing: 0; text-transform: none; }
 
 @media (max-width: 780px) {
-  .login-layout { grid-template-columns: 1fr; align-content: center; gap: 2rem; padding: 3rem 0; }
-  .login-copy h1 { font-size: 2.8rem; }
-  .page-heading { align-items: stretch; flex-direction: column; }
-  .tabs button { flex: 1; }
+  .masthead {
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "brand out" "tabs tabs";
+    min-height: 0;
+    padding: 0 var(--space-3);
+  }
+  .brand { grid-area: brand; height: 40px; }
+  .sign-out { grid-area: out; }
+  .tabs { grid-area: tabs; }
+  .tabs button { flex: 1; height: var(--control-height-lg); }
+  .workspace { padding-top: var(--space-3); }
+  .page-heading { margin-bottom: var(--space-2); }
   .provider-form, .filters { grid-template-columns: 1fr; }
   .provider-form .wide, .filter-actions { grid-column: auto; }
-  .metadata { grid-template-columns: 1fr; }
-  .credential-card { grid-template-columns: 1fr; }
-  .credential-card code, .credential-card .actions { grid-column: auto; }
-}
-</style>
-
-<style>
-:root {
-  color: #17211c;
-  background: #f1f3ed;
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  font-synthesis: none;
-}
-
-* { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; }
-button, input, select { font: inherit; }
-button { cursor: pointer; }
-button:disabled { cursor: wait; opacity: .58; }
-code { font-family: "SFMono-Regular", Consolas, monospace; overflow-wrap: anywhere; }
-
-.shell { min-height: 100vh; background: radial-gradient(circle at 10% 0%, #dce8d7 0, transparent 26rem), #f1f3ed; }
-.masthead { height: 72px; padding: 0 clamp(1.25rem, 4vw, 4rem); display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #d9ddd4; background: rgba(248, 249, 245, .82); backdrop-filter: blur(14px); }
-.brand { display: inline-flex; align-items: center; gap: .7rem; color: inherit; text-decoration: none; font-weight: 760; letter-spacing: -.02em; }
-.brand-mark { display: grid; place-items: center; width: 2rem; height: 2rem; color: #f8fff8; background: #1e6a48; border-radius: .55rem; }
-.workspace { width: min(1180px, calc(100% - 2rem)); margin: 0 auto; padding: 3.5rem 0 5rem; }
-.page-heading { display: flex; align-items: end; justify-content: space-between; gap: 2rem; margin-bottom: 2rem; }
-h1, h2, p { margin-top: 0; }
-h1 { margin-bottom: .25rem; font-size: clamp(2.2rem, 6vw, 4.6rem); line-height: .95; letter-spacing: -.055em; }
-h2 { margin-bottom: .35rem; font-size: 1.15rem; letter-spacing: -.02em; }
-.eyebrow { margin-bottom: .7rem; color: #347052; font-size: .72rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
-.card { background: rgba(255, 255, 252, .92); border: 1px solid #d6dbd1; border-radius: 1rem; box-shadow: 0 16px 40px rgba(34, 51, 40, .06); }
-.tabs { display: flex; padding: .25rem; background: #e3e7df; border-radius: .75rem; }
-.tabs button { padding: .65rem 1rem; border: 0; border-radius: .55rem; color: #536058; background: transparent; }
-.tabs button.active { color: #173d2a; background: #fff; box-shadow: 0 2px 8px rgba(20, 45, 30, .1); }
-.button { min-height: 2.55rem; padding: .65rem 1rem; border: 1px solid #c9d0c7; border-radius: .65rem; color: #24352b; background: #f9faf7; font-weight: 680; }
-.button.primary { border-color: #1e6a48; color: white; background: #1e6a48; }
-.button.danger { border-color: #ebc8c3; color: #9a3028; background: #fff7f6; }
-.button.ghost { background: transparent; }
-.center-card { min-height: calc(100vh - 72px); display: grid; place-content: center; justify-items: center; color: #536058; }
-.spinner { width: 2rem; height: 2rem; border: 3px solid #cbd5cc; border-top-color: #1e6a48; border-radius: 50%; animation: spin .8s linear infinite; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.login-layout { width: min(1080px, calc(100% - 2rem)); min-height: calc(100vh - 72px); margin: auto; display: grid; grid-template-columns: 1.3fr .7fr; align-items: center; gap: clamp(3rem, 8vw, 8rem); }
-.login-copy h1 { max-width: 13ch; }
-.login-copy > p:last-child { max-width: 55ch; color: #59665e; font-size: 1.05rem; line-height: 1.7; }
-.login-card { padding: 2rem; }
-label { display: grid; gap: .45rem; color: #48554d; font-size: .76rem; font-weight: 760; letter-spacing: .025em; }
-label span { font-weight: 500; }
-input, select { width: 100%; min-height: 2.75rem; padding: .7rem .8rem; border: 1px solid #cbd2c9; border-radius: .55rem; color: #17211c; background: #fff; outline: none; }
-input:focus, select:focus { border-color: #287653; box-shadow: 0 0 0 3px rgba(40, 118, 83, .12); }
-.login-card label { margin: 1.5rem 0 1rem; }
-.login-card .button { width: 100%; }
-.alert { padding: .85rem 1rem; border-radius: .65rem; font-size: .9rem; }
-.alert.error { color: #85251f; background: #fce8e5; border: 1px solid #efcbc6; }
-.alert.success { color: #24593c; background: #e3f1e7; border: 1px solid #c2dfca; }
-.credential-card { display: grid; grid-template-columns: 1fr auto; gap: 1rem 2rem; margin-bottom: 1.5rem; padding: 1.5rem; color: #153825; background: #ddefd9; border: 1px solid #b9d7b7; border-radius: 1rem; }
-.credential-card code { grid-column: 1 / -1; padding: 1rem; color: #effff4; background: #173d2a; border-radius: .6rem; }
-.actions { display: flex; flex-wrap: wrap; gap: .55rem; }
-.credential-card .actions { grid-column: 1 / -1; }
-.create-card, .filters-card { margin-bottom: 1.25rem; padding: 1.5rem; }
-.section-title { display: flex; align-items: start; justify-content: space-between; gap: 1rem; margin-bottom: 1.25rem; }
-.section-note { color: #6a756e; font-size: .82rem; }
-.provider-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
-.provider-form .wide { grid-column: 1 / -1; }
-.align-end { align-self: end; }
-.provider-list { display: grid; gap: 1rem; }
-.provider-card { padding: 1.5rem; }
-.provider-summary, .title-row { display: flex; align-items: start; gap: .7rem; }
-.provider-summary { justify-content: space-between; }
-.provider-summary h2 { font-size: 1.35rem; }
-.provider-id { color: #7b857e; font: .8rem "SFMono-Regular", Consolas, monospace; }
-.endpoint { margin: .35rem 0 0; color: #627068; }
-.badge { display: inline-flex; padding: .25rem .5rem; border-radius: 999px; font-size: .68rem; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
-.badge.enabled { color: #20613f; background: #d9efdf; }
-.badge.disabled { color: #8a4337; background: #f6e2de; }
-.badge.neutral { color: #47584d; background: #e8ece6; }
-.badge.incomplete { color: #7c570e; background: #f7e9bc; }
-.metadata { display: grid; grid-template-columns: 1.3fr .7fr 1fr; gap: 1rem; margin: 1.4rem 0; padding: 1rem 0; border-top: 1px solid #e3e7e0; border-bottom: 1px solid #e3e7e0; }
-.metadata div { min-width: 0; }
-.metadata dt { margin-bottom: .35rem; color: #7a857d; font-size: .7rem; font-weight: 760; text-transform: uppercase; }
-.metadata dd { margin: 0; font-size: .9rem; }
-.filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
-.filter-actions { grid-column: 1 / -1; }
-.table-card { overflow: hidden; }
-.table-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: .82rem; }
-th, td { padding: .9rem 1rem; border-bottom: 1px solid #e4e7e2; text-align: left; vertical-align: top; white-space: nowrap; }
-th { color: #6c7870; background: #f8f9f6; font-size: .68rem; letter-spacing: .06em; text-transform: uppercase; }
-td small { display: block; margin-top: .35rem; color: #9a3d33; }
-.empty-state { padding: 3rem 1rem; color: #738078; text-align: center; }
-.load-more { display: block; margin: 1rem auto; }
-.filters-pending { margin-top: 1rem; color: #6a756e; font-size: .82rem; }
-.settings-heading { padding: 1.5rem 1.5rem 0; }
-.settings-actions { padding: 1rem 1.5rem 1.5rem; }
-td input { min-width: 16rem; }
-td small { display: block; margin-top: .35rem; color: #7a857d; font-weight: 500; letter-spacing: 0; text-transform: none; }
-
-@media (max-width: 780px) {
-  .login-layout { grid-template-columns: 1fr; align-content: center; gap: 2rem; padding: 3rem 0; }
-  .login-copy h1 { font-size: 2.8rem; }
-  .page-heading { align-items: stretch; flex-direction: column; }
-  .tabs button { flex: 1; }
-  .provider-form, .filters { grid-template-columns: 1fr; }
-  .provider-form .wide, .filter-actions { grid-column: auto; }
-  .metadata { grid-template-columns: 1fr; }
   .credential-card { grid-template-columns: 1fr; }
   .credential-card code, .credential-card .actions { grid-column: auto; }
 }

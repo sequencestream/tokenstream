@@ -251,7 +251,7 @@ Key forks among alternatives are recorded as architecture decision records under
 | Proxy | [`modules/proxy.md`](./modules/proxy.md) | HTTP/SSE streaming and bidirectional WebSocket relay |
 | Providers | [`modules/providers.md`](./modules/providers.md) | Provider lifecycle, credential issuance, snapshot loading |
 | Logging | [`modules/logging.md`](./modules/logging.md) | Bounded, non-blocking transport-metadata logging |
-| Administration | [`modules/administration.md`](./modules/administration.md) | Control-plane session, APIs, and administration page |
+| Administration | [`modules/administration.md`](./modules/administration.md) | Control-plane session, APIs, administration page, and page presentation |
 
 Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Routing, Proxy, Providers, Logging, Administration.
 

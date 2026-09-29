@@ -238,11 +238,19 @@ async function runSuite(browser, origin, label) {
     assert.equal(csrf.cache, 'no-store')
 
     const providerName = `browser-${label}`
+    assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
+    await page.getByRole('button', { name: 'New provider' }).click()
+    await page.getByPlaceholder('primary-openai').waitFor()
+    await page.getByRole('button', { name: 'Cancel' }).click()
+    assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
+    await page.getByRole('button', { name: 'New provider' }).click()
     await page.getByPlaceholder('primary-openai').fill(providerName)
     await page.getByPlaceholder('https://api.example.com').fill('https://api.example.com')
     await page.getByLabel('Upstream API key').fill('upstream-secret')
     await page.getByRole('button', { name: 'Create provider' }).click()
     await page.getByRole('heading', { name: `Credential for ${providerName}` }).waitFor()
+    assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'New provider' }).count(), 1)
     const createdCredential = (await page.locator('.credential-card code').innerText()).trim()
     assert.match(createdCredential, /^.+\..+$/)
     assert.deepEqual(await storedCredentialTraces(page, createdCredential), {
@@ -258,7 +266,7 @@ async function runSuite(browser, origin, label) {
 
     page.once('dialog', (dialog) => dialog.accept())
     await page
-      .getByRole('article')
+      .getByRole('row')
       .filter({ hasText: providerName })
       .getByRole('button', { name: 'Rotate credential' })
       .click()
