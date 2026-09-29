@@ -32,7 +32,7 @@ use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::{Request, Response};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::capture_connection;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use tokio::time::{Instant, Sleep, timeout};
 
 use crate::config::Config;
@@ -47,8 +47,9 @@ use crate::telemetry::Metrics;
 ///
 /// The body type is a type parameter so one pipeline accepts both the live
 /// downstream body and a test body without buffering either one. The client
-/// pools transport connections but holds no credential: every call re-reads the
-/// request-local snapshot it is handed.
+/// may retain a bounded number of idle HTTP connections per origin, and never
+/// holds a credential: every call re-reads the request-local snapshot it is
+/// handed, replaces the upstream authentication header, and does not retry.
 pub struct HttpProxy<B> {
     client: Client<UpstreamConnector, IdleTimeoutBody<B>>,
     header_timeout: Duration,
@@ -98,12 +99,44 @@ where
         metrics: Metrics,
         buffer_bytes: usize,
     ) -> Self {
+        Self::with_pool(
+            connect_timeout,
+            header_timeout,
+            idle_timeout,
+            metrics,
+            buffer_bytes,
+            0,
+            Duration::from_secs(30),
+        )
+    }
+
+    /// Builds a proxy that may retain idle HTTP connections within explicit bounds.
+    ///
+    /// `idle_per_host` of zero keeps the historical no-reuse behaviour. A positive
+    /// cap retains at most that many idle connections per origin and reaps them
+    /// after `pool_idle_timeout`, so a changing endpoint cannot hold sockets
+    /// indefinitely. Cancelled exchanges are never retried.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_pool(
+        connect_timeout: Duration,
+        header_timeout: Duration,
+        idle_timeout: Duration,
+        metrics: Metrics,
+        buffer_bytes: usize,
+        idle_per_host: usize,
+        pool_idle_timeout: Duration,
+    ) -> Self {
         let connector = UpstreamConnector::new(connect_timeout);
         let mut builder = Client::builder(TokioExecutor::new());
         builder
             .retry_canceled_requests(false)
             .http1_read_buf_exact_size(buffer_bytes)
-            .pool_max_idle_per_host(0);
+            .pool_max_idle_per_host(idle_per_host);
+        if idle_per_host > 0 {
+            builder
+                .pool_timer(TokioTimer::new())
+                .pool_idle_timeout(pool_idle_timeout);
+        }
         let client = builder.build(connector);
         Self {
             client,
@@ -115,12 +148,14 @@ where
 
     /// Builds a proxy from the already-validated startup configuration.
     pub fn from_config(config: &Config) -> Self {
-        Self::with_buffer(
+        Self::with_pool(
             config.upstream_connect_timeout(),
             config.upstream_header_timeout(),
             config.stream_idle_timeout(),
             Metrics::default(),
             config.http_buffer_bytes(),
+            config.upstream_idle_per_host(),
+            config.upstream_pool_idle_timeout(),
         )
     }
 

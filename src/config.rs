@@ -72,6 +72,8 @@ pub struct Config {
     upstream_connect_timeout: Duration,
     upstream_header_timeout: Duration,
     stream_idle_timeout: Duration,
+    upstream_idle_per_host: usize,
+    upstream_pool_idle_timeout: Duration,
     shutdown_drain_timeout: Duration,
     log_flush_timeout: Duration,
     database_max_connections: usize,
@@ -143,6 +145,14 @@ impl Config {
             &mut get,
             "TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS",
             MAX_IDLE_TIMEOUT_MS,
+        )?;
+        let upstream_idle_per_host =
+            parse_optional(&mut get, "TOKENSTREAM_UPSTREAM_IDLE_PER_HOST", 8, 0, 64)?;
+        let upstream_pool_idle_timeout = parse_optional_duration(
+            &mut get,
+            "TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS",
+            30_000,
+            MAX_UPSTREAM_TIMEOUT_MS,
         )?;
         let shutdown_drain_timeout = parse_duration(
             &mut get,
@@ -296,6 +306,8 @@ impl Config {
             upstream_connect_timeout,
             upstream_header_timeout,
             stream_idle_timeout,
+            upstream_idle_per_host,
+            upstream_pool_idle_timeout,
             shutdown_drain_timeout,
             log_flush_timeout,
             database_max_connections,
@@ -386,6 +398,14 @@ impl Config {
 
     pub fn stream_idle_timeout(&self) -> Duration {
         self.stream_idle_timeout
+    }
+
+    pub fn upstream_idle_per_host(&self) -> usize {
+        self.upstream_idle_per_host
+    }
+
+    pub fn upstream_pool_idle_timeout(&self) -> Duration {
+        self.upstream_pool_idle_timeout
     }
 
     pub fn shutdown_drain_timeout(&self) -> Duration {
@@ -791,6 +811,8 @@ mod tests {
         assert_eq!(config.upstream_connect_timeout().as_millis(), 5000);
         assert_eq!(config.upstream_header_timeout().as_millis(), 30000);
         assert_eq!(config.stream_idle_timeout().as_millis(), 60000);
+        assert_eq!(config.upstream_idle_per_host(), 8);
+        assert_eq!(config.upstream_pool_idle_timeout().as_millis(), 30_000);
         assert_eq!(config.shutdown_drain_timeout().as_millis(), 30000);
         assert_eq!(config.log_flush_timeout().as_millis(), 5000);
         assert_eq!(config.database_max_connections(), 16);
@@ -850,6 +872,9 @@ mod tests {
             ("TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS", "0"),
             ("TOKENSTREAM_UPSTREAM_HEADER_TIMEOUT_MS", "300001"),
             ("TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS", "3600001"),
+            ("TOKENSTREAM_UPSTREAM_IDLE_PER_HOST", "65"),
+            ("TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS", "0"),
+            ("TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS", "300001"),
             ("TOKENSTREAM_SHUTDOWN_DRAIN_TIMEOUT_MS", "300001"),
             ("TOKENSTREAM_LOG_FLUSH_TIMEOUT_MS", "0"),
             ("TOKENSTREAM_DATABASE_MAX_CONNECTIONS", "0"),
@@ -895,6 +920,8 @@ mod tests {
         assert_eq!(config.admin_max_connections(), 128);
         assert_eq!(config.downstream_header_timeout().as_millis(), 10000);
         assert_eq!(config.admin_body_timeout().as_millis(), 30000);
+        assert_eq!(config.upstream_idle_per_host(), 8);
+        assert_eq!(config.upstream_pool_idle_timeout().as_millis(), 30_000);
         assert!(
             config.data_max_connections() > config.max_proxy_connections(),
             "the data plane must keep room to reject overload before the proxy limit"
@@ -907,6 +934,8 @@ mod tests {
             ("TOKENSTREAM_ADMIN_MAX_CONNECTIONS", "64"),
             ("TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS", "1500"),
             ("TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS", "2000"),
+            ("TOKENSTREAM_UPSTREAM_IDLE_PER_HOST", "0"),
+            ("TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS", "1500"),
         ] {
             explicit.insert(name, value.into());
         }
@@ -918,6 +947,8 @@ mod tests {
         assert_eq!(config.admin_max_connections(), 64);
         assert_eq!(config.downstream_header_timeout().as_millis(), 1500);
         assert_eq!(config.admin_body_timeout().as_millis(), 2000);
+        assert_eq!(config.upstream_idle_per_host(), 0);
+        assert_eq!(config.upstream_pool_idle_timeout().as_millis(), 1500);
     }
 
     #[test]

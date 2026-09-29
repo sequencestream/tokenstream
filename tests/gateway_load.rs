@@ -3,8 +3,9 @@
 //! The component profile in `release_load_profile` bounds the proxy in
 //! isolation. This profile drives the deployed process through its formal
 //! listeners so admission, authentication, routing, database and logging are
-//! all part of the measurement, and samples the gateway's own memory
-//! independently of the driver.
+//! all part of the measurement: default hashing, declared admission, mixed
+//! short requests and long-lived streams, bounded HTTP reuse, and sampled
+//! process resources.
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};

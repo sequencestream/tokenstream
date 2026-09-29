@@ -151,7 +151,7 @@ Validates the HTTP method and URL path against the resolved provider's `protocol
 4. If the WebSocket handshake is blocked, the client falls back to HTTP-SSE and the gateway forwards the stream correctly.
 5. Under normal logging-queue and database operation, if the WebSocket connection closes and the client switches to HTTP-SSE, both connections are logged with the correct `transport_type`; an injected queue-saturation test increments the dropped-log metric without blocking proxy traffic.
 6. HTTP bodies and WebSocket application messages arrive upstream without application-level inspection or mutation. Requests missing a required `model` field are rejected by the upstream and are not repaired by the gateway.
-7. Under a documented concurrency and payload-size test profile, long-lived SSE and WebSocket connections remain responsive, queue and buffer bounds are enforced, and memory reaches a stable bound rather than growing with connection duration.
+7. Under a documented concurrency and payload-size test profile, using the default hashing budget rather than a raised substitute, mixed short HTTP requests and long-lived SSE and WebSocket connections remain responsive, queue, buffer, hashing, and semaphore bounds are enforced, and memory reaches a stable bound rather than growing with connection duration.
 8. Request and response application payloads remain unchanged end to end.
 9. If the upstream closes a WebSocket or SSE stream, the gateway propagates the closure or end-of-stream result and does not automatically retry or reconnect upstream.
 10. Request logs contain no request bodies, response bodies, API keys, or other sensitive payloads.

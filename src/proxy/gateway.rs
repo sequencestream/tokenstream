@@ -68,12 +68,14 @@ impl Gateway {
                 Argon2GatewaySecretVerifier::new(),
             )
             .with_password_work(work),
-            http: HttpProxy::with_buffer(
+            http: HttpProxy::with_pool(
                 config.upstream_connect_timeout(),
                 config.upstream_header_timeout(),
                 config.stream_idle_timeout(),
                 metrics.clone(),
                 config.http_buffer_bytes(),
+                config.upstream_idle_per_host(),
+                config.upstream_pool_idle_timeout(),
             ),
             websocket: WebSocketProxy::with_metrics(
                 config.upstream_connect_timeout(),

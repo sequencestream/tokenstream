@@ -22,7 +22,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 
 - **Proxy**: Never read, inject, or validate application fields. HTTP request and response bodies are streamed with bounded buffers and backpressure, never fully buffered. WebSocket application messages are relayed without deserialization, under configured message and connection bounds. There is no retry, no reconnect, no protocol conversion, and no load balancing. Client cancellation cancels the associated upstream request.
 - **Logging**: Logging is best-effort, metadata-only, and must never block proxy traffic. A full log queue drops events and increments a dropped-event metric. Request and response payloads are never stored. Metrics carry no key IDs, URLs with query strings, or other high-cardinality secrets.
-- **Bounds**: A global semaphore bounds admitted proxy connections. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, and log queue capacity are all bounded. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
+- **Bounds**: A global semaphore bounds admitted proxy connections. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, log queue capacity, and idle HTTP connections retained per upstream origin are all bounded. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
 
 ## 4. Security Invariants
 
@@ -72,7 +72,7 @@ Transparency and safety are proven by tests, not assumed:
 
 - HTTP/SSE and WebSocket contract tests demonstrate byte-preserving relay across arbitrary chunk fragmentation, unknown application fields, backpressure, cancellation, and abrupt disconnects.
 - Security tests assert redaction, fail-closed behavior, and the absence of secrets from logs and API responses.
-- Load tests demonstrate stable memory under the documented concurrency profile for long-lived streams and enforce every queue, buffer, and semaphore bound.
+- Load tests demonstrate stable memory under the documented concurrency profile for mixed short requests and long-lived streams and enforce every queue, buffer, hashing, idle-connection, and semaphore bound.
 - A version-controlled manifest of pinned client and SDK versions, run against a controllable mock upstream, is the release compatibility gate; external live services are never the CI correctness dependency.
 
 A change is complete only when all applicable layers pass. Milestone designs may add tests, but may not remove or weaken any of these layers.

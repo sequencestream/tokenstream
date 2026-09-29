@@ -27,7 +27,7 @@ use url::Url;
 
 const HTTP_CONNECTIONS: usize = 24;
 const WEBSOCKET_CONNECTIONS: usize = 24;
-const PROFILE_DURATION: Duration = Duration::from_secs(3);
+const PROFILE_DURATION: Duration = Duration::from_secs(10);
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_STEADY_RSS_SPREAD_KIB: u64 = 16 * 1024;
 
