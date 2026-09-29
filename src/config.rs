@@ -956,7 +956,7 @@ fn decode_master_key(value: &str) -> Result<[u8; 32], ConfigError> {
     }
 
     let mut key = [0_u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let high = hex_digit(pair[0]);
         let low = hex_digit(pair[1]);
         key[index] = (high << 4) | low;
