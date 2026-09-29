@@ -14,7 +14,8 @@ use crate::auth::GatewayAuthenticator;
 use crate::config::Config;
 use crate::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
 use crate::domain::{ProviderSnapshot, RequestId, TransportType};
-use crate::logging::{LogSink, RequestLogLifecycle, observe_response};
+use crate::events::EventBus;
+use crate::logging::{RequestLogLifecycle, observe_response};
 use crate::persistence::Database;
 use crate::proxy::admission::{AdmissionPermit, ProxyLimits};
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
@@ -40,17 +41,18 @@ pub struct Gateway {
     authenticator: GatewayAuthenticator<Database, SharedCipher, Argon2GatewaySecretVerifier>,
     http: HttpProxy<Incoming>,
     websocket: WebSocketProxy,
-    logs: LogSink,
+    events: EventBus,
+    metrics: Metrics,
     admission: LayeredAdmission,
     settings: crate::ConnectionSettings,
 }
 
 impl Gateway {
-    pub fn new(config: &Config, database: Database, logs: LogSink, metrics: Metrics) -> Self {
+    pub fn new(config: &Config, database: Database, events: EventBus, metrics: Metrics) -> Self {
         Self::with_password_work(
             config,
             database,
-            logs,
+            events,
             metrics,
             crate::crypto::PasswordWork::default(),
         )
@@ -59,14 +61,14 @@ impl Gateway {
     pub fn with_password_work(
         config: &Config,
         database: Database,
-        logs: LogSink,
+        events: EventBus,
         metrics: Metrics,
         work: crate::crypto::PasswordWork,
     ) -> Self {
         Self::with_shared_cipher(
             config,
             database,
-            logs,
+            events,
             metrics,
             work,
             SharedCipher::new(config.master_key().expose()),
@@ -76,7 +78,7 @@ impl Gateway {
     pub fn with_shared_cipher(
         config: &Config,
         database: Database,
-        logs: LogSink,
+        events: EventBus,
         metrics: Metrics,
         work: crate::crypto::PasswordWork,
         cipher: SharedCipher,
@@ -103,9 +105,10 @@ impl Gateway {
                 config.upstream_header_timeout(),
                 config.stream_idle_timeout(),
                 &ProxyLimits::from_config(config),
-                metrics,
+                metrics.clone(),
             ),
-            logs,
+            events,
+            metrics,
             admission: LayeredAdmission::new(),
         }
     }
@@ -147,7 +150,8 @@ impl Gateway {
                     query.as_deref(),
                     peer,
                     request,
-                    self.logs.clone(),
+                    self.events.clone(),
+                    self.metrics.clone(),
                     id,
                 )
                 .await?;
@@ -162,8 +166,14 @@ impl Gateway {
                 None,
             ));
         }
-        let mut lifecycle = RequestLogLifecycle::start(self.logs.clone(), id, &snapshot, &route)
-            .observe_websocket();
+        let mut lifecycle = RequestLogLifecycle::start(
+            self.events.clone(),
+            self.metrics.clone(),
+            id,
+            &snapshot,
+            &route,
+        )
+        .observe_websocket();
         let (response, relay) = match self
             .websocket
             .prepare(&snapshot, &route, query.as_deref(), peer, &mut request)

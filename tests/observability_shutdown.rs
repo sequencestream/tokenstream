@@ -10,8 +10,9 @@ use hyper::body::Incoming;
 use tokenstream::domain::{
     AccountId, ApiKeyId, ProtocolType, ProviderId, RequestId, TransportType,
 };
+use tokenstream::events::{Admitted, EmitResult, Finished, LifecycleEvent, SubscriberName};
 use tokenstream::logging::{LogEvent, LogStore, channel_with_metrics};
-use tokenstream::persistence::{RepositoryError, RequestLogStarted};
+use tokenstream::persistence::RepositoryError;
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::telemetry::{Metrics, ProxyFailureCategory};
 use tokenstream::{ControlPlaneAuthenticator, DataPlaneAuthenticator, MigrationRunner};
@@ -81,17 +82,34 @@ fn admission(metrics: Metrics) -> AdmissionControl {
     )
 }
 
-fn started() -> LogEvent {
-    LogEvent::Started(RequestLogStarted::new(
-        RequestId::new("request-before-shutdown").expect("request ID"),
-        AccountId::try_from(1).expect("account ID"),
-        ApiKeyId::try_from(1).expect("credential ID"),
-        ProviderId::try_from(1).expect("provider ID"),
-        ProtocolType::OpenAi,
-        TransportType::Http,
-        "/v1/responses".to_owned(),
-        Utc::now(),
-    ))
+fn started() -> LifecycleEvent {
+    LifecycleEvent::Admitted(Admitted {
+        request_id: RequestId::new("request-before-shutdown").expect("request ID"),
+        account_id: AccountId::try_from(1).expect("account ID"),
+        api_key_id: ApiKeyId::try_from(1).expect("credential ID"),
+        provider_id: ProviderId::try_from(1).expect("provider ID"),
+        protocol_type: ProtocolType::OpenAi,
+        transport_type: TransportType::Http,
+        path: "/v1/responses".to_owned(),
+        observed_at: Utc::now(),
+    })
+}
+
+/// The finished point, used to prove a persisted completion is never synthesized.
+fn finished() -> LifecycleEvent {
+    LifecycleEvent::Finished(Finished {
+        request_id: RequestId::new("request-before-shutdown").expect("request ID"),
+        status_code: Some(200),
+        transport_type: TransportType::Http,
+        outcome: None,
+        elapsed: Duration::from_millis(1),
+        finished_at: Utc::now(),
+    })
+}
+
+fn request_log(metrics: &Metrics) -> (usize, u64) {
+    let view = metrics.subscriber(SubscriberName::RequestLog);
+    (view.queue_depth, view.dropped_events)
 }
 
 async fn unused_address() -> io::Result<SocketAddr> {
@@ -121,7 +139,7 @@ async fn authenticated_control_plane_exports_only_aggregate_metrics() -> io::Res
     let control = unused_address().await?;
     let metrics = Metrics::default();
     metrics.record_failure(ProxyFailureCategory::UpstreamTimeout);
-    let (sink, worker) = channel_with_metrics(
+    let (events, worker) = channel_with_metrics(
         Arc::new(ImmediateStore),
         4,
         2,
@@ -142,7 +160,7 @@ async fn authenticated_control_plane_exports_only_aggregate_metrics() -> io::Res
             Ok(())
         },
         Duration::from_millis(20),
-        sink,
+        events,
         worker,
         Duration::from_millis(20),
     ));
@@ -172,17 +190,15 @@ async fn shutdown_drains_connections_then_bounds_log_flush_without_synthesizing_
     let control = unused_address().await?;
     let metrics = Metrics::default();
     let store = Arc::new(BlockingStore::default());
-    let (sink, worker) = channel_with_metrics(
+    let (events, worker) = channel_with_metrics(
         Arc::clone(&store),
         4,
         1,
         Duration::from_secs(1),
         metrics.clone(),
     );
-    assert_eq!(
-        sink.try_emit(started()),
-        tokenstream::logging::EmitResult::Enqueued
-    );
+    assert_eq!(events.emit(started()), EmitResult::Enqueued);
+    assert_eq!(events.emit(finished()), EmitResult::Enqueued);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let drain_timeout = Duration::from_millis(30);
@@ -200,7 +216,7 @@ async fn shutdown_drains_connections_then_bounds_log_flush_without_synthesizing_
             Ok(())
         },
         drain_timeout,
-        sink,
+        events,
         worker,
         flush_timeout,
     ));
@@ -219,8 +235,7 @@ async fn shutdown_drains_connections_then_bounds_log_flush_without_synthesizing_
     assert!(shutdown_started.elapsed() >= drain_timeout + flush_timeout);
     assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
     assert_eq!(store.completed_events.load(Ordering::SeqCst), 0);
-    assert_eq!(metrics.log_queue_depth(), 0);
-    assert_eq!(metrics.dropped_log_events(), 1);
+    assert_eq!(request_log(&metrics), (0, 1));
     assert!(TcpStream::connect(data).await.is_err());
     Ok(())
 }

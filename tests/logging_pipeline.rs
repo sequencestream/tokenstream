@@ -8,13 +8,15 @@ use tokenstream::domain::{
     AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderStatus, RequestId, SecretCiphertext,
     TransportType,
 };
-use tokenstream::logging::{EmitResult, LogEvent, LogStore, channel};
+use tokenstream::events::{Admitted, EmitResult, Finished, LifecycleEvent, UpstreamObserved};
+use tokenstream::logging::{LogEvent, LogStore, channel_with_metrics};
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    Database, NewProvider, ProviderRepository, RepositoryError, RequestLogCompleted,
-    RequestLogQuery, RequestLogRepository, RequestLogStarted,
+    Database, NewProvider, ProviderRepository, RepositoryError, RequestLogQuery,
+    RequestLogRepository,
 };
+use tokenstream::telemetry::{Metrics, SubscriberName};
 use tokio::sync::Mutex;
 use url::Url;
 
@@ -93,11 +95,12 @@ fn persisted_started_ids(batches: &[Vec<LogEvent>]) -> Vec<String> {
         .collect()
 }
 
-fn started(request_id: &str) -> LogEvent {
+/// The admitted point, which is what produces a start row.
+fn started(request_id: &str) -> LifecycleEvent {
     started_for(request_id, ProviderId::try_from(1).expect("provider ID"))
 }
 
-fn started_for(request_id: &str, provider_id: ProviderId) -> LogEvent {
+fn started_for(request_id: &str, provider_id: ProviderId) -> LifecycleEvent {
     started_for_account(
         request_id,
         AccountId::try_from(1).expect("account ID"),
@@ -116,26 +119,49 @@ fn started_for_account(
     account_id: AccountId,
     api_key_id: ApiKeyId,
     provider_id: ProviderId,
-) -> LogEvent {
-    LogEvent::Started(RequestLogStarted::new(
-        RequestId::new(request_id).expect("request ID"),
+) -> LifecycleEvent {
+    LifecycleEvent::Admitted(Admitted {
+        request_id: RequestId::new(request_id).expect("request ID"),
         account_id,
         api_key_id,
         provider_id,
-        ProtocolType::OpenAi,
-        TransportType::Http,
-        "/v1/responses".to_owned(),
-        Utc::now(),
-    ))
+        protocol_type: ProtocolType::OpenAi,
+        transport_type: TransportType::Http,
+        path: "/v1/responses".to_owned(),
+        observed_at: Utc::now(),
+    })
 }
 
-fn completed(request_id: &str, status: u16) -> LogEvent {
-    LogEvent::Completed(RequestLogCompleted::new(
-        RequestId::new(request_id).expect("request ID"),
-        Some(status),
-        Utc::now(),
-        None,
-    ))
+/// The finished point, which is what produces the completion update.
+fn completed(request_id: &str, status: u16) -> LifecycleEvent {
+    LifecycleEvent::Finished(Finished {
+        request_id: RequestId::new(request_id).expect("request ID"),
+        status_code: Some(status),
+        transport_type: TransportType::Http,
+        outcome: None,
+        elapsed: Duration::from_millis(1),
+        finished_at: Utc::now(),
+    })
+}
+
+/// The upstream-observed point, which produces no row of its own because the
+/// terminal event owns the one optional status a record carries.
+fn observed(request_id: &str, status: u16) -> LifecycleEvent {
+    LifecycleEvent::UpstreamObserved(UpstreamObserved {
+        request_id: RequestId::new(request_id).expect("request ID"),
+        status_code: Some(status),
+        observed_at: Utc::now(),
+    })
+}
+
+fn queued(metrics: &Metrics) -> usize {
+    metrics.subscriber(SubscriberName::RequestLog).queue_depth
+}
+
+fn dropped(metrics: &Metrics) -> u64 {
+    metrics
+        .subscriber(SubscriberName::RequestLog)
+        .dropped_events
 }
 
 fn unique_value(prefix: &str) -> String {
@@ -160,22 +186,21 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
 }
 
 #[test]
-fn a_full_or_closed_queue_drops_immediately_and_counts_the_event() {
+fn a_full_or_abandoned_queue_drops_immediately_and_counts_the_event() {
     let store = Arc::new(RecordingStore::default());
-    let (sink, worker) = channel(store, 1, 1, Duration::from_secs(1));
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(store, 1, 1, Duration::from_secs(1), metrics.clone());
 
-    assert_eq!(sink.try_emit(started("request-1")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(started("request-2")), EmitResult::DroppedFull);
-    assert_eq!(sink.queued_events(), 1);
-    assert_eq!(sink.dropped_events(), 1);
+    assert_eq!(bus.emit(started("request-1")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("request-2")), EmitResult::PartiallyDropped);
+    assert_eq!(queued(&metrics), 1);
+    assert_eq!(dropped(&metrics), 1);
 
-    drop(worker);
-    assert_eq!(
-        sink.try_emit(started("request-3")),
-        EmitResult::DroppedClosed
-    );
-    assert_eq!(sink.queued_events(), 0);
-    assert_eq!(sink.dropped_events(), 3);
+    // An abandoned worker is a full queue forever: the subscriber owns the
+    // receiver, so nothing drains it and every later copy is lost here.
+    drop(writer);
+    assert_eq!(bus.emit(started("request-3")), EmitResult::PartiallyDropped);
+    assert_eq!(bus.emit(started("request-4")), EmitResult::PartiallyDropped);
 }
 
 #[tokio::test]
@@ -184,11 +209,18 @@ async fn worker_flushes_by_size_and_retries_only_inside_the_background_task() {
         failures_remaining: AtomicUsize::new(2),
         ..RecordingStore::default()
     });
-    let (sink, worker) = channel(Arc::clone(&store), 4, 2, Duration::from_secs(5));
-    let worker = tokio::spawn(worker.run());
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        4,
+        2,
+        Duration::from_secs(5),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
 
-    assert_eq!(sink.try_emit(started("request-1")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(started("request-2")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("request-1")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("request-2")), EmitResult::Enqueued);
 
     tokio::time::timeout(Duration::from_secs(1), async {
         while store.batches.lock().await.is_empty() {
@@ -199,18 +231,25 @@ async fn worker_flushes_by_size_and_retries_only_inside_the_background_task() {
     .expect("batch persisted after bounded retry");
     assert_eq!(store.attempts.load(Ordering::SeqCst), 3);
     assert_eq!(store.batches.lock().await[0].len(), 2);
-    assert_eq!(sink.queued_events(), 0);
+    assert_eq!(queued(&metrics), 0);
 
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
 }
 
 #[tokio::test]
 async fn worker_flushes_a_partial_batch_on_the_interval() {
     let store = Arc::new(RecordingStore::default());
-    let (sink, worker) = channel(Arc::clone(&store), 4, 4, Duration::from_millis(20));
-    let worker = tokio::spawn(worker.run());
-    assert_eq!(sink.try_emit(started("request-1")), EmitResult::Enqueued);
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        4,
+        4,
+        Duration::from_millis(20),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
+    assert_eq!(bus.emit(started("request-1")), EmitResult::Enqueued);
 
     tokio::time::timeout(Duration::from_secs(1), async {
         while store.batches.lock().await.is_empty() {
@@ -221,8 +260,8 @@ async fn worker_flushes_a_partial_batch_on_the_interval() {
     .expect("interval flushes partial batch");
     assert_eq!(store.batches.lock().await[0].len(), 1);
 
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
 }
 
 #[tokio::test]
@@ -231,66 +270,83 @@ async fn exhausted_retries_drop_the_batch_without_blocking_producers() {
         failures_remaining: AtomicUsize::new(10),
         ..RecordingStore::default()
     });
-    let (sink, worker) = channel(Arc::clone(&store), 2, 1, Duration::from_secs(1));
-    let worker = tokio::spawn(worker.run());
-    assert_eq!(sink.try_emit(started("request-1")), EmitResult::Enqueued);
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        2,
+        1,
+        Duration::from_secs(1),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
+    assert_eq!(bus.emit(started("request-1")), EmitResult::Enqueued);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while sink.queued_events() != 0 {
+        while queued(&metrics) != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("failed batch is discarded after bounded retry");
     assert_eq!(store.attempts.load(Ordering::SeqCst), 3);
-    assert_eq!(sink.dropped_events(), 1);
+    assert_eq!(dropped(&metrics), 1);
 
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
 }
 
 #[tokio::test]
 async fn a_single_permanent_failure_is_dropped_without_retrying() {
     let store = Arc::new(RecordingStore::with_poison(&["poison"]));
-    let (sink, worker) = channel(Arc::clone(&store), 2, 1, Duration::from_secs(1));
-    let worker = tokio::spawn(worker.run());
-    assert_eq!(sink.try_emit(started("poison")), EmitResult::Enqueued);
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        2,
+        1,
+        Duration::from_secs(1),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
+    assert_eq!(bus.emit(started("poison")), EmitResult::Enqueued);
 
     tokio::time::timeout(Duration::from_secs(1), async {
-        while sink.queued_events() != 0 {
+        while queued(&metrics) != 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("permanent event is isolated");
     assert_eq!(store.attempts.load(Ordering::SeqCst), 1);
-    assert_eq!(sink.dropped_events(), 1);
+    assert_eq!(dropped(&metrics), 1);
     assert!(store.batches.lock().await.is_empty());
 
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
 }
 
 #[tokio::test]
 async fn worker_isolates_a_permanent_event_and_keeps_the_rest() {
     let store = Arc::new(RecordingStore::with_poison(&["poison"]));
-    let (sink, worker) = channel(Arc::clone(&store), 8, 4, Duration::from_secs(5));
-    let worker = tokio::spawn(worker.run());
-
-    assert_eq!(sink.try_emit(started("poison")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(started("good-1")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(started("good-2")), EmitResult::Enqueued);
-    assert_eq!(
-        sink.try_emit(completed("good-1", 200)),
-        EmitResult::Enqueued
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        8,
+        4,
+        Duration::from_secs(5),
+        metrics.clone(),
     );
+    let worker = tokio::spawn(writer.run());
 
-    let metrics = sink.metrics().clone();
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    assert_eq!(bus.emit(started("poison")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("good-1")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("good-2")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(completed("good-1", 200)), EmitResult::Enqueued);
 
-    assert_eq!(metrics.dropped_log_events(), 1);
-    assert_eq!(metrics.log_queue_depth(), 0);
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
+
+    assert_eq!(dropped(&metrics), 1);
+    assert_eq!(queued(&metrics), 0);
     assert!(store.attempts.load(Ordering::SeqCst) <= 7);
     let persisted = persisted_started_ids(&store.batches.lock().await);
     assert_eq!(persisted, ["good-1", "good-2"]);
@@ -306,20 +362,67 @@ async fn worker_isolates_a_permanent_event_and_keeps_the_rest() {
 }
 
 #[tokio::test]
+async fn the_upstream_observed_point_persists_no_row_of_its_own() {
+    let store = Arc::new(RecordingStore::default());
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        8,
+        3,
+        Duration::from_secs(5),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
+
+    // A stored record has exactly one optional status and the terminal event
+    // owns it, so the upstream-observed point carries a fact the writer skips
+    // rather than a row of its own.
+    assert_eq!(bus.emit(observed("request-1", 200)), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("request-1")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(observed("request-1", 200)), EmitResult::Enqueued);
+    assert_eq!(bus.emit(completed("request-1", 200)), EmitResult::Enqueued);
+
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
+
+    let batches = store.batches.lock().await;
+    let writes: Vec<&LogEvent> = batches.iter().flatten().collect();
+    assert_eq!(
+        writes.len(),
+        2,
+        "only the admitted and finished points persist"
+    );
+    assert!(
+        matches!(writes[0], LogEvent::Started(started) if started.request_id().as_str() == "request-1")
+    );
+    assert!(
+        matches!(writes[1], LogEvent::Completed(completed) if completed.status_code() == Some(200))
+    );
+    assert_eq!(dropped(&metrics), 0);
+    assert_eq!(queued(&metrics), 0);
+}
+
+#[tokio::test]
 async fn worker_isolates_a_duplicate_start_and_keeps_later_events() {
     let store = Arc::new(RecordingStore::with_conflicts(&["dup"]));
-    let (sink, worker) = channel(Arc::clone(&store), 8, 3, Duration::from_secs(5));
-    let worker = tokio::spawn(worker.run());
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        8,
+        3,
+        Duration::from_secs(5),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
 
-    assert_eq!(sink.try_emit(started("dup")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(started("later")), EmitResult::Enqueued);
-    assert_eq!(sink.try_emit(completed("later", 200)), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("dup")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(started("later")), EmitResult::Enqueued);
+    assert_eq!(bus.emit(completed("later", 200)), EmitResult::Enqueued);
 
-    let metrics = sink.metrics().clone();
-    drop(sink);
-    worker.await.expect("worker exits after sender closes");
+    drop(bus);
+    worker.await.expect("worker exits after the bus closes");
 
-    assert_eq!(metrics.dropped_log_events(), 1);
+    assert_eq!(dropped(&metrics), 1);
     let persisted = persisted_started_ids(&store.batches.lock().await);
     assert_eq!(persisted, ["later"]);
 }
@@ -345,14 +448,20 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
     // events are attributed to one that exists and is bound to the provider.
     let api_key_id = support::stored_api_key(&database, &account, kept.id()).await;
     let store = Arc::new(database);
-    let (sink, worker) = channel(Arc::clone(&store), 8, 8, Duration::from_secs(30));
-    let metrics = sink.metrics().clone();
-    let worker = tokio::spawn(worker.run());
+    let metrics = Metrics::default();
+    let (bus, writer) = channel_with_metrics(
+        Arc::clone(&store),
+        8,
+        8,
+        Duration::from_secs(30),
+        metrics.clone(),
+    );
+    let worker = tokio::spawn(writer.run());
 
     let orphan_id = format!("{prefix}-orphan");
     let kept_id = format!("{prefix}-kept");
     assert_eq!(
-        sink.try_emit(started_for_account(
+        bus.emit(started_for_account(
             &orphan_id,
             account.id(),
             api_key_id,
@@ -364,7 +473,7 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
         .await
         .expect("delete succeeds while the start event is still queued");
     assert_eq!(
-        sink.try_emit(started_for_account(
+        bus.emit(started_for_account(
             &kept_id,
             account.id(),
             api_key_id,
@@ -372,23 +481,17 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
         )),
         EmitResult::Enqueued
     );
-    assert_eq!(
-        sink.try_emit(completed(&kept_id, 200)),
-        EmitResult::Enqueued
-    );
-    assert_eq!(
-        sink.try_emit(completed(&kept_id, 500)),
-        EmitResult::Enqueued
-    );
+    assert_eq!(bus.emit(completed(&kept_id, 200)), EmitResult::Enqueued);
+    assert_eq!(bus.emit(completed(&kept_id, 500)), EmitResult::Enqueued);
 
-    drop(sink);
+    drop(bus);
     tokio::time::timeout(Duration::from_secs(5), worker)
         .await
         .expect("worker finishes isolation")
         .expect("worker join");
 
-    assert_eq!(metrics.dropped_log_events(), 1);
-    assert_eq!(metrics.log_queue_depth(), 0);
+    assert_eq!(dropped(&metrics), 1);
+    assert_eq!(queued(&metrics), 0);
 
     let kept_logs = store
         .as_ref()

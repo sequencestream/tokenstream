@@ -37,7 +37,8 @@ use tokio::time::{Instant, Sleep, timeout};
 
 use crate::config::Config;
 use crate::domain::{ProviderSnapshot, RequestId};
-use crate::logging::{LogSink, LoggedBody, RequestLogLifecycle, observe_response};
+use crate::events::EventBus;
+use crate::logging::{LoggedBody, RequestLogLifecycle, observe_response};
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
@@ -233,16 +234,23 @@ where
         query: Option<&str>,
         downstream_peer: SocketAddr,
         request: Request<B>,
-        log_sink: LogSink,
+        events: EventBus,
+        metrics: Metrics,
         request_id: RequestId,
     ) -> Result<Response<LoggedBody<IdleTimeoutBody<Incoming>>>, GatewayError> {
         let mut lifecycle =
-            RequestLogLifecycle::start(log_sink, request_id, snapshot, route).observe_http();
+            RequestLogLifecycle::start(events, metrics, request_id, snapshot, route).observe_http();
         match self
             .forward(snapshot, route, query, downstream_peer, request)
             .await
         {
-            Ok(upstream) => Ok(observe_response(self.relay_response(upstream), lifecycle)),
+            // The upstream-observed point is emitted here: response headers are
+            // in hand, which is where an error envelope stops being possible
+            // and streaming begins.
+            Ok(upstream) => {
+                lifecycle.observe_upstream(Some(upstream.status()));
+                Ok(observe_response(self.relay_response(upstream), lifecycle))
+            }
             Err(error) => {
                 lifecycle.complete(None, Some(error.code()));
                 Err(error)

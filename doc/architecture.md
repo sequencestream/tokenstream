@@ -24,8 +24,8 @@ The gateway is infrastructure, not application logic. It does not select models,
 ## 3. Non-Negotiable Constraints
 
 - **Proxy**: Never read, inject, or validate application fields. HTTP request and response bodies are streamed with bounded buffers and backpressure, never fully buffered. WebSocket application messages are relayed without deserialization, under configured message and connection bounds. There is no retry, no reconnect, no protocol conversion, and no load balancing. Client cancellation cancels the associated upstream request.
-- **Logging**: Logging is best-effort, metadata-only, and must never block proxy traffic. A full log queue drops events and increments a dropped-event metric. Request and response payloads are never stored. Metrics carry no key IDs, URLs with query strings, or other high-cardinality secrets.
-- **Bounds**: A global semaphore bounds admitted proxy connections. Admission is layered: a global gate, then optional per-provider and per-credential layers that count concurrent requests and request rate, plus a per-credential bound on long-lived WebSocket connections ([ADR 0015](./adr/0015-layered-transport-admission.md)). Every layer decides only from connection-level facts and never reads a payload; every acquisition is non-blocking, so an exhausted layer rejects immediately instead of queueing. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, log queue capacity, and idle HTTP connections retained per upstream origin are all bounded. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
+- **Logging**: Logging is best-effort, metadata-only, and must never block proxy traffic. The proxy reports lifecycle facts to a sideband event bus rather than to one log queue ([ADR 0016](./adr/0016-metadata-event-bus.md)). The event set is closed and metadata-only: a request, account, credential, provider, protocol, transport, normalized path, an upstream status or handshake outcome, an elapsed time, and a result drawn from a closed category set. No event, log line, or metric carries a credential plaintext, a header value, a full URL, a query string, or any part of a request or response payload. Metrics carry no key IDs, URLs with query strings, or other high-cardinality secrets.
+- **Bounds**: A global semaphore bounds admitted proxy connections. Admission is layered: a global gate, then optional per-provider and per-credential layers that count concurrent requests and request rate, plus a per-credential bound on long-lived WebSocket connections ([ADR 0015](./adr/0015-layered-transport-admission.md)). Every layer decides only from connection-level facts and never reads a payload; every acquisition is non-blocking, so an exhausted layer rejects immediately instead of queueing. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, every event subscriber queue, and idle HTTP connections retained per upstream origin are all bounded. The subscriber set is fixed before either listener binds and a bus handed to the proxy is sealed by construction, so fan-out reads a fixed collection of bounded queues. Fan-out is per subscriber and is not atomic: a subscriber that is full, closed, or stopped drops that event for itself, counts it under its own name, and starves no other subscriber, because a slow consumer must never become a reason a request fails. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
 
 ## 4. Security Invariants
 
@@ -78,8 +78,9 @@ flowchart LR
     R --> W[WebSocket proxy]
     H --> U[Configured upstream provider]
     W --> U
-    H -. bounded log events .-> L[Log queue and writer]
-    W -. bounded log events .-> L
+    H -. non-blocking metadata events .-> EB[Event bus]
+    W -. non-blocking metadata events .-> EB
+    EB -. bounded per-subscriber queues .-> L[Request-log writer]
     L --> DB[(SQLite / PostgreSQL)]
     UI[Administration UI] --> AP[Administration API]
     AP --> AZ[Account session and role gate]
@@ -91,7 +92,7 @@ flowchart LR
 
 The process contains two logical planes:
 
-1. The **data plane** serves proxy traffic. Its hot path performs credential lookup, route validation, header transformation, streaming, and non-blocking log emission.
+1. The **data plane** serves proxy traffic. Its hot path performs credential lookup, route validation, header transformation, streaming, and non-blocking lifecycle event emission.
 2. The **control plane** serves administration. It authenticates accounts, resolves each session's role once per request, manages accounts, credentials, providers, and process settings, and queries request metadata.
 
 Both planes may ship in one binary. The separation is permanent: separate route trees, separate middleware, and separate authentication that can never be confused.
@@ -102,7 +103,7 @@ Further boundaries:
 - Every admitted request or connection holds a request-local, immutable configuration snapshot, created only after credential verification and secret decryption. Account disabling, role changes, credential rotation and disabling, binding edits, and provider edits affect new work only; they never alter a snapshot held by an active stream or connection.
 - Control-plane authorization is decided once per request from the session's account and role, before any handler runs. A resource is never reachable because a handler forgot a check.
 - A credential selects at most one provider per request, and only from its own bindings and a dedicated non-payload request field. Nothing in the proxy core reads a request body to choose an upstream.
-- Proxy modules depend on snapshot lookup and a non-blocking log sink; they never depend directly on administration handlers. Repository records that contain secrets remain internal, and API responses use separate representations so secrets cannot be serialized accidentally.
+- Proxy modules depend on snapshot lookup and a non-blocking event bus; they never depend on a subscriber and never depend directly on administration handlers. Repository records that contain secrets remain internal, and API responses use separate representations so secrets cannot be serialized accidentally.
 
 ## 8. Product Scope
 
@@ -116,10 +117,11 @@ Further boundaries:
 3. **Multiple upstream providers**: Each provider has an endpoint, protocol type, and encrypted upstream key. The gateway replaces the gateway credential in the provider's native authentication header, preserving the OpenAI Bearer or Anthropic `x-api-key` form. A credential may be bound to several providers and selects exactly one of them per request without reading the body.
 4. **Opaque request forwarding**: HTTP bodies and WebSocket application messages pass through without inspecting application fields. Clients own model selection and must supply every field the upstream requires.
 5. **Non-blocking asynchronous logging**: Transport-layer metadata only. No payload parsing and no token counting. Log I/O must not block the request path.
-6. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
-7. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
-8. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
-9. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
+6. **A sideband lifecycle event bus**: The proxy reports a closed set of transport facts to a bus with a fixed set of bounded subscribers. Fan-out is per subscriber, a saturated subscriber loses only its own copy, and nothing about a subscriber can change a proxy result. The request-log writer is the first subscriber.
+7. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
+8. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
+9. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
+10. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
 
 ### Excluded
 
@@ -349,10 +351,11 @@ Key forks among alternatives are recorded as architecture decision records under
 | Routing | [`modules/routing.md`](./modules/routing.md) | Allowlist decision over provider, method, path, and transport |
 | Proxy | [`modules/proxy.md`](./modules/proxy.md) | HTTP/SSE streaming and bidirectional WebSocket relay |
 | Providers | [`modules/providers.md`](./modules/providers.md) | Provider lifecycle, credential issuance, snapshot loading |
+| Events | [`modules/events.md`](./modules/events.md) | The request-lifecycle sideband event bus and its bounded subscribers |
 | Logging | [`modules/logging.md`](./modules/logging.md) | Bounded, non-blocking transport-metadata logging |
 | Administration | [`modules/administration.md`](./modules/administration.md) | Control-plane session, APIs, administration page, and page presentation |
 
-Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Routing, Proxy, Providers, Logging, Administration.
+Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Routing, Proxy, Providers, Events, Logging, Administration.
 
 ## 12. Verification
 

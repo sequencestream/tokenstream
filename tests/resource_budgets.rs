@@ -16,15 +16,16 @@ use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier, PasswordWor
 use tokenstream::domain::{
     AccountId, ApiKeyId, ApiKeyStatus, GatewayKeyId, ProtocolType, ProviderStatus, SecretString,
 };
-use tokenstream::logging::{LogEvent, LogSink, channel};
+use tokenstream::events::{Admitted, EmitResult, LifecycleEvent};
+use tokenstream::logging::channel_with_metrics;
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
     ApiKeyRepository, DatabaseBounds, ProviderListRequest, ProviderRepository, RepositoryError,
-    RequestLogStarted,
 };
 use tokenstream::providers::{CreateProviderRequest, ProviderService};
-use tokenstream::telemetry::{Metrics, ProxyFailureCategory};
+use tokenstream::telemetry::ProxyFailureCategory;
+use tokenstream::telemetry::{Metrics, SubscriberName};
 use tokio::sync::oneshot;
 
 mod support;
@@ -306,29 +307,31 @@ async fn sqlite_log_batch_deadline_does_not_block_a_later_write() {
         .execute(&mut *held)
         .await
         .expect("exclusive lock");
-    let (sink, worker): (LogSink, _) = channel(
+    let metrics = Metrics::default();
+    let (events, worker) = channel_with_metrics(
         std::sync::Arc::new(tokenstream::persistence::Database::Sqlite(database.clone())),
         4,
         1,
         Duration::from_millis(10),
+        metrics.clone(),
     );
     let worker = tokio::spawn(worker.run());
     let started = Instant::now();
     assert_eq!(
-        sink.try_emit(LogEvent::Started(RequestLogStarted::new(
-            tokenstream::domain::RequestId::new("req-log-timeout").expect("id"),
-            AccountId::try_from(1).expect("account"),
-            ApiKeyId::try_from(1).expect("credential"),
-            tokenstream::domain::ProviderId::try_from(1).expect("provider"),
-            ProtocolType::OpenAi,
-            tokenstream::domain::TransportType::Http,
-            "/v1/responses".to_owned(),
-            chrono::Utc::now(),
-        ))),
-        tokenstream::logging::EmitResult::Enqueued
+        events.emit(LifecycleEvent::Admitted(Admitted {
+            request_id: tokenstream::domain::RequestId::new("req-log-timeout").expect("id"),
+            account_id: AccountId::try_from(1).expect("account"),
+            api_key_id: ApiKeyId::try_from(1).expect("credential"),
+            provider_id: tokenstream::domain::ProviderId::try_from(1).expect("provider"),
+            protocol_type: ProtocolType::OpenAi,
+            transport_type: tokenstream::domain::TransportType::Http,
+            path: "/v1/responses".to_owned(),
+            observed_at: chrono::Utc::now(),
+        })),
+        EmitResult::Enqueued
     );
     tokio::time::timeout(Duration::from_secs(2), async {
-        while sink.queued_events() != 0 {
+        while metrics.subscriber(SubscriberName::RequestLog).queue_depth != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -340,7 +343,7 @@ async fn sqlite_log_batch_deadline_does_not_block_a_later_write() {
         .await
         .expect("release lock");
     drop(held);
-    drop(sink);
+    drop(events);
     worker.await.expect("worker exits");
 }
 

@@ -49,7 +49,8 @@ use tower_service::Service;
 
 use crate::config::Config;
 use crate::domain::{ProviderSnapshot, RequestId};
-use crate::logging::{LogSink, RequestLogLifecycle};
+use crate::events::EventBus;
+use crate::logging::RequestLogLifecycle;
 use crate::proxy::admission::ProxyLimits;
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
@@ -336,11 +337,13 @@ impl WebSocketProxy {
         query: Option<&str>,
         downstream_peer: SocketAddr,
         request: &mut Request<Incoming>,
-        log_sink: LogSink,
+        events: EventBus,
+        metrics: Metrics,
         request_id: RequestId,
     ) -> Result<Handshake, GatewayError> {
         let mut lifecycle =
-            RequestLogLifecycle::start(log_sink, request_id, snapshot, route).observe_websocket();
+            RequestLogLifecycle::start(events, metrics, request_id, snapshot, route)
+                .observe_websocket();
         let handshake = match self
             .handshake(snapshot, route, query, downstream_peer, request)
             .await
@@ -353,6 +356,9 @@ impl WebSocketProxy {
         };
         let (response, relay) = handshake.into_parts();
         let status = response.status();
+        // The upstream-observed point is the handshake outcome, whether it was a
+        // verified upgrade or an ordinary non-upgrade rejection.
+        lifecycle.observe_upstream(Some(status));
         let relay = match relay {
             None => {
                 lifecycle.complete(Some(status), None);

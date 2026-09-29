@@ -11,6 +11,38 @@ use std::time::Duration;
 
 const LATENCY_BUCKETS_SECONDS: [f64; 8] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0];
 const FAILURE_CATEGORY_COUNT: usize = 13;
+const SUBSCRIBER_COUNT: usize = 1;
+
+/// The closed set of event subscribers that can appear in the exposition.
+///
+/// Every name is compiled in rather than configured, so exposition cardinality
+/// cannot grow with the number of subscribers a deployment happens to attach,
+/// and a name is never derived from a request.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum SubscriberName {
+    /// The subscriber that persists request-log rows.
+    RequestLog,
+}
+
+impl SubscriberName {
+    const ALL: [Self; SUBSCRIBER_COUNT] = [Self::RequestLog];
+
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequestLog => "request_log",
+        }
+    }
+}
+
+impl std::fmt::Display for SubscriberName {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyFailureCategory {
@@ -77,8 +109,8 @@ struct Inner {
     latency_count: AtomicU64,
     latency_micros: AtomicU64,
     failures: [AtomicU64; FAILURE_CATEGORY_COUNT],
-    log_queue_depth: AtomicUsize,
-    dropped_log_events: AtomicU64,
+    subscriber_queue_depth: [AtomicUsize; SUBSCRIBER_COUNT],
+    subscriber_dropped: [AtomicU64; SUBSCRIBER_COUNT],
 }
 
 impl Default for Inner {
@@ -90,8 +122,8 @@ impl Default for Inner {
             latency_count: AtomicU64::new(0),
             latency_micros: AtomicU64::new(0),
             failures: std::array::from_fn(|_| AtomicU64::new(0)),
-            log_queue_depth: AtomicUsize::new(0),
-            dropped_log_events: AtomicU64::new(0),
+            subscriber_queue_depth: std::array::from_fn(|_| AtomicUsize::new(0)),
+            subscriber_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -136,27 +168,6 @@ impl Metrics {
         self.inner.failures[category.index()].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn enqueue_log_event(&self) {
-        self.inner.log_queue_depth.fetch_add(1, Ordering::AcqRel);
-    }
-
-    pub(crate) fn remove_log_events(&self, count: usize) {
-        self.inner
-            .log_queue_depth
-            .fetch_sub(count, Ordering::AcqRel);
-    }
-
-    pub(crate) fn drop_log_events(&self, count: u64) {
-        self.inner
-            .dropped_log_events
-            .fetch_add(count, Ordering::Relaxed);
-    }
-
-    pub(crate) fn drop_all_queued_log_events(&self) {
-        let queued = self.inner.log_queue_depth.swap(0, Ordering::AcqRel);
-        self.drop_log_events(queued as u64);
-    }
-
     pub fn active_http(&self) -> usize {
         self.inner.active_http.load(Ordering::Acquire)
     }
@@ -165,16 +176,16 @@ impl Metrics {
         self.inner.active_websockets.load(Ordering::Acquire)
     }
 
-    pub fn log_queue_depth(&self) -> usize {
-        self.inner.log_queue_depth.load(Ordering::Acquire)
-    }
-
-    pub fn dropped_log_events(&self) -> u64 {
-        self.inner.dropped_log_events.load(Ordering::Relaxed)
-    }
-
     pub fn failure_count(&self, category: ProxyFailureCategory) -> u64 {
         self.inner.failures[category.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-subscriber queue depth and drop counters, by subscriber name.
+    pub fn subscriber(&self, name: SubscriberName) -> SubscriberView {
+        SubscriberView {
+            queue_depth: self.inner.subscriber_queue_depth[name.index()].load(Ordering::Acquire),
+            dropped_events: self.inner.subscriber_dropped[name.index()].load(Ordering::Relaxed),
+        }
     }
 
     /// Renders a Prometheus text exposition containing only fixed metric names
@@ -227,25 +238,81 @@ impl Metrics {
             )
             .unwrap();
         }
-        writeln!(output, "# TYPE tokenstream_log_queue_depth gauge").unwrap();
         writeln!(
             output,
-            "tokenstream_log_queue_depth {}",
-            self.log_queue_depth()
+            "# TYPE tokenstream_event_subscriber_queue_depth gauge"
         )
         .unwrap();
+        for name in SubscriberName::ALL {
+            writeln!(
+                output,
+                "tokenstream_event_subscriber_queue_depth{{subscriber=\"{}\"}} {}",
+                name.as_str(),
+                self.subscriber(name).queue_depth
+            )
+            .unwrap();
+        }
         writeln!(
             output,
-            "# TYPE tokenstream_log_events_dropped_total counter"
+            "# TYPE tokenstream_event_subscriber_events_dropped_total counter"
         )
         .unwrap();
-        writeln!(
-            output,
-            "tokenstream_log_events_dropped_total {}",
-            self.dropped_log_events()
-        )
-        .unwrap();
+        for name in SubscriberName::ALL {
+            writeln!(
+                output,
+                "tokenstream_event_subscriber_events_dropped_total{{subscriber=\"{}\"}} {}",
+                name.as_str(),
+                self.subscriber(name).dropped_events
+            )
+            .unwrap();
+        }
         output
+    }
+}
+
+/// A read-only view of one subscriber's queue state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SubscriberView {
+    pub queue_depth: usize,
+    pub dropped_events: u64,
+}
+
+/// One subscriber's own queue depth and drop counters.
+///
+/// The counters are per subscriber rather than global so a lagging consumer is
+/// distinguishable from a healthy one: a process-wide drop count cannot say
+/// which consumer fell behind.
+#[derive(Clone, Debug)]
+pub struct SubscriberCounters {
+    metrics: Metrics,
+    name: SubscriberName,
+}
+
+impl SubscriberCounters {
+    pub fn new(metrics: Metrics, name: SubscriberName) -> Self {
+        Self { metrics, name }
+    }
+
+    pub fn enqueue(&self) {
+        self.metrics.inner.subscriber_queue_depth[self.name.index()].fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn remove_queued(&self, count: usize) {
+        self.metrics.inner.subscriber_queue_depth[self.name.index()]
+            .fetch_sub(count, Ordering::AcqRel);
+    }
+
+    pub fn drop(&self, count: u64) {
+        self.metrics.inner.subscriber_dropped[self.name.index()]
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn queued(&self) -> usize {
+        self.metrics.subscriber(self.name).queue_depth
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.metrics.subscriber(self.name).dropped_events
     }
 }
 
@@ -288,6 +355,48 @@ mod tests {
         assert_eq!(metrics.active_websockets(), 1);
         drop(websocket);
         assert_eq!(metrics.active_websockets(), 0);
+    }
+
+    #[test]
+    fn subscriber_counters_are_independent_of_the_process_wide_drop_count() {
+        let metrics = Metrics::default();
+        let request_log = SubscriberCounters::new(metrics.clone(), SubscriberName::RequestLog);
+        request_log.enqueue();
+        request_log.enqueue();
+        request_log.remove_queued(1);
+        request_log.drop(1);
+
+        let rendered = metrics.render();
+        assert!(
+            rendered
+                .contains("tokenstream_event_subscriber_queue_depth{subscriber=\"request_log\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "tokenstream_event_subscriber_events_dropped_total{subscriber=\"request_log\"} 1"
+            ),
+            "{rendered}"
+        );
+        // The superseded process-wide pair is gone: a drop is only ever
+        // reported against the subscriber that lost it.
+        assert!(
+            !rendered.contains("tokenstream_log_queue_depth"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("tokenstream_log_events_dropped_total"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn subscriber_names_are_a_closed_set() {
+        let names: Vec<&str> = SubscriberName::ALL
+            .iter()
+            .map(|name| name.as_str())
+            .collect();
+        assert_eq!(names, ["request_log"]);
     }
 
     #[test]

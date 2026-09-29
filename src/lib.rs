@@ -27,6 +27,7 @@ pub mod config;
 pub mod credentials;
 pub mod crypto;
 pub mod domain;
+pub mod events;
 pub mod local_state;
 pub mod logging;
 pub mod persistence;
@@ -249,8 +250,8 @@ pub async fn run_with_logging<M, D, C, S, L>(
     metrics: Metrics,
     shutdown: S,
     drain_timeout: Duration,
-    log_sink: crate::logging::LogSink,
-    log_worker: crate::logging::LogWorker<L>,
+    events: crate::events::EventBus,
+    log_worker: crate::logging::LogWriter<L>,
     log_flush_timeout: Duration,
 ) -> io::Result<BoundPlanes>
 where
@@ -270,7 +271,7 @@ where
         metrics,
         shutdown,
         drain_timeout,
-        log_sink,
+        events,
         log_worker,
         log_flush_timeout,
     )
@@ -289,8 +290,8 @@ pub async fn run_with_control_and_logging<M, D, C, S, L>(
     metrics: Metrics,
     shutdown: S,
     drain_timeout: Duration,
-    log_sink: crate::logging::LogSink,
-    log_worker: crate::logging::LogWorker<L>,
+    events: crate::events::EventBus,
+    log_worker: crate::logging::LogWriter<L>,
     log_flush_timeout: Duration,
 ) -> io::Result<BoundPlanes>
 where
@@ -301,7 +302,6 @@ where
     L: crate::logging::LogStore,
 {
     let mut worker_task = tokio::spawn(log_worker.run());
-    let flush_metrics = log_sink.metrics().clone();
     let server_result = run_observed_with_control(
         data_address,
         control_address,
@@ -316,15 +316,17 @@ where
     .await;
 
     // All connection tasks have completed or been aborted before the last
-    // composition-root sender closes. No synthetic completion events are made.
-    drop(log_sink);
+    // composition-root bus handle closes. No synthetic completion events are
+    // made, and dropping the bus leaves the worker with nothing left to flush
+    // after, so an aborted worker leaves its own subscriber counters as the
+    // only record of what it did not persist.
+    drop(events);
     if tokio::time::timeout(log_flush_timeout, &mut worker_task)
         .await
         .is_err()
     {
         worker_task.abort();
         let _ = worker_task.await;
-        flush_metrics.drop_all_queued_log_events();
     }
     server_result
 }

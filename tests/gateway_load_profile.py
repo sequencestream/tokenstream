@@ -435,11 +435,22 @@ def metrics(admin_port, auth):
     return exchange(admin_port, 'GET', '/metrics', headers=auth)[2].decode()
 
 
-def metric_value(rendered, name):
+def metric_value(rendered, name, labels=''):
     for line in rendered.splitlines():
-        if line.startswith(name + ' '):
+        if line.startswith(name + labels + ' '):
             return int(line.split()[1])
-    raise AssertionError(f'metric {name} is missing')
+    raise AssertionError(f'metric {name}{labels} is missing')
+
+
+# Drops are attributed to the subscriber that lost them, so a lagging consumer is
+# distinguishable from a healthy one. The request-log subscriber is the one the
+# load profile exercises.
+REQUEST_LOG_DROPPED = 'tokenstream_event_subscriber_events_dropped_total'
+REQUEST_LOG_LABELS = '{subscriber="request_log"}'
+
+
+def request_log_drops(rendered):
+    return metric_value(rendered, REQUEST_LOG_DROPPED, REQUEST_LOG_LABELS)
 
 
 def stop(process):
@@ -565,7 +576,7 @@ def run():
                 assert metric_value(rendered, 'tokenstream_active_http_requests') == HTTP_CLIENTS, rendered
                 assert metric_value(rendered, 'tokenstream_active_websockets') == WEBSOCKET_CLIENTS, rendered
                 assert not http_errors, http_errors
-                dropped_at_steady = metric_value(rendered, 'tokenstream_log_events_dropped_total')
+                dropped_at_steady = request_log_drops(rendered)
 
                 print('mixed short-request turnover while long-lived streams remain admitted')
                 before_accepts = accepted_count()
@@ -668,12 +679,12 @@ def run():
                 assert exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0] == 200
 
                 print('exercising logging saturation without stalling the proxy')
-                before_dropped = metric_value(metrics(admin_port, auth), 'tokenstream_log_events_dropped_total')
+                before_dropped = request_log_drops(metrics(admin_port, auth))
                 for _ in range(80):
                     exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)
                 rendered = metrics(admin_port, auth)
                 assert metric_value(rendered, 'tokenstream_active_http_requests') == 0, rendered
-                after_dropped = metric_value(rendered, 'tokenstream_log_events_dropped_total')
+                after_dropped = request_log_drops(rendered)
                 assert after_dropped >= before_dropped
                 print(f'  dropped logs {before_dropped} -> {after_dropped}')
 
@@ -901,8 +912,7 @@ def run():
                 print('passed layered admission under a wide-open global gate')
 
                 print('exercising a logging storage fault while the proxy keeps serving')
-                dropped_before = metric_value(metrics(small_admin, small_auth),
-                                              'tokenstream_log_events_dropped_total')
+                dropped_before = request_log_drops(metrics(small_admin, small_auth))
                 fault = sqlite3.connect(small_db, timeout=5, isolation_level=None)
                 fault.execute(FAULT_TRIGGER)
                 fault.close()
@@ -916,8 +926,7 @@ def run():
                     repair.execute('DROP TRIGGER request_log_write_fault')
                     repair.close()
                 assert exchange(small_data, 'POST', '/v1/responses', PAYLOAD, small_headers)[0] == 200
-                assert metric_value(metrics(small_admin, small_auth),
-                                    'tokenstream_log_events_dropped_total') > dropped_before, \
+                assert request_log_drops(metrics(small_admin, small_auth)) > dropped_before, \
                     'the failing logging path dropped no events'
                 print('  the proxy kept serving while every log write failed')
                 stop(small)

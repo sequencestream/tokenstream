@@ -48,7 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let metrics = Metrics::default();
     let admission =
         AdmissionControl::with_metrics(ProxyLimits::from_config(&config), metrics.clone());
-    let (log_sink, log_worker) = tokenstream::logging::channel_with_metrics(
+    let (events, log_worker) = tokenstream::logging::channel_with_metrics(
         std::sync::Arc::new(database.clone()),
         config.log_queue_capacity(),
         config.log_batch_size(),
@@ -107,7 +107,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let gateway = Gateway::with_shared_cipher(
         &config,
         database.clone(),
-        log_sink.clone(),
+        events.clone(),
         metrics.clone(),
         data_password_work,
         cipher,
@@ -122,7 +122,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         metrics,
         tokenstream::wait_for_shutdown_signal(),
         config.shutdown_drain_timeout(),
-        log_sink,
+        events,
         log_worker,
         config.log_flush_timeout(),
     )

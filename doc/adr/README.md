@@ -23,6 +23,7 @@ A new architectural fork gets an ADR before the architecture document changes. A
 | [0013](./0013-account-owned-data-plane-credentials.md) | Accepted | Data-plane credentials identify an account, not a provider |
 | [0014](./0014-migrating-provider-issued-credentials.md) | Accepted | Converting provider-issued credentials to account-owned credentials |
 | [0015](./0015-layered-transport-admission.md) | Accepted | Layered transport admission, separate from application scheduling |
+| [0016](./0016-metadata-event-bus.md) | Accepted | A sideband metadata event bus with per-subscriber bounded queues |
 
 ## Template
 

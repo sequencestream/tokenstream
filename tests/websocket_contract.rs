@@ -28,6 +28,7 @@ use tokenstream::proxy::http::HttpProxy;
 use tokenstream::proxy::websocket::{RejectionBody, WebSocketProxy};
 use tokenstream::proxy::websocket::{RelayOutcome, relay};
 use tokenstream::routing::resolve_route;
+use tokenstream::telemetry::Metrics;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, oneshot};
@@ -459,9 +460,10 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
     ));
     let sequence = Arc::new(AtomicUsize::new(0));
     let log_store = Arc::new(RecordingLogStore::default());
-    let (log_sink, log_worker) = channel(Arc::clone(&log_store), 8, 4, Duration::from_millis(20));
+    let metrics = Metrics::default();
+    let (events, log_worker) = channel(Arc::clone(&log_store), 8, 4, Duration::from_millis(20));
     let log_worker = tokio::spawn(log_worker.run());
-    let gateway_log_sink = log_sink.clone();
+    let gateway_events = events.clone();
     let gateway = tokio::spawn(async move {
         let mut connections = Vec::new();
         for _ in 0..2 {
@@ -473,14 +475,16 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
             let websocket_proxy = Arc::clone(&websocket_proxy);
             let http_proxy = Arc::clone(&http_proxy);
             let sequence = Arc::clone(&sequence);
-            let log_sink = gateway_log_sink.clone();
+            let events = gateway_events.clone();
+            let metrics = metrics.clone();
             connections.push(tokio::spawn(async move {
                 let service = service_fn(move |mut request: Request<Incoming>| {
                     let snapshot = Arc::clone(&snapshot);
                     let websocket_proxy = Arc::clone(&websocket_proxy);
                     let http_proxy = Arc::clone(&http_proxy);
                     let sequence = Arc::clone(&sequence);
-                    let log_sink = log_sink.clone();
+                    let events = events.clone();
+                    let metrics = metrics.clone();
                     async move {
                         let number = sequence.fetch_add(1, Ordering::SeqCst) + 1;
                         let request_id =
@@ -501,7 +505,8 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                                     query.as_deref(),
                                     peer,
                                     &mut request,
-                                    log_sink,
+                                    events,
+                                    metrics,
                                     request_id.clone(),
                                 )
                                 .await
@@ -515,7 +520,8 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                                     query.as_deref(),
                                     peer,
                                     request,
-                                    log_sink,
+                                    events,
+                                    metrics,
                                     request_id.clone(),
                                 )
                                 .await
@@ -588,7 +594,7 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
 
     upstream.await.expect("upstream task");
     gateway.await.expect("gateway task");
-    drop(log_sink);
+    drop(events);
     log_worker.await.expect("log worker");
 
     let events = log_store.events.lock().await;
