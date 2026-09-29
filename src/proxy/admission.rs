@@ -22,7 +22,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::config::Config;
 use crate::proxy::error::GatewayError;
-use crate::telemetry::{Metrics, ProxyFailureCategory};
+use crate::telemetry::{Metrics, ProxyFailureCategory, RejectionLayer, RejectionReason};
 
 /// A resource bound that cannot be used as a limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -189,6 +189,13 @@ impl AdmissionControl {
         match Arc::clone(&self.slots).try_acquire_owned() {
             Ok(permit) => Ok(AdmissionPermit { _permit: permit }),
             Err(TryAcquireError::NoPermits | TryAcquireError::Closed) => {
+                // The refusal is recorded here and only here: this gate is
+                // reached before the proxy service, so no other component
+                // observes the point where the request stopped. It is recorded
+                // as a rejection rather than as a failed exchange, because the
+                // request never became an exchange.
+                self.metrics
+                    .record_rejection(RejectionLayer::GlobalGate, RejectionReason::Concurrency);
                 self.metrics
                     .record_failure(ProxyFailureCategory::ConnectionLimitReached);
                 Err(GatewayError::ConnectionLimitReached)

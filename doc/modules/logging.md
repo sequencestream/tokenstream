@@ -68,7 +68,7 @@ queued for it and counts it, so no queue depth survives that still claims pendin
 - Administration never writes log rows on behalf of the proxy. Proxy modules depend on the bus only, never on this writer.
 - A permanent unwritable event cannot roll back other events in the same batch.
 - The upstream-observed point produces no stored row of its own.
-- Metrics are aggregated: active HTTP, active WebSockets, upstream latency, failures by safe category, and — for this subscriber — queue depth and dropped events. They carry no key IDs or URLs with query strings.
+- Metrics are aggregated and are the [observability design](./observability.md)'s subject. What this design owns is that the drops it causes are reported against this subscriber rather than the process, and that the denominator is visible: the number of hand-offs the proxy attempted is a series beside the number it lost. A drop rate that cannot be divided is a counter that cannot be alerted on.
 
 ## Failures and bounds
 

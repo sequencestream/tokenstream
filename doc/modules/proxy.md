@@ -6,7 +6,7 @@ Relay allowed HTTP/SSE bodies and WebSocket messages without interpreting applic
 
 ## Design
 
-The proxy applies the architecture header policy and then streams. It does not coalesce SSE, split on newlines, decompress, retry, or convert transports ([ADR 0001](../adr/0001-transparent-proxy-core.md)). Admission is held for the whole HTTP/SSE exchange. Upgraded WebSocket work stays owned by the downstream connection supervisor so shutdown drains both transports ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
+The proxy applies the architecture header policy and then streams. Every point at which it refuses work or decides an exchange's outcome records an operational fact, and the set of points and the labels those facts carry belong to the [observability design](./observability.md). It does not coalesce SSE, split on newlines, decompress, retry, or convert transports ([ADR 0001](../adr/0001-transparent-proxy-core.md)). Admission is held for the whole HTTP/SSE exchange. Upgraded WebSocket work stays owned by the downstream connection supervisor so shutdown drains both transports ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 
 For WebSocket routes the upstream handshake completes before the downstream upgrade ([ADR 0007](../adr/0007-upstream-websocket-handshake-first.md)). An invalid `101` is a handshake failure, not a successful socket. An ordinary non-upgrade HTTP rejection is streamed through unchanged so the client can fall back on its own.
 

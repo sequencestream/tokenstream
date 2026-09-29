@@ -29,6 +29,7 @@ use crate::auth::GatewayAuthError;
 use crate::domain::RequestId;
 use crate::proxy::headers::HeaderError;
 use crate::routing::{RouteError, TargetError};
+use crate::telemetry::ProxyFailureCategory;
 
 /// Media type of the local error envelope.
 pub const ERROR_CONTENT_TYPE: &str = "application/json";
@@ -100,6 +101,31 @@ impl GatewayError {
             Self::ConnectionLimitReached => StatusCode::SERVICE_UNAVAILABLE,
             Self::ResourceExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// The fine result category this failure is recorded under.
+    ///
+    /// The function is total over the closed set, so every gateway-originated
+    /// failure is classified and none is counted nowhere. Placing it here rather
+    /// than at each call site is what makes totality a property of the error
+    /// contract: a new variant cannot be added without a decision about which
+    /// category it belongs to, and a partial match at one call site cannot
+    /// silently stop counting a failure the exposition already has a series for.
+    pub const fn category(self) -> ProxyFailureCategory {
+        match self {
+            Self::InvalidGatewayCredential => ProxyFailureCategory::InvalidGatewayCredential,
+            Self::ProviderDisabled => ProxyFailureCategory::ProviderDisabled,
+            Self::AccountDisabled => ProxyFailureCategory::AccountDisabled,
+            Self::KeyExpired => ProxyFailureCategory::KeyExpired,
+            Self::NoProviderSelected => ProxyFailureCategory::NoProviderSelected,
+            Self::UnsupportedRoute => ProxyFailureCategory::UnsupportedRoute,
+            Self::InvalidUpgrade => ProxyFailureCategory::InvalidUpgrade,
+            Self::UpstreamConnectFailed => ProxyFailureCategory::UpstreamConnectFailed,
+            Self::UpstreamTimeout => ProxyFailureCategory::UpstreamTimeout,
+            Self::ConnectionLimitReached => ProxyFailureCategory::ConnectionLimitReached,
+            Self::ResourceExhausted => ProxyFailureCategory::ResourceExhausted,
+            Self::InternalError => ProxyFailureCategory::InternalError,
         }
     }
 

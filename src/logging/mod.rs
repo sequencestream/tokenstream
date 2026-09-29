@@ -24,7 +24,9 @@ use crate::events::{
 };
 use crate::persistence::{Database, RepositoryError, RequestLogCompleted, RequestLogStarted};
 use crate::routing::ResolvedRoute;
-use crate::telemetry::{ActiveRequestGuard, Metrics, ProxyFailureCategory, SubscriberName};
+use crate::telemetry::{
+    ActiveRequestGuard, ExchangeOutcome, Metrics, ProxyFailureCategory, SubscriberName,
+};
 
 const WARNING_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -280,17 +282,28 @@ impl RequestLogLifecycle {
             return;
         };
         let outcome = error.and_then(failure_category);
+        let elapsed = self.started.elapsed();
         let _ = self.bus.emit(LifecycleEvent::Finished(Finished {
             request_id,
             status_code: status.map(|status| status.as_u16()),
             transport_type: transport,
             outcome,
-            elapsed: self.started.elapsed(),
+            elapsed,
             finished_at: Utc::now(),
         }));
-        if let Some(category) = outcome {
-            self.metrics.record_failure(category);
-        }
+        // The operational result is recorded here, at the same point and from
+        // the same member that the terminal event carries, so a metric and a
+        // request record cannot drift apart. An exchange with no upstream
+        // response and no gateway-originated failure is a success: nothing went
+        // wrong, and the status is not a label this process may read.
+        let recorded = match outcome {
+            Some(category) => {
+                self.metrics.record_failure(category);
+                ExchangeOutcome::failure(transport, category)
+            }
+            None => ExchangeOutcome::success(transport),
+        };
+        self.metrics.record_exchange(recorded, elapsed);
         self.active.take();
     }
 }
@@ -299,6 +312,9 @@ fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
     Some(match error {
         "invalid_gateway_credential" => ProxyFailureCategory::InvalidGatewayCredential,
         "provider_disabled" => ProxyFailureCategory::ProviderDisabled,
+        "account_disabled" => ProxyFailureCategory::AccountDisabled,
+        "key_expired" => ProxyFailureCategory::KeyExpired,
+        "no_provider_selected" => ProxyFailureCategory::NoProviderSelected,
         "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
         "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
         "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,

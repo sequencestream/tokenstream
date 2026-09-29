@@ -117,7 +117,6 @@ pub struct WebSocketProxy {
     header_timeout: Duration,
     idle_timeout: Duration,
     config: WebSocketConfig,
-    metrics: Metrics,
 }
 
 impl WebSocketProxy {
@@ -127,22 +126,6 @@ impl WebSocketProxy {
         header_timeout: Duration,
         idle_timeout: Duration,
         limits: &ProxyLimits,
-    ) -> Self {
-        Self::with_metrics(
-            connect_timeout,
-            header_timeout,
-            idle_timeout,
-            limits,
-            Metrics::default(),
-        )
-    }
-
-    pub fn with_metrics(
-        connect_timeout: Duration,
-        header_timeout: Duration,
-        idle_timeout: Duration,
-        limits: &ProxyLimits,
-        metrics: Metrics,
     ) -> Self {
         let frame = limits.websocket_max_frame_bytes();
         let message = limits.websocket_max_message_bytes();
@@ -161,7 +144,6 @@ impl WebSocketProxy {
             header_timeout,
             idle_timeout,
             config,
-            metrics,
         }
     }
 
@@ -244,7 +226,6 @@ impl WebSocketProxy {
         *upstream_request.headers_mut() = headers;
 
         let on_upgrade = hyper::upgrade::on(request);
-        let started = tokio::time::Instant::now();
         let mut connector = UpstreamConnector::new(self.connect_timeout);
         let stream = connector
             .call(upstream_uri.clone())
@@ -273,7 +254,6 @@ impl WebSocketProxy {
         // the handshake head. A rejection lets it end with the body instead.
         let upstream_connection = tokio::spawn(async move { connection.without_shutdown().await });
         let connected = timeout(self.header_timeout, sender.send_request(upstream_request)).await;
-        self.metrics.observe_upstream_latency(started.elapsed());
         let upstream_response = match connected {
             Err(_) => {
                 upstream_connection.abort();

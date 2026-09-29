@@ -19,7 +19,7 @@ use crate::domain::RequestId;
 use crate::proxy::admission::{AdmissionControl, AdmissionPermit};
 use crate::proxy::error::GatewayError;
 use crate::proxy::gateway::{Exchange, Session, boxed, error_response};
-use crate::telemetry::{Metrics, ProxyFailureCategory};
+use crate::telemetry::Metrics;
 
 pub mod admin;
 pub mod auth;
@@ -110,11 +110,7 @@ impl<T: DataPlaneAuthenticator> DataPlaneService for T {
         } else {
             GatewayError::InvalidGatewayCredential
         };
-        metrics.record_failure(if error == GatewayError::UnsupportedRoute {
-            ProxyFailureCategory::UnsupportedRoute
-        } else {
-            ProxyFailureCategory::InvalidGatewayCredential
-        });
+        metrics.record_failure(error.category());
         (error_response(error, &id), None)
     }
 }

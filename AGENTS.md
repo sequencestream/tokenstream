@@ -27,6 +27,7 @@ Entry point for agents and contributors. Defines the rules governing Tokenstream
 | Providers | `doc/modules/providers.md` | Provider lifecycle and snapshot loading |
 | Events | `doc/modules/events.md` | The request-lifecycle sideband event bus and its bounded subscribers |
 | Logging | `doc/modules/logging.md` | Bounded, non-blocking transport-metadata logging |
+| Observability | `doc/modules/observability.md` | The bounded operational exposition and its result classification |
 | Administration | `doc/modules/administration.md` | Control-plane session, APIs, administration page, and page presentation |
 
 ## Architecture Authority

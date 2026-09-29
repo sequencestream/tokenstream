@@ -25,6 +25,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 
 - **Proxy**: Never read, inject, or validate application fields. HTTP request and response bodies are streamed with bounded buffers and backpressure, never fully buffered. WebSocket application messages are relayed without deserialization, under configured message and connection bounds. There is no retry, no reconnect, no protocol conversion, and no load balancing. Client cancellation cancels the associated upstream request.
 - **Logging**: Logging is best-effort, metadata-only, and must never block proxy traffic. The proxy reports lifecycle facts to a sideband event bus rather than to one log queue ([ADR 0016](./adr/0016-metadata-event-bus.md)). The event set is closed and metadata-only: a request, account, credential, provider, protocol, transport, normalized path, an upstream status or handshake outcome, an elapsed time, and a result drawn from a closed category set. No event, log line, or metric carries a credential plaintext, a header value, a full URL, a query string, or any part of a request or response payload. Metrics carry no key IDs, URLs with query strings, or other high-cardinality secrets.
+- **Observability**: The operational exposition is a fixed set of series labelled by at most two dimensions, transport type and a coarse result classification of four members — success, gateway failure, upstream failure, and client cancellation ([ADR 0017](./adr/0017-cardinality-bounded-observability.md)). That classification is a total function over the fine failure-category set a request record and a gateway error use, so nothing falls through unclassified. An exchange is counted once at the point its result is decided, and a request refused before it became work is a rejection with a named layer and reason rather than a failure of a request that never started. Latency percentiles are read from cumulative buckets whose boundaries are fixed at compile time and shared by every series, with an unbounded top bucket so a slow observation is never discarded. The exposition is rendered from compiled closed sets, so its size is a property of the build rather than of traffic, and recording a fact adds no lock and no allocation to the forwarding path. The control plane serves it to an authenticated administrator only, and the data plane serves it at no path. Provider and account dimensions are deliberately excluded until an alert needs them.
 - **Bounds**: A global semaphore bounds admitted proxy connections. Admission is layered: a global gate, then optional per-provider and per-credential layers that count concurrent requests and request rate, plus a per-credential bound on long-lived WebSocket connections ([ADR 0015](./adr/0015-layered-transport-admission.md)). Every layer decides only from connection-level facts and never reads a payload; every acquisition is non-blocking, so an exhausted layer rejects immediately instead of queueing. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, every event subscriber queue, and idle HTTP connections retained per upstream origin are all bounded. The subscriber set is fixed before either listener binds and a bus handed to the proxy is sealed by construction, so fan-out reads a fixed collection of bounded queues. Fan-out is per subscriber and is not atomic: a subscriber that is full, closed, or stopped drops that event for itself, counts it under its own name, and starves no other subscriber, because a slow consumer must never become a reason a request fails. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
 
 ## 4. Security Invariants
@@ -118,10 +119,11 @@ Further boundaries:
 4. **Opaque request forwarding**: HTTP bodies and WebSocket application messages pass through without inspecting application fields. Clients own model selection and must supply every field the upstream requires.
 5. **Non-blocking asynchronous logging**: Transport-layer metadata only. No payload parsing and no token counting. Log I/O must not block the request path.
 6. **A sideband lifecycle event bus**: The proxy reports a closed set of transport facts to a bus with a fixed set of bounded subscribers. Fan-out is per subscriber, a saturated subscriber loses only its own copy, and nothing about a subscriber can change a proxy result. The request-log writer is the first subscriber.
-7. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
-8. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
-9. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
-10. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
+7. **An operational exposition**: Throughput and pass/fail by transport and coarse result, latency percentiles over the whole exchange, HTTP and WebSocket connections in flight, per-subscriber dropped and attempted event counts, and admission refusals by the layer that refused. It is built from compiled closed sets, adds no payload, and counts no token.
+8. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
+9. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
+10. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
+11. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
 
 ### Excluded
 
@@ -131,7 +133,9 @@ Further boundaries:
 4. Token parsing, usage billing, cost estimation, and reconciliation.
 5. A general role and permission system. Roles are a fixed set, and adding one is an architectural change.
 6. User-defined model names, choosing an upstream by a request body field, and multi-provider failover or retries.
-7. Aggregate allowances wider than one credential, monthly token quotas, and any accounting-based allowance. A credential carries the per-caller admission bounds; an account-wide aggregate belongs to the billing stage, which has no measurement to divide ([ADR 0015](./adr/0015-layered-transport-admission.md)).
+7. A dashboard page, alert rules, notification channels, and a productized tracing exporter. An alert reads the exposition; the gateway does not evaluate or deliver one.
+8. Per-provider and per-account metric dimensions, exact percentiles, and any token or usage metric. Provider and account series are a deliberate deferral: the cost when they are needed is series count, not a change in what a series means ([ADR 0017](./adr/0017-cardinality-bounded-observability.md)).
+9. Aggregate allowances wider than one credential, monthly token quotas, and any accounting-based allowance. A credential carries the per-caller admission bounds; an account-wide aggregate belongs to the billing stage, which has no measurement to divide ([ADR 0015](./adr/0015-layered-transport-admission.md)).
 
 ## 9. Data Model
 
@@ -320,6 +324,22 @@ Reads never return secret values. Secret writes are write-only. The administrato
 
 `GET /admin/api/request-logs` accepts `after_id`, `limit`, `account_id`, `provider_id`, `transport_type`, `start_time_gte`, and `start_time_lt`. A regular user may read only rows for its own account. Results are ordered by `id ASC` and return rows with `id > after_id`; omit `after_id` to start from the beginning. The response contains `items` and `next_after_id`, set to the last returned ID or `null` when no rows are returned. `limit` defaults to 100 and cannot exceed 100. There are no page numbers, offsets, or total-page counts. The same cursor and limit rules apply to provider lists. Filter values remain fixed while advancing a cursor; callers restart from the beginning when filters change. The cursor is for list navigation, not a guaranteed change feed under concurrent writes.
 
+### Operational exposition
+
+`GET /metrics` on the control plane returns a text exposition of the fixed series described in the
+observability constraint: completed exchanges by transport and coarse result, latency histograms with
+cumulative buckets and their quantile boundaries, HTTP exchanges and WebSocket connections in flight,
+per-subscriber attempted and dropped lifecycle events, and admission refusals by layer and reason.
+
+The exposition is administrator-only. A regular account receives the same refusal it receives for any
+other administrator surface, the response is not cacheable, and the data plane serves no metrics path at
+all. A quantile over a series with no observation is reported as unknown rather than as zero, because a
+zero latency percentile would be a wrong answer rather than an unavailable one, and the quantile series
+is declared for every series so the shape of the exposition does not depend on traffic.
+
+The detail of the series set, the label rules, the classification mapping, and where each fact is
+recorded are in the [observability design](./modules/observability.md).
+
 ### Gateway errors
 
 Gateway-generated failures use a small, stable envelope:
@@ -353,9 +373,10 @@ Key forks among alternatives are recorded as architecture decision records under
 | Providers | [`modules/providers.md`](./modules/providers.md) | Provider lifecycle, credential issuance, snapshot loading |
 | Events | [`modules/events.md`](./modules/events.md) | The request-lifecycle sideband event bus and its bounded subscribers |
 | Logging | [`modules/logging.md`](./modules/logging.md) | Bounded, non-blocking transport-metadata logging |
+| Observability | [`modules/observability.md`](./modules/observability.md) | The bounded operational exposition and its result classification |
 | Administration | [`modules/administration.md`](./modules/administration.md) | Control-plane session, APIs, administration page, and page presentation |
 
-Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Routing, Proxy, Providers, Events, Logging, Administration.
+Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Routing, Proxy, Providers, Events, Logging, Observability, Administration.
 
 ## 12. Verification
 
@@ -365,6 +386,7 @@ Transparency and safety are proven by tests, not assumed:
 - Security tests assert redaction, fail-closed behavior, and the absence of secrets from logs and API responses.
 - Load tests demonstrate stable memory under the documented concurrency profile for mixed short requests and long-lived streams and enforce every queue, buffer, hashing, idle-connection, and semaphore bound.
 - Admission tests demonstrate that an over-limit provider or credential is rejected immediately without queueing and without contacting an upstream, that the limit applies to long-lived connections for their whole lifetime, and that editing a limit never reaches work already admitted.
+- Observability tests demonstrate that a refused request is recorded once as a rejection naming the layer that refused, that a completed exchange is recorded once under its transport and coarse result, that latency percentiles are derivable from bounded buckets over the whole exchange, and that the exposition carries no credential, account, provider, path, or query string and is refused to a regular account.
 - A version-controlled manifest of pinned client and SDK versions, run against a controllable mock upstream, is the release compatibility gate; external live services are never the CI correctness dependency.
 - Administration page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are accepted through real browser interaction; a successful page build is never the release substitute for that interaction.
 

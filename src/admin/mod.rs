@@ -287,10 +287,18 @@ where
                 },
             );
         }
+        // The exposition is an administrator surface. It carries no request
+        // identity, but it does describe the whole process, and a regular
+        // account is refused here exactly as it is on any other administrator
+        // surface rather than being shown a partial view.
         if method == Method::GET && path == "/metrics" {
+            if !principal.is_admin() {
+                return forbidden();
+            }
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")
+                .header("cache-control", "no-store")
                 .body(Full::new(Bytes::from(metrics.render())))
                 .expect("metrics response is valid");
         }

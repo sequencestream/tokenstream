@@ -598,6 +598,10 @@ async fn accounts_and_credentials_are_role_scoped_and_never_return_a_secret() {
     for (method, path) in [
         (Method::GET, "/admin/api/accounts"),
         (Method::GET, "/admin/api/settings"),
+        // The operational exposition is an administrator surface too: it
+        // describes the whole process, so a regular account is refused rather
+        // than shown a partial view.
+        (Method::GET, "/metrics"),
     ] {
         let (status, _, _) = send(
             &api,
@@ -610,6 +614,30 @@ async fn accounts_and_credentials_are_role_scoped_and_never_return_a_secret() {
             "{path} must stay administrator-only"
         );
     }
+
+    // The administrator does receive it, and the response is not cacheable.
+    // The exposition is text, so it is read directly rather than through the
+    // JSON helper the API responses use.
+    let response = api
+        .handle(
+            request(Method::GET, "/metrics", Value::Null, Some(&cookie), None),
+            Metrics::default(),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("response body")
+        .to_bytes();
+    let rendered = String::from_utf8(bytes.to_vec()).expect("text exposition");
+    assert!(rendered.contains("tokenstream_exchanges_total"));
+    assert!(rendered.contains("tokenstream_admission_rejections_total"));
     let (status, _, _) = send(
         &api,
         request(

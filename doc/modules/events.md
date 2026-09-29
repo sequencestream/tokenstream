@@ -38,6 +38,12 @@ A cancellation or disconnect reason is a member of the same closed category set 
 reports, not a free-form string, so the set of possible results cannot grow with traffic and a
 result can be compared with a metric or a sanitized error without translation.
 
+That closed set is also the source of the operational result classification. The terminal point is
+where an exchange's result is decided exactly once, and the exposition is incremented at that same
+point from that same member, so a metric and a request record can never disagree about how an exchange
+ended. The mapping from a member to a coarse classification belongs to the
+[observability design](./observability.md) and is not restated here.
+
 Subscribing happens before either listener binds, and a bus handed to a proxy task is sealed by
 construction: only a builder that is still being composed can add a subscriber. The emit path
 therefore reads a fixed collection of bounded channels and allocates nothing. The bus holds no

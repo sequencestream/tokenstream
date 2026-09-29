@@ -55,7 +55,6 @@ pub struct HttpProxy<B> {
     client: Client<UpstreamConnector, IdleTimeoutBody<B>>,
     header_timeout: Duration,
     idle_timeout: Duration,
-    metrics: Metrics,
 }
 
 impl<B> HttpProxy<B>
@@ -70,41 +69,19 @@ where
         header_timeout: Duration,
         idle_timeout: Duration,
     ) -> Self {
-        Self::with_metrics(
-            connect_timeout,
-            header_timeout,
-            idle_timeout,
-            Metrics::default(),
-        )
-    }
-
-    pub fn with_metrics(
-        connect_timeout: Duration,
-        header_timeout: Duration,
-        idle_timeout: Duration,
-        metrics: Metrics,
-    ) -> Self {
-        Self::with_buffer(
-            connect_timeout,
-            header_timeout,
-            idle_timeout,
-            metrics,
-            65536,
-        )
+        Self::with_buffer(connect_timeout, header_timeout, idle_timeout, 65536)
     }
 
     pub fn with_buffer(
         connect_timeout: Duration,
         header_timeout: Duration,
         idle_timeout: Duration,
-        metrics: Metrics,
         buffer_bytes: usize,
     ) -> Self {
         Self::with_pool(
             connect_timeout,
             header_timeout,
             idle_timeout,
-            metrics,
             buffer_bytes,
             0,
             Duration::from_secs(30),
@@ -122,7 +99,6 @@ where
         connect_timeout: Duration,
         header_timeout: Duration,
         idle_timeout: Duration,
-        metrics: Metrics,
         buffer_bytes: usize,
         idle_per_host: usize,
         pool_idle_timeout: Duration,
@@ -143,7 +119,6 @@ where
             client,
             header_timeout,
             idle_timeout,
-            metrics,
         }
     }
 
@@ -153,7 +128,6 @@ where
             config.upstream_connect_timeout(),
             config.upstream_header_timeout(),
             config.stream_idle_timeout(),
-            Metrics::default(),
             config.http_buffer_bytes(),
             config.upstream_idle_per_host(),
             config.upstream_pool_idle_timeout(),
@@ -191,7 +165,6 @@ where
             .map_err(|_| GatewayError::InternalError)?;
         *upstream.headers_mut() = headers;
 
-        let started = Instant::now();
         let mut captured = capture_connection(&mut upstream);
         let exchange = self.client.request(upstream);
         tokio::pin!(exchange);
@@ -204,7 +177,6 @@ where
                 }
             }
         };
-        self.metrics.observe_upstream_latency(started.elapsed());
         result
     }
 
