@@ -147,7 +147,7 @@ Each admitted request receives its own immutable, shared provider snapshot. Cont
 
 Proxy tasks use a bounded, non-blocking sender. Failure to enqueue increments `tokenstream_log_events_dropped_total` and does not change the proxy result.
 
-The writer consumes events outside proxy tasks and performs batched database I/O. A `Started` event inserts a row. A `Completed` event updates `status_code`, `end_time`, and sanitized `error_msg`. Completion processing is idempotent by `request_id`. Because either event may be dropped or the process may crash, the UI labels rows with no `end_time` as **incomplete**, not necessarily active.
+The writer consumes events outside proxy tasks and performs batched database I/O. A `Started` event inserts a row. A `Completed` event updates `status_code`, `end_time`, and sanitized `error_msg`. Completion processing is idempotent by `request_id`. Retryable batch failures follow a bounded retry policy, then discard the remaining batch. Permanent event errors, such as a start record whose provider was deleted before the row was persisted, are isolated with bounded splits so other events in the same batch can still be written; isolated events increment the dropped-log metric. Because either event may be dropped or the process may crash, the UI labels rows with no `end_time` as **incomplete**, not necessarily active.
 
 Metrics are aggregated and contain no key IDs, URLs with queries, or other high-cardinality secrets. Minimum operational metrics are active HTTP requests, active WebSockets, upstream latency, proxy failures by safe category, log queue depth, and dropped log events.
 
@@ -359,7 +359,7 @@ New requests using the old credential fail immediately after the committed chang
 
 1. Proxy code attempts a non-blocking event emission; a full or closed queue increments the dropped counter and returns immediately.
 2. The writer groups events by size or a short flush interval and writes them in a transaction.
-3. Database failures are reported through bounded-rate operational logs and metrics. Events may be discarded after a bounded retry policy inside the logging worker; proxy traffic is never delayed.
+3. Database failures are reported through bounded-rate operational logs and metrics. Retryable failures may discard the remaining batch after a bounded retry policy. Permanent event errors are isolated with bounded splits so they cannot roll back other events in the same batch; isolated events increment the dropped-log metric. Proxy traffic is never delayed.
 4. On graceful shutdown, stop accepting new traffic, allow active requests a configured drain period, then give the logger a separate bounded flush period. SIGINT and SIGTERM enter this sequence on platforms that deliver those signals.
 5. On startup, leave rows with no `end_time` unchanged. The UI renders them as incomplete. The MVP does not synthesize close times.
 

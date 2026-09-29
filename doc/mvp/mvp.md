@@ -94,7 +94,7 @@ Validates the HTTP method and URL path against the resolved provider's `protocol
 
 ### 5.4 Asynchronous Logging Module
 
-- Emit start and completion records to a bounded logging queue. Database I/O runs outside the proxy tasks. On queue saturation, drop the log record and increment a dropped-log metric rather than blocking the proxy path or allowing unbounded memory growth; therefore logging is explicitly best-effort in the MVP.
+- Emit start and completion records to a bounded logging queue. Database I/O runs outside the proxy tasks. On queue saturation, drop the log record and increment a dropped-log metric rather than blocking the proxy path or allowing unbounded memory growth; therefore logging is explicitly best-effort in the MVP. A permanently unwritable event, such as a start record that loses a race with provider deletion, is isolated from the rest of its batch rather than causing the whole batch to be discarded.
 - Store transport-layer metadata only; never store request or response payloads.
 - For HTTP, record the upstream status and completion time. For WebSocket, record handshake status and connection close time. A process crash may leave a started record without an `end_time`; the UI must represent it as incomplete rather than as an active connection indefinitely.
 

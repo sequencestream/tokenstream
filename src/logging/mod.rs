@@ -1,8 +1,9 @@
 //! Best-effort request lifecycle logging outside the proxy hot path.
 //!
 //! Proxy tasks only attempt a bounded channel send. A full or closed channel
-//! drops the event and increments a counter; database work and retries remain
-//! confined to the background worker. Events contain transport metadata only.
+//! drops the event and increments a counter; database work, bounded retries,
+//! and isolation of permanent event errors remain confined to the background
+//! worker. Events contain transport metadata only.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,6 +24,14 @@ use crate::telemetry::{ActiveRequestGuard, Metrics, ProxyFailureCategory};
 const MAX_WRITE_ATTEMPTS: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_millis(10);
 const WARNING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Result of writing one contiguous slice of a dequeued batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchWriteOutcome {
+    Persisted,
+    PermanentFailure,
+    RetryExhausted,
+}
 
 /// One metadata-only lifecycle event.
 #[derive(Clone, Debug)]
@@ -191,41 +200,76 @@ where
                 }
             }
 
-            let persisted = self.write_with_retry(&batch, &mut last_warning).await;
-            if !persisted {
-                self.metrics.drop_log_events(batch.len() as u64);
+            let dropped = self.persist_batch(&batch, &mut last_warning).await;
+            if dropped > 0 {
+                self.metrics.drop_log_events(dropped as u64);
             }
             self.metrics.remove_log_events(batch.len());
             batch.clear();
         }
     }
 
-    async fn write_with_retry(
+    /// Writes a dequeued batch, retrying transient failures and isolating
+    /// permanent event errors with bounded binary splits.
+    async fn persist_batch(&self, batch: &[LogEvent], last_warning: &mut Option<Instant>) -> usize {
+        let mut pending = Vec::new();
+        pending.push(0..batch.len());
+        let mut dropped = 0;
+        while let Some(range) = pending.pop() {
+            let start = range.start;
+            let end = range.end;
+            if start >= end {
+                continue;
+            }
+            let chunk = &batch[start..end];
+            match self.try_write(chunk, last_warning).await {
+                BatchWriteOutcome::Persisted => {}
+                BatchWriteOutcome::RetryExhausted => dropped += chunk.len(),
+                BatchWriteOutcome::PermanentFailure if chunk.len() == 1 => dropped += 1,
+                BatchWriteOutcome::PermanentFailure => {
+                    let mid = start + chunk.len() / 2;
+                    pending.push(mid..end);
+                    pending.push(start..mid);
+                }
+            }
+        }
+        dropped
+    }
+
+    async fn try_write(
         &self,
         batch: &[LogEvent],
         last_warning: &mut Option<Instant>,
-    ) -> bool {
+    ) -> BatchWriteOutcome {
         for attempt in 1..=MAX_WRITE_ATTEMPTS {
             match self.store.write_batch(batch).await {
-                Ok(()) => return true,
+                Ok(()) => return BatchWriteOutcome::Persisted,
+                Err(error) if is_permanent_log_failure(&error) => {
+                    warn_rate_limited(last_warning);
+                    return BatchWriteOutcome::PermanentFailure;
+                }
                 Err(_) if attempt < MAX_WRITE_ATTEMPTS => {
                     warn_rate_limited(last_warning);
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 Err(_) => {
                     warn_rate_limited(last_warning);
-                    return false;
+                    return BatchWriteOutcome::RetryExhausted;
                 }
             }
         }
-        false
+        BatchWriteOutcome::RetryExhausted
     }
+}
+
+fn is_permanent_log_failure(error: &RepositoryError) -> bool {
+    matches!(error, RepositoryError::NotFound | RepositoryError::Conflict)
 }
 
 fn warn_rate_limited(last_warning: &mut Option<Instant>) {
     let now = Instant::now();
     if last_warning.is_none_or(|previous| now.duration_since(previous) >= WARNING_INTERVAL) {
-        eprintln!("Tokenstream request-log batch write failed; retry is bounded");
+        eprintln!("Tokenstream request-log batch write failed; retry and isolation are bounded");
         *last_warning = Some(now);
     }
 }
