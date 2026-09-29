@@ -9,10 +9,10 @@ Design constraints and public contracts are in the [architecture document](./arc
 Compile a release binary that includes the administration page:
 
 ```sh
-./scripts/build.sh
+make build
 ```
 
-The release binary is `target/release/tokenstream`. The administration page is compiled into that binary.
+The release binary is `target/release/tokenstream`. The administration page is compiled into that binary. `make` lists the other local shortcuts (lint, tests, the CI-equivalent check, and the release gate).
 
 ## Local development
 
@@ -48,12 +48,12 @@ GitHub Release archives contain the gateway binary alone; the compiled administr
 
 ## Verification
 
-Basic checks are `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`, and, in `web/`, `npm run check`, `npm run test`, and `npm run build`. Dual-backend repository tests need a PostgreSQL server through `TOKENSTREAM_TEST_POSTGRES_URL`; absence is a failure, not a skip.
+Basic checks are `make ci`: formatting and strict static analysis, the locked test suite, and the administration frontend typecheck, tests, and production build. Faster inner-loop targets are `make lint` and `make test`. Dual-backend repository tests need a PostgreSQL server through `TOKENSTREAM_TEST_POSTGRES_URL`; absence is a failure, not a skip.
 
 The release gate runs the full verification set: formatting and strict static analysis, the unit, repository, protocol, and security suites, a fast component load profile, a sustained mixed load profile measured against a real gateway process, the administration frontend checks and production build, real-browser administration acceptance against both the control-plane hosted page and the development-server proxy, the pinned client suite, and the pinned clients driven through a real gateway process. The gate provisions an ephemeral PostgreSQL server when one is not supplied through `TOKENSTREAM_TEST_POSTGRES_URL`, and fails rather than skipping when no server is available. A supplied server that is not reachable is a gate failure, not a reason to record the dual-backend layers as unexecuted, and the storage layers themselves report a missing server as a failure rather than skipping.
 
 ```sh
-./scripts/release-gate.sh
+make gate
 ```
 
 The real-process stages start the compiled binary, configure providers through the administration API, and measure the gateway's own resource use:
