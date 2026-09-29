@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 const LATENCY_BUCKETS_SECONDS: [f64; 8] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 1.0, 5.0];
-const FAILURE_CATEGORY_COUNT: usize = 12;
+const FAILURE_CATEGORY_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProxyFailureCategory {
@@ -21,6 +21,7 @@ pub enum ProxyFailureCategory {
     UpstreamConnectFailed,
     UpstreamTimeout,
     ConnectionLimitReached,
+    ResourceExhausted,
     InternalError,
     StreamFailed,
     DownstreamCancelled,
@@ -37,6 +38,7 @@ impl ProxyFailureCategory {
         Self::UpstreamConnectFailed,
         Self::UpstreamTimeout,
         Self::ConnectionLimitReached,
+        Self::ResourceExhausted,
         Self::InternalError,
         Self::StreamFailed,
         Self::DownstreamCancelled,
@@ -57,6 +59,7 @@ impl ProxyFailureCategory {
             Self::UpstreamConnectFailed => "upstream_connect_failed",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::ConnectionLimitReached => "connection_limit_reached",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::InternalError => "internal_error",
             Self::StreamFailed => "stream_failed",
             Self::DownstreamCancelled => "downstream_cancelled",

@@ -21,19 +21,21 @@ use serde::{Deserialize, Serialize};
 use crate::ControlPlaneService;
 use crate::admin::assets::{AdminAssets, PAGE_CONTENT_SECURITY_POLICY};
 use crate::crypto::{
-    AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher,
+    AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, PasswordWorkError,
+    SecretCipher,
 };
 use crate::domain::{
     ProtocolType, ProviderAdminView, ProviderCursor, ProviderId, ProviderStatus, RequestLog,
     RequestLogCursor, SecretString, TransportType,
 };
 use crate::persistence::{
-    Database, ProviderListRequest, ProviderRepository, RequestLogQuery, RequestLogRepository,
+    Database, ProviderListRequest, ProviderRepository, RepositoryError, RequestLogQuery,
+    RequestLogRepository,
 };
 use crate::providers::{
     CreateProviderRequest, ProviderService, ProviderServiceError, UpdateProviderRequest,
 };
-use crate::telemetry::Metrics;
+use crate::telemetry::{Metrics, ProxyFailureCategory};
 
 const SESSION_COOKIE: &str = "tokenstream_admin";
 const MAX_ADMIN_BODY_BYTES: usize = 16 * 1024;
@@ -54,6 +56,7 @@ pub struct AdminApi<R, C, V> {
     session_ttl: Duration,
     assets: Option<AdminAssets>,
     development_mode: bool,
+    metrics: Metrics,
 }
 
 #[derive(Clone)]
@@ -111,6 +114,7 @@ where
             session_ttl,
             assets: None,
             development_mode: false,
+            metrics: Metrics::default(),
         }
     }
 
@@ -126,6 +130,19 @@ where
         self.body_timeout = config.admin_body_timeout();
         self.connection_settings = crate::ConnectionSettings::control(config);
         self.development_mode = config.development_mode();
+        self
+    }
+
+    pub fn with_password_work(mut self, work: crate::crypto::PasswordWork) -> Self {
+        self.password_work = work.clone();
+        Arc::get_mut(&mut self.providers)
+            .expect("unshared provider service")
+            .set_password_work(work);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -279,16 +296,18 @@ where
         };
         let hash = self.password_hash.clone();
         let password = SecretString::new(input.password);
-        let verified = self
+        let verified = match self
             .password_work
             .run(move || verify_password(password.expose(), &hash))
-            .await;
-        let Ok(verified) = verified else {
-            return api_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "password_work_unavailable",
-                "Password processing is unavailable.",
-            );
+            .await
+        {
+            Ok(verified) => verified,
+            Err(PasswordWorkError::Busy) => {
+                self.metrics
+                    .record_failure(ProxyFailureCategory::ResourceExhausted);
+                return resource_exhausted();
+            }
+            Err(PasswordWorkError::Failed) => return internal_error(),
         };
         if !verified {
             return api_error(
@@ -381,7 +400,7 @@ where
                     },
                 )
             }
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
@@ -419,14 +438,14 @@ where
                     },
                 )
             }
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
     async fn get_provider(&self, id: ProviderId) -> Response<ApiBody> {
         match self.providers.get(id).await {
             Ok(provider) => json_response(StatusCode::OK, &ProviderAdminView::from(&provider)),
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
@@ -458,7 +477,7 @@ where
         }
         match self.providers.update(id, change).await {
             Ok(provider) => json_response(StatusCode::OK, &ProviderAdminView::from(&provider)),
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
@@ -468,7 +487,7 @@ where
                 .status(StatusCode::NO_CONTENT)
                 .body(Full::new(Bytes::new()))
                 .expect("delete response is valid"),
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
@@ -484,7 +503,7 @@ where
                     },
                 )
             }
-            Err(error) => provider_error(error),
+            Err(error) => self.provider_error(error),
         }
     }
 
@@ -504,7 +523,49 @@ where
                     },
                 )
             }
+            Err(RepositoryError::Timeout) => {
+                self.metrics
+                    .record_failure(ProxyFailureCategory::ResourceExhausted);
+                resource_exhausted()
+            }
             Err(_) => internal_error(),
+        }
+    }
+
+    fn provider_error(&self, error: ProviderServiceError) -> Response<ApiBody> {
+        match error {
+            ProviderServiceError::InvalidName
+            | ProviderServiceError::InvalidEndpoint
+            | ProviderServiceError::InsecureEndpoint
+            | ProviderServiceError::InvalidUpstreamApiKey => {
+                invalid_input("Invalid provider configuration.")
+            }
+            ProviderServiceError::Conflict => api_error(
+                StatusCode::CONFLICT,
+                "provider_conflict",
+                "Provider configuration conflicts with an existing provider.",
+            ),
+            ProviderServiceError::NotFound => api_error(
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "Provider not found.",
+            ),
+            ProviderServiceError::InUse => api_error(
+                StatusCode::CONFLICT,
+                "provider_in_use",
+                "Provider is referenced by request logs.",
+            ),
+            ProviderServiceError::NoFieldsToUpdate => {
+                invalid_input("No provider field was supplied.")
+            }
+            ProviderServiceError::Busy => {
+                self.metrics
+                    .record_failure(ProxyFailureCategory::ResourceExhausted);
+                resource_exhausted()
+            }
+            ProviderServiceError::Credential
+            | ProviderServiceError::Cipher
+            | ProviderServiceError::Storage => internal_error(),
         }
     }
 }
@@ -799,34 +860,12 @@ fn provider_item_path(path: &str) -> Option<(i64, bool)> {
     Some((id.parse().ok()?, rotate))
 }
 
-fn provider_error(error: ProviderServiceError) -> Response<ApiBody> {
-    match error {
-        ProviderServiceError::InvalidName
-        | ProviderServiceError::InvalidEndpoint
-        | ProviderServiceError::InsecureEndpoint
-        | ProviderServiceError::InvalidUpstreamApiKey => {
-            invalid_input("Invalid provider configuration.")
-        }
-        ProviderServiceError::Conflict => api_error(
-            StatusCode::CONFLICT,
-            "provider_conflict",
-            "Provider configuration conflicts with an existing provider.",
-        ),
-        ProviderServiceError::NotFound => api_error(
-            StatusCode::NOT_FOUND,
-            "provider_not_found",
-            "Provider not found.",
-        ),
-        ProviderServiceError::InUse => api_error(
-            StatusCode::CONFLICT,
-            "provider_in_use",
-            "Provider is referenced by request logs.",
-        ),
-        ProviderServiceError::NoFieldsToUpdate => invalid_input("No provider field was supplied."),
-        ProviderServiceError::Credential
-        | ProviderServiceError::Cipher
-        | ProviderServiceError::Storage => internal_error(),
-    }
+fn resource_exhausted() -> Response<ApiBody> {
+    api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "resource_exhausted",
+        "The gateway has no spare capacity for this request.",
+    )
 }
 
 fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<ApiBody> {

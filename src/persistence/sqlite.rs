@@ -11,27 +11,26 @@ use crate::logging::LogEvent;
 
 use super::time::to_epoch_micros;
 use super::{
-    DEFAULT_POOL_ACQUIRE_TIMEOUT, NewProvider, ProviderListRequest, ProviderPage,
-    ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted,
-    RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted,
-    protocol_value, status_value, transport_value,
+    DatabaseBounds, NewProvider, ProviderListRequest, ProviderPage, ProviderRepository,
+    ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage,
+    RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted, protocol_value,
+    status_value, timed, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
 #[derive(Clone, Debug)]
 pub struct SqliteDatabase {
-    pool: SqlitePool,
+    auth: SqlitePool,
+    shared: SqlitePool,
+    auth_timeout: Duration,
+    admin_timeout: Duration,
+    log_timeout: Duration,
 }
 
 impl SqliteDatabase {
     pub async fn connect(database_url: &str, max_connections: usize) -> Result<Self, sqlx::Error> {
-        Self::connect_with_acquire_timeout(
-            database_url,
-            max_connections,
-            DEFAULT_POOL_ACQUIRE_TIMEOUT,
-        )
-        .await
+        Self::connect_with_bounds(database_url, DatabaseBounds::for_tests(max_connections)).await
     }
 
     /// Connects with an explicit pooled-connection count and acquisition deadline.
@@ -43,34 +42,75 @@ impl SqliteDatabase {
         max_connections: usize,
         acquire_timeout: Duration,
     ) -> Result<Self, sqlx::Error> {
-        let options = SqliteConnectOptions::from_str(database_url)?
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let pool = SqlitePoolOptions::new()
-            .max_connections(max_connections as u32)
-            .acquire_timeout(acquire_timeout)
-            .after_connect(|connection, _metadata| {
-                Box::pin(async move {
-                    connection.execute("PRAGMA foreign_keys = ON").await?;
-                    verify_foreign_keys(connection).await
-                })
-            })
-            .connect_with(options)
-            .await?;
-        Ok(Self { pool })
+        let mut bounds = DatabaseBounds::for_tests(max_connections);
+        bounds.acquire_timeout = acquire_timeout;
+        Self::connect_with_bounds(database_url, bounds).await
+    }
+
+    pub async fn connect_with_bounds(
+        database_url: &str,
+        bounds: DatabaseBounds,
+    ) -> Result<Self, sqlx::Error> {
+        let auth_connections = bounds.auth_connections.min(bounds.max_connections).max(1);
+        let partitioned = auth_connections < bounds.max_connections;
+        let shared_connections = if partitioned {
+            bounds.max_connections - auth_connections
+        } else {
+            bounds.max_connections
+        };
+        let auth_acquire = bounds.auth_timeout.min(bounds.acquire_timeout);
+        let shared_acquire = bounds
+            .acquire_timeout
+            .min(bounds.admin_timeout.max(bounds.log_timeout));
+        let auth = connect_pool(
+            database_url,
+            auth_connections,
+            auth_acquire,
+            duration_millis(bounds.auth_timeout),
+        )
+        .await?;
+        let shared = if partitioned {
+            connect_pool(
+                database_url,
+                shared_connections,
+                shared_acquire,
+                duration_millis(bounds.admin_timeout.max(bounds.log_timeout)),
+            )
+            .await?
+        } else {
+            auth.clone()
+        };
+        Ok(Self {
+            auth,
+            shared,
+            auth_timeout: bounds.auth_timeout,
+            admin_timeout: bounds.admin_timeout,
+            log_timeout: bounds.log_timeout,
+        })
     }
 
     pub fn pool(&self) -> &SqlitePool {
-        &self.pool
+        &self.shared
+    }
+
+    pub fn auth_pool(&self) -> &SqlitePool {
+        &self.auth
     }
 
     pub async fn migrate(&self) -> Result<(), sqlx::migrate::MigrateError> {
-        MIGRATOR.run(&self.pool).await
+        MIGRATOR.run(&self.shared).await
     }
 
     /// Persists one logger batch atomically so retry never observes a partial batch.
     pub(crate) async fn write_log_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
-        let mut transaction = self.pool.begin().await.map_err(map_storage_error)?;
+        match tokio::time::timeout(self.log_timeout, self.write_log_batch_inner(events)).await {
+            Ok(result) => result,
+            Err(_) => Err(RepositoryError::Timeout),
+        }
+    }
+
+    async fn write_log_batch_inner(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
         for event in events {
             match event {
                 LogEvent::Started(event) => {
@@ -115,6 +155,36 @@ impl MigrationRunner for SqliteDatabase {
     }
 }
 
+async fn connect_pool(
+    database_url: &str,
+    max_connections: usize,
+    acquire_timeout: Duration,
+    busy_timeout_ms: i64,
+) -> Result<SqlitePool, sqlx::Error> {
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .foreign_keys(true);
+    SqlitePoolOptions::new()
+        .max_connections(max_connections as u32)
+        .acquire_timeout(acquire_timeout)
+        .after_connect(move |connection, _metadata| {
+            Box::pin(async move {
+                connection.execute("PRAGMA foreign_keys = ON").await?;
+                connection.execute("PRAGMA journal_mode = WAL").await?;
+                sqlx::query(&format!("PRAGMA busy_timeout = {busy_timeout_ms}"))
+                    .execute(&mut *connection)
+                    .await?;
+                verify_foreign_keys(connection).await
+            })
+        })
+        .connect_with(options)
+        .await
+}
+
+fn duration_millis(duration: Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 async fn verify_foreign_keys(connection: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     let enabled: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
         .fetch_one(&mut *connection)
@@ -133,14 +203,17 @@ impl ProviderRepository for SqliteDatabase {
         &self,
         key_id: &GatewayKeyId,
     ) -> Result<Option<Provider>, RepositoryError> {
-        sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+        timed(
+            self.auth_timeout,
+            sqlx::query_as::<_, ProviderRow>(
+                "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     gateway_key_id, gateway_api_key_hash, status, created_at
              FROM provider
              WHERE gateway_key_id = ?",
+            )
+            .bind(key_id.as_str())
+            .fetch_optional(&self.auth),
         )
-        .bind(key_id.as_str())
-        .fetch_optional(&self.pool)
         .await
         .map_err(map_storage_error)?
         .map(ProviderRow::into_provider)
@@ -148,14 +221,17 @@ impl ProviderRepository for SqliteDatabase {
     }
 
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
-        sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+        timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ProviderRow>(
+                "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     gateway_key_id, gateway_api_key_hash, status, created_at
              FROM provider
              WHERE id = ?",
+            )
+            .bind(id.get())
+            .fetch_optional(&self.shared),
         )
-        .bind(id.get())
-        .fetch_optional(&self.pool)
         .await
         .map_err(map_storage_error)?
         .map(ProviderRow::into_provider)
@@ -166,17 +242,20 @@ impl ProviderRepository for SqliteDatabase {
         let after_id = request.after_id().map_or(0, |cursor| cursor.get());
         let fetch_limit =
             i64::try_from(request.limit() + 1).expect("bounded provider page size fits in i64");
-        let mut rows = sqlx::query_as::<_, ProviderRow>(
-            "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+        let mut rows = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ProviderRow>(
+                "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     gateway_key_id, gateway_api_key_hash, status, created_at
              FROM provider
              WHERE id > ?
              ORDER BY id ASC
              LIMIT ?",
+            )
+            .bind(after_id)
+            .bind(fetch_limit)
+            .fetch_all(&self.shared),
         )
-        .bind(after_id)
-        .bind(fetch_limit)
-        .fetch_all(&self.pool)
         .await
         .map_err(map_storage_error)?;
         let has_more = rows.len() > request.limit();
@@ -189,23 +268,26 @@ impl ProviderRepository for SqliteDatabase {
     }
 
     async fn create(&self, provider: NewProvider) -> Result<Provider, RepositoryError> {
-        sqlx::query_as::<_, ProviderRow>(
-            "INSERT INTO provider (
+        timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ProviderRow>(
+                "INSERT INTO provider (
                  name, protocol_type, endpoint, upstream_api_key_ciphertext,
                  gateway_key_id, gateway_api_key_hash, status, created_at
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                        gateway_key_id, gateway_api_key_hash, status, created_at",
+            )
+            .bind(provider.name)
+            .bind(protocol_value(provider.protocol_type))
+            .bind(provider.endpoint.as_str())
+            .bind(provider.upstream_api_key_ciphertext.expose())
+            .bind(provider.gateway_key_id.as_str())
+            .bind(provider.gateway_api_key_hash.expose())
+            .bind(status_value(provider.status))
+            .bind(to_epoch_micros(provider.created_at))
+            .fetch_one(&self.shared),
         )
-        .bind(provider.name)
-        .bind(protocol_value(provider.protocol_type))
-        .bind(provider.endpoint.as_str())
-        .bind(provider.upstream_api_key_ciphertext.expose())
-        .bind(provider.gateway_key_id.as_str())
-        .bind(provider.gateway_api_key_hash.expose())
-        .bind(status_value(provider.status))
-        .bind(to_epoch_micros(provider.created_at))
-        .fetch_one(&self.pool)
         .await
         .map_err(map_write_error)?
         .into_provider()
@@ -252,13 +334,16 @@ impl ProviderRepository for SqliteDatabase {
             " RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                       gateway_key_id, gateway_api_key_hash, status, created_at",
         );
-        builder
-            .build_query_as::<ProviderRow>()
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_write_error)?
-            .ok_or(RepositoryError::NotFound)?
-            .into_provider()
+        timed(
+            self.admin_timeout,
+            builder
+                .build_query_as::<ProviderRow>()
+                .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(map_write_error)?
+        .ok_or(RepositoryError::NotFound)?
+        .into_provider()
     }
 
     async fn rotate_gateway_key(
@@ -267,17 +352,20 @@ impl ProviderRepository for SqliteDatabase {
         key_id: GatewayKeyId,
         hash: PasswordHash,
     ) -> Result<Provider, RepositoryError> {
-        sqlx::query_as::<_, ProviderRow>(
-            "UPDATE provider
+        timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ProviderRow>(
+                "UPDATE provider
              SET gateway_key_id = ?, gateway_api_key_hash = ?
              WHERE id = ?
              RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                        gateway_key_id, gateway_api_key_hash, status, created_at",
+            )
+            .bind(key_id.as_str())
+            .bind(hash.expose())
+            .bind(id.get())
+            .fetch_optional(&self.shared),
         )
-        .bind(key_id.as_str())
-        .bind(hash.expose())
-        .bind(id.get())
-        .fetch_optional(&self.pool)
         .await
         .map_err(map_write_error)?
         .ok_or(RepositoryError::NotFound)?
@@ -285,17 +373,20 @@ impl ProviderRepository for SqliteDatabase {
     }
 
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError> {
-        let result = sqlx::query("DELETE FROM provider WHERE id = ?")
-            .bind(id.get())
-            .execute(&self.pool)
-            .await
-            .map_err(|error| {
-                if is_foreign_key_violation(&error) {
-                    RepositoryError::ProviderInUse
-                } else {
-                    RepositoryError::Storage
-                }
-            })?;
+        let result = timed(
+            self.admin_timeout,
+            sqlx::query("DELETE FROM provider WHERE id = ?")
+                .bind(id.get())
+                .execute(&self.shared),
+        )
+        .await
+        .map_err(|error| {
+            if is_foreign_key_violation(&error) {
+                RepositoryError::ProviderInUse
+            } else {
+                map_storage_error(error)
+            }
+        })?;
         if result.rows_affected() == 0 {
             Err(RepositoryError::NotFound)
         } else {
@@ -306,34 +397,40 @@ impl ProviderRepository for SqliteDatabase {
 
 impl RequestLogRepository for SqliteDatabase {
     async fn insert_started(&self, event: RequestLogStarted) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "INSERT INTO request_log (
+        timed(
+            self.log_timeout,
+            sqlx::query(
+                "INSERT INTO request_log (
                  request_id, provider_id, protocol_type, transport_type, path, start_time
              ) VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(event.request_id.as_str())
+            .bind(event.provider_id.get())
+            .bind(protocol_value(event.protocol_type))
+            .bind(transport_value(event.transport_type))
+            .bind(event.path)
+            .bind(to_epoch_micros(event.start_time))
+            .execute(&self.shared),
         )
-        .bind(event.request_id.as_str())
-        .bind(event.provider_id.get())
-        .bind(protocol_value(event.protocol_type))
-        .bind(transport_value(event.transport_type))
-        .bind(event.path)
-        .bind(to_epoch_micros(event.start_time))
-        .execute(&self.pool)
         .await
         .map_err(map_write_error)?;
         Ok(())
     }
 
     async fn apply_completed(&self, event: RequestLogCompleted) -> Result<(), RepositoryError> {
-        sqlx::query(
-            "UPDATE request_log
+        timed(
+            self.log_timeout,
+            sqlx::query(
+                "UPDATE request_log
              SET status_code = ?, end_time = ?, error_msg = ?
              WHERE request_id = ? AND end_time IS NULL",
+            )
+            .bind(event.status_code.map(i64::from))
+            .bind(to_epoch_micros(event.end_time))
+            .bind(event.error_msg)
+            .bind(event.request_id.as_str())
+            .execute(&self.shared),
         )
-        .bind(event.status_code.map(i64::from))
-        .bind(to_epoch_micros(event.end_time))
-        .bind(event.error_msg)
-        .bind(event.request_id.as_str())
-        .execute(&self.pool)
         .await
         .map_err(map_storage_error)?;
         Ok(())
@@ -371,11 +468,14 @@ impl RequestLogRepository for SqliteDatabase {
             i64::try_from(query.limit() + 1).expect("bounded request log page size fits in i64"),
         );
 
-        let mut rows = statement
-            .build_query_as::<RequestLogRow>()
-            .fetch_all(&self.pool)
-            .await
-            .map_err(map_storage_error)?;
+        let mut rows = timed(
+            self.admin_timeout,
+            statement
+                .build_query_as::<RequestLogRow>()
+                .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
         let has_more = rows.len() > query.limit();
         rows.truncate(query.limit());
         let items = rows
@@ -387,7 +487,9 @@ impl RequestLogRepository for SqliteDatabase {
 }
 
 fn map_write_error(error: sqlx::Error) -> RepositoryError {
-    if error.as_database_error().is_some_and(|database_error| {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        RepositoryError::Timeout
+    } else if error.as_database_error().is_some_and(|database_error| {
         database_error.is_unique_violation()
             || matches!(database_error.code().as_deref(), Some("1555" | "2067"))
     }) {
@@ -399,8 +501,12 @@ fn map_write_error(error: sqlx::Error) -> RepositoryError {
     }
 }
 
-fn map_storage_error(_: sqlx::Error) -> RepositoryError {
-    RepositoryError::Storage
+fn map_storage_error(error: sqlx::Error) -> RepositoryError {
+    if matches!(error, sqlx::Error::PoolTimedOut) {
+        RepositoryError::Timeout
+    } else {
+        RepositoryError::Storage
+    }
 }
 
 fn is_foreign_key_violation(error: &sqlx::Error) -> bool {

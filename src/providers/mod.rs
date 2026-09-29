@@ -6,7 +6,7 @@
 //! only from the creation result; it is never stored, logged, or rendered by
 //! diagnostics.
 
-use crate::crypto::PasswordWork;
+use crate::crypto::{PasswordWork, PasswordWorkError};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -207,6 +207,8 @@ pub enum ProviderServiceError {
     InvalidUpstreamApiKey,
     /// Gateway credential generation failed.
     Credential,
+    /// Compute or database capacity for this change is exhausted.
+    Busy,
     /// Upstream credential encryption failed.
     Cipher,
     /// A provider with the same name or gateway key identifier already exists.
@@ -229,6 +231,7 @@ impl fmt::Display for ProviderServiceError {
             Self::InsecureEndpoint => "provider endpoint must use HTTPS",
             Self::InvalidUpstreamApiKey => "upstream API key is invalid",
             Self::Credential => "gateway credential generation failed",
+            Self::Busy => "provider service has no spare capacity",
             Self::Cipher => "upstream credential encryption failed",
             Self::Conflict => "provider conflicts with existing data",
             Self::NotFound => "provider was not found",
@@ -319,12 +322,14 @@ where
         validate_upstream_api_key(&request.upstream_api_key)?;
 
         let verifier = self.verifier.clone();
-        let (gateway_credential, gateway_api_key_hash) = self
-            .password_work
-            .run(move || verifier.issue())
-            .await
-            .map_err(|_| ProviderServiceError::Credential)?
-            .map_err(|_| ProviderServiceError::Credential)?;
+        let (gateway_credential, gateway_api_key_hash) =
+            match self.password_work.run(move || verifier.issue()).await {
+                Ok(Ok(issued)) => issued,
+                Ok(Err(_)) | Err(PasswordWorkError::Failed) => {
+                    return Err(ProviderServiceError::Credential);
+                }
+                Err(PasswordWorkError::Busy) => return Err(ProviderServiceError::Busy),
+            };
         let upstream_api_key_ciphertext = self
             .cipher
             .encrypt(&request.upstream_api_key)
@@ -361,12 +366,14 @@ where
         id: ProviderId,
     ) -> Result<RotatedProvider, ProviderServiceError> {
         let verifier = self.verifier.clone();
-        let (gateway_credential, gateway_api_key_hash) = self
-            .password_work
-            .run(move || verifier.issue())
-            .await
-            .map_err(|_| ProviderServiceError::Credential)?
-            .map_err(|_| ProviderServiceError::Credential)?;
+        let (gateway_credential, gateway_api_key_hash) =
+            match self.password_work.run(move || verifier.issue()).await {
+                Ok(Ok(issued)) => issued,
+                Ok(Err(_)) | Err(PasswordWorkError::Failed) => {
+                    return Err(ProviderServiceError::Credential);
+                }
+                Err(PasswordWorkError::Busy) => return Err(ProviderServiceError::Busy),
+            };
 
         let provider = self
             .repository
@@ -498,6 +505,7 @@ fn map_repository_error(error: RepositoryError) -> ProviderServiceError {
         RepositoryError::ProviderInUse => ProviderServiceError::InUse,
         RepositoryError::NotFound => ProviderServiceError::NotFound,
         RepositoryError::NoFieldsToUpdate => ProviderServiceError::NoFieldsToUpdate,
+        RepositoryError::Timeout => ProviderServiceError::Busy,
         _ => ProviderServiceError::Storage,
     }
 }

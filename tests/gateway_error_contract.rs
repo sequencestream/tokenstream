@@ -32,6 +32,7 @@ fn every_error_class_has_a_stable_code_status_and_message() {
         (GatewayError::UpstreamConnectFailed, 502),
         (GatewayError::UpstreamTimeout, 504),
         (GatewayError::ConnectionLimitReached, 503),
+        (GatewayError::ResourceExhausted, 503),
         (GatewayError::InternalError, 500),
     ];
 
@@ -59,6 +60,7 @@ fn the_code_set_is_exactly_the_documented_data_plane_contract() {
         GatewayError::UpstreamConnectFailed,
         GatewayError::UpstreamTimeout,
         GatewayError::ConnectionLimitReached,
+        GatewayError::ResourceExhausted,
         GatewayError::InternalError,
     ]
     .into_iter()
@@ -75,6 +77,7 @@ fn the_code_set_is_exactly_the_documented_data_plane_contract() {
             "upstream_connect_failed",
             "upstream_timeout",
             "connection_limit_reached",
+            "resource_exhausted",
             "internal_error",
         ])
     );
@@ -101,6 +104,10 @@ fn authentication_and_route_failures_classify_into_the_contract() {
     assert_eq!(
         GatewayError::from(GatewayAuthError::ProviderDisabled),
         GatewayError::ProviderDisabled
+    );
+    assert_eq!(
+        GatewayError::from(GatewayAuthError::Busy),
+        GatewayError::ResourceExhausted
     );
     assert_eq!(
         GatewayError::from(GatewayAuthError::Unavailable),
@@ -140,6 +147,7 @@ fn hostile_upstream_text_never_reaches_a_local_message() {
         GatewayError::UpstreamConnectFailed,
         GatewayError::UpstreamTimeout,
         GatewayError::ConnectionLimitReached,
+        GatewayError::ResourceExhausted,
         GatewayError::InternalError,
     ] {
         let body = error.render(&request_id);

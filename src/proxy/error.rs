@@ -54,6 +54,8 @@ pub enum GatewayError {
     UpstreamTimeout,
     /// The admission limit for proxy connections is full.
     ConnectionLimitReached,
+    /// Compute or storage capacity for this request is exhausted.
+    ResourceExhausted,
     /// A local configuration or processing failure whose detail is withheld.
     InternalError,
 }
@@ -69,6 +71,7 @@ impl GatewayError {
             Self::UpstreamConnectFailed => "upstream_connect_failed",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::ConnectionLimitReached => "connection_limit_reached",
+            Self::ResourceExhausted => "resource_exhausted",
             Self::InternalError => "internal_error",
         }
     }
@@ -83,6 +86,7 @@ impl GatewayError {
             Self::UpstreamConnectFailed => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::ConnectionLimitReached => StatusCode::SERVICE_UNAVAILABLE,
+            Self::ResourceExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -99,6 +103,7 @@ impl GatewayError {
             Self::UpstreamConnectFailed => "The upstream connection failed.",
             Self::UpstreamTimeout => "The upstream request timed out.",
             Self::ConnectionLimitReached => "The gateway is at its connection limit.",
+            Self::ResourceExhausted => "The gateway has no spare capacity for this request.",
             Self::InternalError => "The gateway encountered an internal error.",
         }
     }
@@ -152,6 +157,7 @@ impl From<GatewayAuthError> for GatewayError {
             | GatewayAuthError::UnknownCredential
             | GatewayAuthError::InvalidCredential => Self::InvalidGatewayCredential,
             GatewayAuthError::ProviderDisabled => Self::ProviderDisabled,
+            GatewayAuthError::Busy => Self::ResourceExhausted,
             GatewayAuthError::Unavailable => Self::InternalError,
         }
     }
@@ -205,6 +211,7 @@ mod tests {
             (GatewayError::UpstreamConnectFailed, 502),
             (GatewayError::UpstreamTimeout, 504),
             (GatewayError::ConnectionLimitReached, 503),
+            (GatewayError::ResourceExhausted, 503),
             (GatewayError::InternalError, 500),
         ];
 
@@ -231,6 +238,7 @@ mod tests {
             GatewayError::UpstreamConnectFailed,
             GatewayError::UpstreamTimeout,
             GatewayError::ConnectionLimitReached,
+            GatewayError::ResourceExhausted,
             GatewayError::InternalError,
         ] {
             assert!(
@@ -263,6 +271,10 @@ mod tests {
         assert_eq!(
             GatewayError::from(GatewayAuthError::ProviderDisabled),
             GatewayError::ProviderDisabled
+        );
+        assert_eq!(
+            GatewayError::from(GatewayAuthError::Busy),
+            GatewayError::ResourceExhausted
         );
         assert_eq!(
             GatewayError::from(GatewayAuthError::Unavailable),

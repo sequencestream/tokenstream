@@ -9,6 +9,7 @@ const MAX_UPSTREAM_TIMEOUT_MS: u64 = 300_000;
 const MAX_IDLE_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_SHUTDOWN_TIMEOUT_MS: u64 = 300_000;
 const MAX_LOG_BATCH_INTERVAL_MS: u64 = 60_000;
+const MAX_DATABASE_TIMEOUT_MS: u64 = 60_000;
 const MAX_DATABASE_CONNECTIONS: usize = 1_024;
 const MAX_PROXY_CONNECTIONS: usize = 1_000_000;
 const MIN_HTTP_BUFFER_BYTES: usize = 1_024;
@@ -83,6 +84,12 @@ pub struct Config {
     log_batch_size: usize,
     log_batch_interval: Duration,
     password_max_concurrency: usize,
+    data_password_concurrency: usize,
+    admin_password_concurrency: usize,
+    auth_database_connections: usize,
+    auth_db_timeout: Duration,
+    admin_db_timeout: Duration,
+    log_db_timeout: Duration,
     data_max_connections: usize,
     admin_max_connections: usize,
     downstream_header_timeout: Duration,
@@ -160,7 +167,40 @@ impl Config {
             MAX_PROXY_CONNECTIONS,
         )?;
         let password_max_concurrency =
-            parse_optional(&mut get, "TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", 4, 1, 64)?;
+            parse_optional(&mut get, "TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", 4, 2, 64)?;
+        let admin_password_concurrency = parse_optional(
+            &mut get,
+            "TOKENSTREAM_ADMIN_PASSWORD_CONCURRENCY",
+            1,
+            1,
+            password_max_concurrency.saturating_sub(1),
+        )?;
+        let data_password_concurrency = password_max_concurrency - admin_password_concurrency;
+        let auth_database_connections = parse_optional(
+            &mut get,
+            "TOKENSTREAM_AUTH_DATABASE_CONNECTIONS",
+            database_max_connections.saturating_sub(1).clamp(1, 2),
+            1,
+            database_max_connections,
+        )?;
+        let auth_db_timeout = parse_optional_duration(
+            &mut get,
+            "TOKENSTREAM_AUTH_DB_TIMEOUT_MS",
+            1000,
+            MAX_DATABASE_TIMEOUT_MS,
+        )?;
+        let admin_db_timeout = parse_optional_duration(
+            &mut get,
+            "TOKENSTREAM_ADMIN_DB_TIMEOUT_MS",
+            5000,
+            MAX_DATABASE_TIMEOUT_MS,
+        )?;
+        let log_db_timeout = parse_optional_duration(
+            &mut get,
+            "TOKENSTREAM_LOG_DB_TIMEOUT_MS",
+            2000,
+            MAX_DATABASE_TIMEOUT_MS,
+        )?;
         let data_max_connections = parse_optional(
             &mut get,
             "TOKENSTREAM_DATA_MAX_CONNECTIONS",
@@ -268,6 +308,12 @@ impl Config {
             log_batch_size,
             log_batch_interval,
             password_max_concurrency,
+            data_password_concurrency,
+            admin_password_concurrency,
+            auth_database_connections,
+            auth_db_timeout,
+            admin_db_timeout,
+            log_db_timeout,
             data_max_connections,
             admin_max_connections,
             downstream_header_timeout,
@@ -279,6 +325,24 @@ impl Config {
 
     pub fn password_max_concurrency(&self) -> usize {
         self.password_max_concurrency
+    }
+    pub fn data_password_concurrency(&self) -> usize {
+        self.data_password_concurrency
+    }
+    pub fn admin_password_concurrency(&self) -> usize {
+        self.admin_password_concurrency
+    }
+    pub fn auth_database_connections(&self) -> usize {
+        self.auth_database_connections
+    }
+    pub fn auth_db_timeout(&self) -> Duration {
+        self.auth_db_timeout
+    }
+    pub fn admin_db_timeout(&self) -> Duration {
+        self.admin_db_timeout
+    }
+    pub fn log_db_timeout(&self) -> Duration {
+        self.log_db_timeout
     }
     pub fn data_max_connections(&self) -> usize {
         self.data_max_connections
@@ -476,6 +540,34 @@ fn parse_bounded(
         });
     }
     Ok(value)
+}
+
+fn parse_optional_duration(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+    default_ms: u64,
+    maximum: u64,
+) -> Result<Duration, ConfigError> {
+    let value = get(name).map_err(|_| ConfigError::Invalid {
+        name,
+        requirement: "must contain valid Unicode",
+    })?;
+    match value {
+        None => Ok(Duration::from_millis(default_ms)),
+        Some(value) => {
+            let milliseconds = value.parse::<u64>().map_err(|_| ConfigError::Invalid {
+                name,
+                requirement: "must be an integer number of milliseconds",
+            })?;
+            if !(MIN_TIMEOUT_MS..=maximum).contains(&milliseconds) {
+                return Err(ConfigError::Invalid {
+                    name,
+                    requirement: "is outside the supported timeout range",
+                });
+            }
+            Ok(Duration::from_millis(milliseconds))
+        }
+    }
 }
 
 fn parse_optional(
@@ -769,8 +861,13 @@ mod tests {
             ("TOKENSTREAM_LOG_QUEUE_CAPACITY", "1000001"),
             ("TOKENSTREAM_LOG_BATCH_SIZE", "0"),
             ("TOKENSTREAM_LOG_BATCH_INTERVAL_MS", "60001"),
-            ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "0"),
+            ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "1"),
             ("TOKENSTREAM_PASSWORD_MAX_CONCURRENCY", "65"),
+            ("TOKENSTREAM_ADMIN_PASSWORD_CONCURRENCY", "0"),
+            ("TOKENSTREAM_AUTH_DATABASE_CONNECTIONS", "0"),
+            ("TOKENSTREAM_AUTH_DB_TIMEOUT_MS", "0"),
+            ("TOKENSTREAM_ADMIN_DB_TIMEOUT_MS", "60001"),
+            ("TOKENSTREAM_LOG_DB_TIMEOUT_MS", "0"),
             ("TOKENSTREAM_DATA_MAX_CONNECTIONS", "4096"),
             ("TOKENSTREAM_ADMIN_MAX_CONNECTIONS", "0"),
             ("TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS", "0"),
@@ -789,6 +886,12 @@ mod tests {
         let config = load(&valid_values()).expect("valid configuration");
 
         assert_eq!(config.password_max_concurrency(), 4);
+        assert_eq!(config.data_password_concurrency(), 3);
+        assert_eq!(config.admin_password_concurrency(), 1);
+        assert_eq!(config.auth_database_connections(), 2);
+        assert_eq!(config.auth_db_timeout().as_millis(), 1000);
+        assert_eq!(config.admin_db_timeout().as_millis(), 5000);
+        assert_eq!(config.log_db_timeout().as_millis(), 2000);
         assert_eq!(config.admin_max_connections(), 128);
         assert_eq!(config.downstream_header_timeout().as_millis(), 10000);
         assert_eq!(config.admin_body_timeout().as_millis(), 30000);
@@ -809,6 +912,8 @@ mod tests {
         }
         let config = load(&explicit).expect("valid configuration");
         assert_eq!(config.password_max_concurrency(), 12);
+        assert_eq!(config.data_password_concurrency(), 11);
+        assert_eq!(config.admin_password_concurrency(), 1);
         assert_eq!(config.data_max_connections(), 5000);
         assert_eq!(config.admin_max_connections(), 64);
         assert_eq!(config.downstream_header_timeout().as_millis(), 1500);

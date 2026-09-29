@@ -9,8 +9,14 @@ pub struct PasswordWork {
     slots: Arc<Semaphore>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct PasswordWorkUnavailable;
+/// Why a password computation was not completed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PasswordWorkError {
+    /// No compute slot was available; admission never queues.
+    Busy,
+    /// The blocking task ended without a result.
+    Failed,
+}
 
 impl Default for PasswordWork {
     /// A self-contained budget. Independent components never share a default
@@ -28,7 +34,7 @@ impl PasswordWork {
         }
     }
 
-    pub async fn run<F, T>(&self, work: F) -> Result<T, PasswordWorkUnavailable>
+    pub async fn run<F, T>(&self, work: F) -> Result<T, PasswordWorkError>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -37,14 +43,14 @@ impl PasswordWork {
             .slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| PasswordWorkUnavailable)?;
+            .map_err(|_| PasswordWorkError::Busy)?;
         tokio::task::spawn_blocking(move || {
             // The computation owns admission even if its async caller is cancelled.
             let _permit = permit;
             work()
         })
         .await
-        .map_err(|_| PasswordWorkUnavailable)
+        .map_err(|_| PasswordWorkError::Failed)
     }
 }
 

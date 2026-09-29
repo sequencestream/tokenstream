@@ -1,7 +1,6 @@
 use tokenstream::admin::AdminApi;
 use tokenstream::config::Config;
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
-use tokenstream::persistence::Database;
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::proxy::gateway::Gateway;
 use tokenstream::telemetry::Metrics;
@@ -24,9 +23,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(root) = config.admin_static_root() {
         eprintln!("Administration page served from {}", root.display());
     }
-    let database = Database::connect(
+    let database = tokenstream::persistence::Database::connect_with_bounds(
         config.database_url().expose(),
-        config.database_max_connections(),
+        tokenstream::persistence::DatabaseBounds {
+            max_connections: config.database_max_connections(),
+            auth_connections: config.auth_database_connections(),
+            acquire_timeout: tokenstream::persistence::DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            auth_timeout: config.auth_db_timeout(),
+            admin_timeout: config.admin_db_timeout(),
+            log_timeout: config.log_db_timeout(),
+        },
     )
     .await?;
     let metrics = Metrics::default();
@@ -39,7 +45,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.log_batch_interval(),
         metrics.clone(),
     );
-    let password_work = tokenstream::crypto::PasswordWork::new(config.password_max_concurrency());
+    let data_password_work =
+        tokenstream::crypto::PasswordWork::new(config.data_password_concurrency());
+    let admin_password_work =
+        tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
     let mut admin_api = AdminApi::new(
         database.clone(),
         AesGcmCipher::new(config.master_key().expose()),
@@ -47,7 +56,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.development_mode(),
         config.admin_password_hash().expose().to_owned(),
     )
-    .with_runtime(&config, password_work.clone());
+    .with_runtime(&config, admin_password_work)
+    .with_metrics(metrics.clone());
     if let Some(root) = config.admin_static_root() {
         admin_api = admin_api.with_assets(root);
     }
@@ -59,7 +69,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         database.clone(),
         log_sink.clone(),
         metrics.clone(),
-        password_work,
+        data_password_work,
     );
     tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),

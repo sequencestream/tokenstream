@@ -189,6 +189,8 @@ impl crate::DataPlaneService for Gateway {
                     GatewayError::ProviderDisabled => Some(Category::ProviderDisabled),
                     GatewayError::UnsupportedRoute => Some(Category::UnsupportedRoute),
                     GatewayError::InvalidUpgrade => Some(Category::InvalidUpgrade),
+                    GatewayError::ResourceExhausted => Some(Category::ResourceExhausted),
+                    GatewayError::InternalError => Some(Category::InternalError),
                     _ => None,
                 };
                 if let Some(category) = category {

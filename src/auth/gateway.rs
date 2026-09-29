@@ -13,7 +13,8 @@
 //! any upstream is contacted and never carry credential, hash, or ciphertext
 //! material.
 
-use crate::crypto::PasswordWork;
+use crate::crypto::{PasswordWork, PasswordWorkError};
+use crate::persistence::{ProviderRepository, RepositoryError};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -25,7 +26,6 @@ use crate::crypto::{GatewaySecretVerifier, SecretCipher};
 use crate::domain::{
     GatewayCredential, MAX_GATEWAY_CREDENTIAL_LEN, ProtocolType, ProviderSnapshot, ProviderStatus,
 };
-use crate::persistence::ProviderRepository;
 
 /// Header carrying the gateway credential on Anthropic-native routes.
 const ANTHROPIC_CREDENTIAL_HEADER: &str = "x-api-key";
@@ -68,6 +68,8 @@ pub enum GatewayAuthError {
     ProviderDisabled,
     /// Storage or cryptographic infrastructure failed; authentication fails closed.
     Unavailable,
+    /// Compute or database capacity for this lookup is exhausted.
+    Busy,
 }
 
 impl fmt::Display for GatewayAuthError {
@@ -81,6 +83,7 @@ impl fmt::Display for GatewayAuthError {
             Self::InvalidCredential => "gateway credential is invalid",
             Self::ProviderDisabled => "provider is disabled",
             Self::Unavailable => "gateway authentication is unavailable",
+            Self::Busy => "gateway authentication is busy",
         };
         formatter.write_str(message)
     }
@@ -135,12 +138,11 @@ where
         let credential =
             GatewayCredential::parse(raw).map_err(|_| GatewayAuthError::MalformedCredential)?;
 
-        let provider = self
-            .repository
-            .find_by_key_id(credential.key_id())
-            .await
-            .map_err(|_| GatewayAuthError::Unavailable)?
-            .ok_or(GatewayAuthError::UnknownCredential)?;
+        let provider = match self.repository.find_by_key_id(credential.key_id()).await {
+            Ok(provider) => provider.ok_or(GatewayAuthError::UnknownCredential)?,
+            Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
+            Err(_) => return Err(GatewayAuthError::Unavailable),
+        };
 
         if source != native_source(provider.protocol_type()) {
             return Err(GatewayAuthError::ConflictingCredential);
@@ -152,12 +154,17 @@ where
         let verifier = self.verifier.clone();
         let secret = credential.secret().clone();
         let hash = provider.gateway_api_key_hash().clone();
-        let verified = self
+        let verified = match self
             .password_work
             .run(move || verifier.verify(&secret, &hash))
             .await
-            .map_err(|_| GatewayAuthError::Unavailable)?
-            .map_err(|_| GatewayAuthError::Unavailable)?;
+        {
+            Ok(Ok(verified)) => verified,
+            Ok(Err(_)) | Err(PasswordWorkError::Failed) => {
+                return Err(GatewayAuthError::Unavailable);
+            }
+            Err(PasswordWorkError::Busy) => return Err(GatewayAuthError::Busy),
+        };
         if !verified {
             return Err(GatewayAuthError::InvalidCredential);
         }

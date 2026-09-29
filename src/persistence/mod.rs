@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::future::Future;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -26,8 +27,51 @@ pub const MAX_REQUEST_LOG_PAGE_SIZE: usize = 100;
 ///
 /// The pool's connection count is the hard upper bound; this deadline keeps an
 /// exhausted pool from blocking an authentication lookup indefinitely. Exhaustion
-/// surfaces as [`RepositoryError::Storage`], a sanitized failure.
+/// and execution deadlines surface as [`RepositoryError::Timeout`].
 pub const DEFAULT_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connection split and execution deadlines for one database handle.
+///
+/// `auth_connections` smaller than `max_connections` reserves that many pooled
+/// connections for credential lookup. The remainder serves administration and
+/// logging. When the values are equal, both paths share one pool.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DatabaseBounds {
+    pub max_connections: usize,
+    pub auth_connections: usize,
+    pub acquire_timeout: Duration,
+    pub auth_timeout: Duration,
+    pub admin_timeout: Duration,
+    pub log_timeout: Duration,
+}
+
+impl DatabaseBounds {
+    /// A single shared pool whose acquire and execution deadlines match the
+    /// historical connection-wait bound. Tests that do not exercise isolation
+    /// or per-class deadlines use this layout.
+    pub fn for_tests(max_connections: usize) -> Self {
+        Self {
+            max_connections,
+            auth_connections: max_connections,
+            acquire_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            auth_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            admin_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+            log_timeout: DEFAULT_POOL_ACQUIRE_TIMEOUT,
+        }
+    }
+}
+
+/// Cancels `fut` when `deadline` elapses so a stuck query cannot occupy a
+/// caller or a pool slot indefinitely.
+pub(crate) async fn timed<T>(
+    deadline: Duration,
+    fut: impl Future<Output = Result<T, sqlx::Error>>,
+) -> Result<T, sqlx::Error> {
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(sqlx::Error::PoolTimedOut),
+    }
+}
 
 /// Storage backend selected from the configured database URL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,12 +104,20 @@ pub enum Database {
 impl Database {
     /// Connects to the backend selected from `database_url` with a bounded pool.
     pub async fn connect(database_url: &str, max_connections: usize) -> Result<Self, sqlx::Error> {
+        Self::connect_with_bounds(database_url, DatabaseBounds::for_tests(max_connections)).await
+    }
+
+    /// Connects with an explicit connection split and per-class execution deadlines.
+    pub async fn connect_with_bounds(
+        database_url: &str,
+        bounds: DatabaseBounds,
+    ) -> Result<Self, sqlx::Error> {
         match DatabaseBackend::from_url(database_url) {
             DatabaseBackend::Sqlite => Ok(Self::Sqlite(
-                SqliteDatabase::connect(database_url, max_connections).await?,
+                SqliteDatabase::connect_with_bounds(database_url, bounds).await?,
             )),
             DatabaseBackend::Postgres => Ok(Self::Postgres(
-                PostgresDatabase::connect(database_url, max_connections).await?,
+                PostgresDatabase::connect_with_bounds(database_url, bounds).await?,
             )),
         }
     }
@@ -483,6 +535,9 @@ pub enum RepositoryError {
     NoFieldsToUpdate,
     InvalidStoredData,
     Storage,
+    /// A pooled connection could not be acquired, or a query or transaction
+    /// exceeded its execution deadline.
+    Timeout,
 }
 
 impl fmt::Display for RepositoryError {
@@ -494,6 +549,7 @@ impl fmt::Display for RepositoryError {
             Self::NoFieldsToUpdate => "the change set named no writable field",
             Self::InvalidStoredData => "stored data is invalid",
             Self::Storage => "storage operation failed",
+            Self::Timeout => "storage operation timed out",
         };
         formatter.write_str(message)
     }

@@ -297,6 +297,7 @@ fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
         "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,
         "upstream_timeout" | "idle_timeout" => ProxyFailureCategory::UpstreamTimeout,
         "connection_limit_reached" => ProxyFailureCategory::ConnectionLimitReached,
+        "resource_exhausted" => ProxyFailureCategory::ResourceExhausted,
         "internal_error" => ProxyFailureCategory::InternalError,
         "stream_failed" => ProxyFailureCategory::StreamFailed,
         "downstream_cancelled" => ProxyFailureCategory::DownstreamCancelled,

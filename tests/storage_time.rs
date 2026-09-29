@@ -188,7 +188,7 @@ async fn sqlite_exhausted_pool_fails_closed() {
         .await;
     assert_eq!(
         result.expect_err("exhausted pool fails closed"),
-        RepositoryError::Storage
+        RepositoryError::Timeout
     );
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(held);
@@ -224,7 +224,7 @@ async fn postgres_exhausted_pool_fails_closed() {
         .await;
     assert_eq!(
         result.expect_err("exhausted pool fails closed"),
-        RepositoryError::Storage
+        RepositoryError::Timeout
     );
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(held);
