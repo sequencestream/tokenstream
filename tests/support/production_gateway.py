@@ -239,8 +239,9 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
         for peer in stalled:
             peer.close()
 
-    sock, stream = websocket(data_port, credential)
-    opened += [stream, sock]
+    # Held streams occupy slots first. A WebSocket opened before this loop sits
+    # idle across sequential Argon2 admissions, and those can exceed the stream
+    # idle deadline at the larger capacity before the ping below is sent.
     held = []
     for _ in range(capacity - 2):
         connection = http.client.HTTPConnection('127.0.0.1', data_port, timeout=4)
@@ -250,6 +251,8 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
         assert response.read(3) == SSE[:3]
         opened += [response, connection]
         held.append((response, connection))
+    sock, stream = websocket(data_port, credential)
+    opened += [stream, sock]
     # Leave one proxy slot for authentication and saturate the independent password budget.
     barrier = threading.Barrier(17)
     def authenticate(index):
@@ -473,7 +476,7 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
                       PASSWORD_MAX_CONCURRENCY='2', HTTP_BUFFER_BYTES='1024',
                       DOWNSTREAM_HEADER_TIMEOUT_MS='500', ADMIN_BODY_TIMEOUT_MS='200',
                       UPSTREAM_CONNECT_TIMEOUT_MS='1500', UPSTREAM_HEADER_TIMEOUT_MS='200',
-                      STREAM_IDLE_TIMEOUT_MS='30000')
+                      STREAM_IDLE_TIMEOUT_MS='180000')
     env = dict(os.environ, **{f'TOKENSTREAM_{key}': value for key, value in values.items()})
     env['SSL_CERT_FILE'] = str(directory / 'trusted.pem')
     env['SSL_CERT_DIR'] = str(directory / 'empty-roots')
