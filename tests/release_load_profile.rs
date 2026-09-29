@@ -105,7 +105,7 @@ fn rss_kib() -> u64 {
             .expect("resident pages")
             .parse()
             .expect("numeric resident pages");
-        return resident_pages * 4;
+        resident_pages * 4
     }
     #[cfg(not(target_os = "linux"))]
     {
