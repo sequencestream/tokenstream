@@ -24,6 +24,7 @@ use crate::telemetry::{Metrics, ProxyFailureCategory};
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod credentials;
 pub mod crypto;
 pub mod domain;
 pub mod local_state;

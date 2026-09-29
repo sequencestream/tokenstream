@@ -1,11 +1,15 @@
 //! Concurrent provider administration contracts.
 //!
 //! These tests pin the observable outcome of interleaved administrative
-//! writes. A configuration edit names only the fields it supplies, so a
-//! rotation or a status change committed while that edit was in flight must
-//! survive it. The same interleaving must produce the same result on both
-//! supported storage backends, which is why the contract is written once
-//! against the repository contract and run against SQLite and PostgreSQL.
+//! writes. A configuration edit names only the fields it supplies, so a status
+//! change committed while that edit was in flight must survive it. The same
+//! interleaving must produce the same result on both supported storage
+//! backends, which is why the contract is written once against the repository
+//! contract and run against SQLite and PostgreSQL.
+//!
+//! A provider holds no credential material at all, so there is no rotation to
+//! race here; rotation lives with the account that owns the credential and is
+//! pinned by the credential rotation contract instead.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -13,9 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{TimeZone, Utc};
-use tokenstream::domain::{
-    GatewayKeyId, PasswordHash, ProtocolType, ProviderId, ProviderStatus, SecretCiphertext,
-};
+use tokenstream::domain::{ProtocolType, ProviderId, ProviderStatus, SecretCiphertext};
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{NewProvider, ProviderRepository, ProviderUpdate, RepositoryError};
@@ -38,8 +40,6 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
         ProtocolType::OpenAi,
         Url::parse(&format!("https://provider-{number}.example.com/base")).expect("valid endpoint"),
         SecretCiphertext::new(format!("ciphertext-{number}")),
-        GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID"),
-        PasswordHash::new(format!("hash-{number}")),
         ProviderStatus::Enabled,
         Utc.timestamp_opt(1_789_000_000 + number as i64 * 60, 0)
             .single()
@@ -98,74 +98,11 @@ async fn verify_interleaving_contract<R>(repository: &R, prefix: &str)
 where
     R: ProviderRepository + Clone + Send + Sync + 'static,
 {
-    // An edit that races a rotation keeps the rotated key material. The
-    // rotation is the security-relevant write: a late configuration edit must
-    // not resurrect the retired credential, whichever statement lands second.
-    for round in 0..12 {
-        let provider = repository
-            .create(new_provider(prefix, 100 + round))
-            .await
-            .expect("create provider for edit/rotation race");
-        let rotated_key =
-            GatewayKeyId::new(format!("{prefix}-rotated-{round}")).expect("non-empty key ID");
-        let rotated_hash = PasswordHash::new(format!("{prefix}-rotated-hash-{round}"));
-        let expected_hash = rotated_hash.clone();
-        let expected_key = rotated_key.clone();
-
-        let barrier = Barrier::new(2);
-        let edit_repository = repository.clone();
-        let rotate_repository = repository.clone();
-        let edit_barrier = Arc::clone(&barrier);
-        let id = provider.id();
-        let edit = async move {
-            edit_barrier.arrive_and_wait().await;
-            edit_repository
-                .update(id, rename(prefix, round))
-                .await
-                .expect("rename during rotation")
-        };
-        let rotate = async move {
-            barrier.arrive_and_wait().await;
-            rotate_repository
-                .rotate_gateway_key(id, rotated_key, rotated_hash)
-                .await
-                .expect("rotate during rename")
-        };
-        let (_edited, _rotated) = tokio::join!(edit, rotate);
-
-        let stored = repository
-            .find_by_id(provider.id())
-            .await
-            .expect("reload provider")
-            .expect("provider still exists");
-        assert_eq!(
-            stored.gateway_key_id(),
-            &expected_key,
-            "an edit must never restore the retired gateway key"
-        );
-        assert_eq!(
-            stored.gateway_api_key_hash().expose(),
-            expected_hash.expose()
-        );
-        assert_eq!(stored.name(), renamed_name(prefix, round));
-        assert!(
-            repository
-                .find_by_key_id(
-                    &GatewayKeyId::new(format!("{prefix}-key-{}", 100 + round))
-                        .expect("non-empty key ID")
-                )
-                .await
-                .expect("retired key lookup")
-                .is_none(),
-            "the retired gateway key must stop resolving"
-        );
-    }
-
     // An edit that races a disable keeps the disable, and never re-enables the
     // provider because the edit did not name the status field.
     for round in 0..12 {
         let provider = repository
-            .create(new_provider(prefix, 200 + round))
+            .create(new_provider(prefix, 100 + round))
             .await
             .expect("create provider for edit/disable race");
         let barrier = Barrier::new(2);
@@ -215,11 +152,11 @@ where
     // the same field resolve to the last statement the database committed, and
     // the row is never left half-applied.
     let provider = repository
-        .create(new_provider(prefix, 300))
+        .create(new_provider(prefix, 200))
         .await
         .expect("create provider for disjoint field edits");
     repository
-        .update(provider.id(), rename(prefix, 300))
+        .update(provider.id(), rename(prefix, 200))
         .await
         .expect("first field edit");
     repository
@@ -236,7 +173,7 @@ where
         .await
         .expect("reload provider")
         .expect("provider still exists");
-    assert_eq!(stored.name(), renamed_name(prefix, 300));
+    assert_eq!(stored.name(), renamed_name(prefix, 200));
     assert_eq!(stored.status(), ProviderStatus::Disabled);
     assert_eq!(
         stored.upstream_api_key_ciphertext().expose(),
@@ -245,7 +182,7 @@ where
     assert_eq!(stored.protocol_type(), ProtocolType::OpenAi);
     assert_eq!(
         stored.endpoint().as_str(),
-        "https://provider-300.example.com/base"
+        "https://provider-200.example.com/base"
     );
 
     // A same-field race is last-commit-wins on both backends: whichever
@@ -286,7 +223,7 @@ where
         .expect("reload provider")
         .expect("provider still exists");
     assert_eq!(stored.status(), ProviderStatus::Enabled);
-    assert_eq!(stored.name(), renamed_name(prefix, 300));
+    assert_eq!(stored.name(), renamed_name(prefix, 200));
 }
 
 async fn sqlite_database(path: &Path) -> SqliteDatabase {
@@ -299,7 +236,7 @@ async fn sqlite_database(path: &Path) -> SqliteDatabase {
 }
 
 #[tokio::test]
-async fn sqlite_concurrent_edits_never_overlap_a_rotation_or_a_disable() {
+async fn sqlite_concurrent_edits_never_overlap_a_disable() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("concurrent-edit.db")).await;
     let prefix = unique_value("sqlite-concurrent-edit");
@@ -307,7 +244,7 @@ async fn sqlite_concurrent_edits_never_overlap_a_rotation_or_a_disable() {
 }
 
 #[tokio::test]
-async fn postgres_concurrent_edits_never_overlap_a_rotation_or_a_disable() {
+async fn postgres_concurrent_edits_never_overlap_a_disable() {
     let url = require_postgres_url("the PostgreSQL concurrent administration layer");
     let database = PostgresDatabase::connect(&url, 4)
         .await

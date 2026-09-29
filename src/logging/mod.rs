@@ -290,6 +290,8 @@ impl RequestLogLifecycle {
     ) -> Self {
         let _ = sink.try_emit(LogEvent::Started(RequestLogStarted::new(
             request_id.clone(),
+            snapshot.account_id(),
+            snapshot.api_key_id(),
             snapshot.id(),
             snapshot.protocol_type(),
             route.transport(),

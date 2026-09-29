@@ -2,15 +2,15 @@
 
 ## Purpose
 
-Validate and persist provider configuration, issue and rotate gateway credentials, encrypt upstream keys, and supply the records authentication turns into snapshots.
+Validate and persist provider configuration, encrypt upstream keys, and supply the provider records authentication selects from a credential's bindings.
 
 ## Design
 
-A provider is the unit of upstream identity: name, protocol type, endpoint, encrypted upstream key, gateway-key identifier, secret hash, and status. Persistence records that contain secrets stay internal; administration sees redacted representations ([ADR 0008](../adr/0008-secret-and-credential-model.md)).
+A provider is the unit of upstream identity: name, protocol type, endpoint, encrypted upstream key, and status. It issues no credentials and holds no credential material ([ADR 0013](../adr/0013-account-owned-data-plane-credentials.md)); a credential refers to a provider through its bindings, and the reference lives on the credential side. Persistence records that contain secrets stay internal; administration sees redacted representations ([ADR 0008](../adr/0008-secret-and-credential-model.md)).
 
-There is no application-level credential cache ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md)). Each new request looks up its key identifier directly. Control-plane writes are transactional and never mutate a snapshot already held by an active stream.
+There is no application-level credential cache ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md)). Each new request resolves its provider through the credential it presented. Control-plane writes are transactional and never mutate a snapshot already held by an active stream.
 
-Request logs pin providers ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)). Delete is restricted; disable is the normal retirement. HTTPS endpoints are required except in explicit development mode.
+Request logs and credential bindings both pin providers ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)). Delete is restricted; disable is the normal retirement. HTTPS endpoints are required except in explicit development mode.
 
 SQLite and PostgreSQL must behave equivalently for uniqueness, cursors, and delete restriction.
 
@@ -24,20 +24,21 @@ sequenceDiagram
     participant Auth as Authentication
 
     Admin->>P: Create
-    P->>P: Validate, generate key-id and secret, hash, encrypt
+    P->>P: Validate and encrypt the upstream key
     P->>Store: Insert one transaction
     Store-->>P: Persisted row
-    P-->>Admin: Redacted provider plus credential once
+    P-->>Admin: Redacted provider
 
-    Admin->>P: Rotate
-    P->>Store: Replace identifier and hash atomically
-    Store-->>P: Committed
-    P-->>Admin: New credential once
-    Note over Auth: New requests with the old credential fail
+    Admin->>P: Edit
+    P->>P: Validate, re-encrypt a changed upstream key
+    P->>Store: Write only the named fields
+    Store-->>P: Reloaded row
+    P-->>Admin: Redacted provider
+    Note over Auth: New requests see the edit
     Note over Auth: Admitted streams keep their snapshots
 
     Admin->>P: Delete
-    alt Log rows reference the provider
+    alt Logs or credential bindings reference the provider
         P-->>Admin: 409 provider_in_use
     else Unreferenced
         P->>Store: Delete
@@ -45,20 +46,22 @@ sequenceDiagram
     end
 ```
 
-If the create or rotate response is lost, the secret cannot be recovered. The administrator rotates again.
+A provider edit never touches a credential. Rotating a gateway credential is a credential operation owned by the account that holds it, and is described in the [administration design](./administration.md).
 
-Disable sets status to disabled and commits. Edit of endpoint or upstream key validates and persists atomically. Existing streams retain the prior snapshot in both cases.
+Disable sets status to disabled and commits. A disabled provider is still selectable configuration — a credential bound to it keeps resolving to it, so the failure is `provider_disabled` at authentication time rather than a missing selection. Edit of endpoint or upstream key validates and persists atomically. Existing streams retain the prior snapshot in both cases.
 
 ## Invariants
 
-- The full gateway credential appears only at creation or rotation. Later reads omit it. Upstream-key updates are write-only.
 - Ciphertext and password hashes never appear in API responses.
 - Decrypted keys exist only in short-lived snapshot wrappers.
 - A referenced provider cannot be deleted.
-- Name and gateway-key identifier uniqueness is enforced by storage, identically on both engines.
+- A provider carries no credential material of its own, so no provider record can leak a credential.
+- Name uniqueness is enforced by storage, identically on both engines.
+- Only an administrator may write a provider.
 
 ## Failures and bounds
 
 - Invalid protocol types, statuses, or endpoints fail before persistence.
 - Uniqueness violations fail the write.
-- Hashing for issuance and rotation uses the control-plane budget so it cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
+- Encryption runs on the control plane and never inside the data-plane request path.
+- The number of providers bound to one credential is bounded, so resolving a provider is not an unbounded scan.

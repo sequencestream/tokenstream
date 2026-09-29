@@ -1,12 +1,16 @@
 use hyper::header::{AUTHORIZATION, HeaderValue};
 use hyper::{HeaderMap, Method};
 use tokenstream::auth::{GatewayAuthError, GatewayAuthenticator};
+use tokenstream::credentials::CredentialService;
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::domain::{
     ProtocolType, ProviderAdminView, ProviderStatus, RequestId, SecretString,
 };
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::providers::{CreateProviderRequest, ProviderService, UpdateProviderRequest};
+
+mod support;
+use support::{bootstrap_account, issue_api_key};
 use tokenstream::proxy::error::GatewayError;
 use tokenstream::routing::{RouteError, resolve_route};
 use tokenstream::telemetry::{Metrics, ProxyFailureCategory};
@@ -46,12 +50,8 @@ async fn security_gate_keeps_secrets_out_and_closes_new_access_after_policy_chan
         .expect("connect SQLite");
     database.migrate().await.expect("migrate SQLite");
 
-    let service = ProviderService::new(
-        database.clone(),
-        AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
-        false,
-    );
+    let service = ProviderService::new(database.clone(), AesGcmCipher::new(&MASTER_KEY), false);
+    let accounts = CredentialService::new(database.clone(), Argon2GatewaySecretVerifier::new());
     let authenticator = GatewayAuthenticator::new(
         database,
         AesGcmCipher::new(&MASTER_KEY),
@@ -68,11 +68,25 @@ async fn security_gate_keeps_secrets_out_and_closes_new_access_after_policy_chan
         ))
         .await
         .expect("create provider");
-    let provider_id = created.provider().id();
-    let original_credential = created.gateway_credential().render();
+    let provider_id = created.id();
+    let account = bootstrap_account(&accounts).await;
+    let issued = issue_api_key(&accounts, account.id(), vec![provider_id]).await;
+    let original_credential = issued.credential().render();
+    let api_key_id = issued.api_key().api_key().id();
 
-    let admin_json = serde_json::to_string(&ProviderAdminView::from(created.provider()))
+    let admin_json = serde_json::to_string(&ProviderAdminView::from(&created))
         .expect("serialize redacted administration view");
+    let key_json = serde_json::to_string(&tokenstream::domain::ApiKeyAdminView::new(
+        issued.api_key().api_key(),
+        issued.api_key().bindings(),
+    ))
+    .expect("serialize redacted credential view");
+    for forbidden in [UPSTREAM_SECRET, "ciphertext", "secret_hash"] {
+        assert!(
+            !key_json.contains(forbidden),
+            "credential response leaked {forbidden}"
+        );
+    }
     for forbidden in [UPSTREAM_SECRET, "ciphertext", "gateway_api_key_hash"] {
         assert!(
             !admin_json.contains(forbidden),
@@ -134,8 +148,8 @@ async fn security_gate_keeps_secrets_out_and_closes_new_access_after_policy_chan
         )
         .await
         .expect("re-enable provider");
-    let rotated = service
-        .rotate_gateway_credential(provider_id)
+    let rotated = accounts
+        .rotate_api_key(api_key_id)
         .await
         .expect("rotate credential");
     assert_eq!(
@@ -146,7 +160,29 @@ async fn security_gate_keeps_secrets_out_and_closes_new_access_after_policy_chan
         GatewayAuthError::UnknownCredential
     );
     authenticator
-        .authenticate(&bearer(&rotated.gateway_credential().render()))
+        .authenticate(&bearer(&rotated.credential().render()))
         .await
         .expect("new credential authenticates");
+
+    // Disabling the owning account closes every credential it holds, which a
+    // provider status change could never do on its own. The bootstrap account
+    // is protected, so a second account owns this credential.
+    let (owner, _) = support::create_user_account(&accounts, "security-user").await;
+    let owned = issue_api_key(&accounts, owner.id(), vec![provider_id]).await;
+    let owned_credential = owned.credential().render();
+    accounts
+        .update_account(
+            owner.id(),
+            tokenstream::credentials::UpdateAccountRequest::new()
+                .with_status(tokenstream::domain::AccountStatus::Disabled),
+        )
+        .await
+        .expect("disable the account");
+    assert_eq!(
+        authenticator
+            .authenticate(&bearer(&owned_credential))
+            .await
+            .expect_err("a credential of a disabled account is rejected"),
+        GatewayAuthError::AccountDisabled
+    );
 }

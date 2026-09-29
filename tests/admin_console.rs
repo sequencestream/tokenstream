@@ -15,6 +15,7 @@ use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::telemetry::Metrics;
 
+const ADMIN_NAME: &str = "admin";
 const PASSWORD: &str = "correct horse battery staple";
 const MASTER_KEY: [u8; 32] = [0x53; 32];
 
@@ -44,17 +45,22 @@ async fn api(development: bool, page: Option<AdminAssets>) -> Api {
         )
         .expect("hash password")
         .to_string();
-    let mut api = AdminApi::new(
+    let api = AdminApi::new(
         database,
         AesGcmCipher::new(&MASTER_KEY),
         Argon2GatewaySecretVerifier::new(),
         development,
         hash,
     );
-    if let Some(page) = page {
-        api = api.with_assets(page);
+    // The control plane signs in as an account, so a deployment has to have one
+    // before any session can be established.
+    api.ensure_bootstrap_account(ADMIN_NAME, PASSWORD)
+        .await
+        .expect("create the bootstrap account");
+    match page {
+        Some(page) => api.with_assets(page),
+        None => api,
     }
-    api
 }
 
 async fn send(api: &Api, method: Method, path: &str) -> (StatusCode, hyper::HeaderMap, Bytes) {
@@ -81,7 +87,7 @@ async fn sign_in(api: &Api) -> String {
         .uri("/admin/api/session")
         .header(CONTENT_TYPE, "application/json")
         .body(http_body_util::Full::new(Bytes::from(
-            json!({"password": PASSWORD}).to_string(),
+            json!({"name": ADMIN_NAME, "password": PASSWORD}).to_string(),
         )))
         .expect("request");
     let response = api.handle(request, Metrics::default()).await;

@@ -17,7 +17,9 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, RequestId, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, RequestId, SecretString,
+};
 use tokenstream::logging::{LogEvent, LogStore, channel};
 use tokenstream::persistence::RepositoryError;
 use tokenstream::proxy::admission::ProxyLimits;
@@ -78,6 +80,8 @@ fn limits() -> ProxyLimits {
 
 fn snapshot(upstream: SocketAddr) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         ProtocolType::OpenAi,
         Url::parse(&format!("http://{upstream}/provider-prefix")).expect("upstream URL"),

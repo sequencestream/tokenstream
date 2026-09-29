@@ -63,6 +63,12 @@ pub fn setting_catalog() -> &'static [SettingSpec] {
             secret: true,
         },
         SettingSpec {
+            name: "TOKENSTREAM_BOOTSTRAP_ACCOUNT",
+            label: "Bootstrap account name",
+            restart_required: true,
+            secret: false,
+        },
+        SettingSpec {
             name: "TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS",
             label: "Upstream connect timeout (ms)",
             restart_required: true,
@@ -367,6 +373,24 @@ pub fn encode_master_key(key: &[u8; 32]) -> String {
         encoded.push_str(&format!("{byte:02x}"));
     }
     encoded
+}
+
+/// Generates a password for the bootstrap account when the configured hash's
+/// plaintext is not recoverable.
+///
+/// The value is shown once and never stored, so the operator sets their own
+/// immediately afterwards.
+pub fn generate_admin_password() -> Result<String, ConfigError> {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    let mut random = [0_u8; 18];
+    getrandom::getrandom(&mut random).map_err(|_| ConfigError::Invalid {
+        name: "TOKENSTREAM_ADMIN_PASSWORD",
+        requirement: "could not generate a bootstrap account password",
+    })?;
+    Ok(random
+        .iter()
+        .map(|byte| ALPHABET[usize::from(*byte) % ALPHABET.len()] as char)
+        .collect())
 }
 
 pub fn hash_admin_password(password: &str) -> Result<String, ConfigError> {

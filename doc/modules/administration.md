@@ -2,13 +2,19 @@
 
 ## Purpose
 
-Serve the control plane: a single administrator session, provider and request-log APIs, and the administration page compiled into the process.
+Serve the control plane: account sessions with a role gate, account, credential, provider, and request-log APIs, and the administration page compiled into the process.
 
 ## Design
 
 The page and the API share one origin ([ADR 0009](../adr/0009-same-origin-administration.md), [ADR 0002](../adr/0002-dual-planes-in-one-process.md)). The control-plane listener serves the compiled entry document and its own assets from the process. There is no second origin and no cross-site cookie exception.
 
-The control plane authenticates one administrator from a password hash supplied at deployment or created from the documented default. Sessions are short-lived HTTP-only same-site cookies, also marked secure on a secure origin. State-changing endpoints require CSRF protection. Every administration API path stays behind the session. The page itself is served before a session exists, because it must load in order to offer sign-in.
+The control plane authenticates accounts, not a process-wide passphrase ([ADR 0012](../adr/0012-account-sessions-and-two-roles.md)). Sign-in takes a name and a password, verifies the stored hash, and establishes a short-lived HTTP-only same-site session, also marked secure on a secure origin. State-changing endpoints require CSRF protection. Every administration API path stays behind the session. The page itself is served before a session exists, because it must load in order to offer sign-in.
+
+The **bootstrap administrator** is the account that exists before any other, created from the configured administrator credentials when the store holds no account. It owns the credentials that predate accounts, and it can be neither disabled nor demoted, so a deployment always retains a way back into its own accounts.
+
+**Authorization is decided once per request**, from the session's account and role, before the route handler runs. A regular user reaches only its own credentials and its own request logs. Accounts, providers, and process settings are administrator surfaces, and a regular user receives `403` on them rather than a `404` that would hide the resource's existence. A regular user naming another account on a write receives `403`; naming a non-existent account receives `404`.
+
+The page renders only the surfaces the signed-in role may reach, so a regular user never sees a control it cannot use. Hiding is presentation, not enforcement: the API decides, and the page follows.
 
 Process settings are listed and updated through the administration API and shown as a table on the page ([ADR 0011](../adr/0011-defaulted-local-settings.md)). Secret settings are write-only. Password and master-key changes apply immediately; listen addresses and other bind-time settings persist and apply on the next start.
 
@@ -24,31 +30,48 @@ Public paths and bodies are in the [architecture document](../architecture.md). 
 sequenceDiagram
     participant B as Browser
     participant C as ControlPlane
+    participant G as Role gate
     participant P as Providers
+    participant K as Credentials
     participant Logs as RequestLogs
 
     B->>C: GET page
     C-->>B: Entry document, no session required
-    B->>C: POST session with password
-    alt Invalid password or hashing exhausted
+    B->>C: POST session with name and password
+    alt Unknown account, invalid password, or hashing exhausted
         C-->>B: Authentication failure
     else Valid
-        C-->>B: Session cookie
-        B->>C: Create or rotate provider
-        C->>P: CSRF-checked write
-        P-->>C: Redacted provider, credential once
-        C-->>B: no-store JSON
-        B->>C: Read or change process settings
-        C-->>B: Redacted settings table, no-store JSON
-        B->>C: Query logs with applied filters and cursor
-        C->>Logs: id greater than after_id, same filters
-        Logs-->>C: items and next_after_id
-        C-->>B: no-store JSON
-        opt Operator edits filters without applying
-            Note over B: Displayed rows and cursor stay on the applied set
-        end
-        opt Operator applies or clears filters
-            B->>C: Restart list from the beginning
+        C-->>B: Session cookie, account name, and role
+        B->>C: Any administration request
+        C->>G: Resolve account and role
+        alt Role does not reach the surface
+            G-->>B: 403
+        else Allowed
+            G-->>C: Continue
+            B->>C: Create or rotate a credential
+            C->>K: CSRF-checked write, owner-checked
+            K-->>C: Redacted credential, plaintext once
+            C-->>B: no-store JSON
+            opt Regular user names another account
+                C-->>B: 403
+            end
+            opt Administrator edits a provider
+                C->>P: CSRF-checked write
+                P-->>C: Redacted provider
+                C-->>B: no-store JSON
+            end
+            B->>C: Read or change process settings
+            C-->>B: Redacted settings table, no-store JSON
+            B->>C: Query logs with applied filters and cursor
+            C->>Logs: id greater than after_id, same filters
+            Logs-->>C: items and next_after_id
+            C-->>B: no-store JSON
+            opt Operator edits filters without applying
+                Note over B: Displayed rows and cursor stay on the applied set
+            end
+            opt Operator applies or clears filters
+                B->>C: Restart list from the beginning
+            end
         end
     end
 ```
@@ -59,7 +82,11 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 
 - The page never receives upstream secrets, gateway secrets after initial creation, password hashes, encryption material, or master-key plaintext.
 - A half-edited filter form never combines one condition set with another set's cursor.
-- Provider deletion that is blocked by log association returns `409` with `provider_in_use` and directs the administrator to disable.
+- Provider deletion that is blocked by log or binding association returns `409` with `provider_in_use` and directs the administrator to disable.
+- Authorization is decided from the session before dispatch. A handler never decides whether the caller may reach it.
+- A regular user reads and writes only its own credentials and sees only its own request logs.
+- Disabling an account stops its new data-plane traffic immediately; already admitted streams keep running.
+- A credential's plaintext is returned exactly once, at creation and at rotation, to whichever account owns it.
 - Control-plane hashing and database work use the reserved control-plane budgets so a burst of sign-ins or rotations cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 - Hashed page assets may cache long-lived. The entry document does not, so a replaced binary is picked up on the next navigation.
 
@@ -67,6 +94,8 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 
 - Missing or expired sessions fail authentication. Invalid CSRF protection fails the state-changing request.
 - General request rate limiting is out of scope. Connection cap, body timeout, hashing budget, and database deadlines are process bounds, not an application limiter.
+- Credential binding sets and account lists are bounded, so a write that names an oversized set is rejected before persistence.
+- The active session count is bounded, so a sign-in burst fails with a capacity error rather than growing the map.
 - Browser acceptance of reachability, sign-in, restoration, credential handling, expiry, and sign-out is a release check, both against the control-plane hosted page and against the development-server proxy.
 
 ## Page presentation

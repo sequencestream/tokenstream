@@ -21,7 +21,9 @@ use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, StatusCode};
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::error::GatewayError;
 use tokenstream::proxy::http::HttpProxy;
 use tokenstream::routing::{ResolvedRoute, resolve_route};
@@ -216,6 +218,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn snapshot(endpoint: SocketAddr) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         ProtocolType::OpenAi,
         Url::parse(&format!("http://{endpoint}")).expect("valid endpoint"),

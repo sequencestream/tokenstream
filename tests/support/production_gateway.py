@@ -259,7 +259,7 @@ def runtime_bounds(data_port, admin_port, credential, auth, capacity, opened, pr
         barrier.wait(timeout=5)
         if index % 2:
             password = 'test-admin' if index % 4 == 1 else 'wrong-password'
-            return exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'password': password}).encode())[0]
+            return exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'name': 'admin', 'password': password}).encode())[0]
         return exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0]
     with concurrent.futures.ThreadPoolExecutor(max_workers=16) as executor:
         futures = [executor.submit(authenticate, index) for index in range(16)]
@@ -294,7 +294,8 @@ def start(directory, name, master_key, development=True):
     values = {
         'DATA_LISTEN_ADDR': f'127.0.0.1:{data_port}', 'ADMIN_LISTEN_ADDR': f'127.0.0.1:{admin_port}',
         'DATABASE_URL': f'sqlite://{directory / (name + ".db")}', 'MASTER_KEY': master_key,
-        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'DEVELOPMENT_MODE': str(development).lower(),
+        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'ADMIN_PASSWORD': 'test-admin',
+        'DEVELOPMENT_MODE': str(development).lower(),
         'UPSTREAM_CONNECT_TIMEOUT_MS': '500', 'UPSTREAM_HEADER_TIMEOUT_MS': '1500',
         'STREAM_IDLE_TIMEOUT_MS': '10000', 'SHUTDOWN_DRAIN_TIMEOUT_MS': '150', 'LOG_FLUSH_TIMEOUT_MS': '1000',
         'DATABASE_MAX_CONNECTIONS': '4', 'MAX_PROXY_CONNECTIONS': '2', 'HTTP_BUFFER_BYTES': '65536',
@@ -315,6 +316,56 @@ def start(directory, name, master_key, development=True):
     return process, data_port, admin_port
 
 
+def credentials(name, password):
+    """The sign-in body a control plane expects: a named account and a password."""
+    return {'name': name, 'password': password}
+
+
+def sign_in(admin_port):
+    """Signs in as the bootstrap administrator and returns its session headers."""
+    status, headers, body = exchange(
+        admin_port, 'POST', '/admin/api/session', json.dumps(credentials('admin', 'test-admin')).encode())
+    assert status == 200, body
+    return {'Cookie': headers['set-cookie'].split(';')[0],
+            'x-csrf-token': json.loads(body)['csrf_token'],
+            'content-type': 'application/json'}
+
+
+def create_provider(admin_port, auth, name, protocol, endpoint):
+    """Creates a provider, which now issues no credential of its own."""
+    body = json.dumps(dict(name=name, protocol_type=protocol, endpoint=endpoint,
+                           upstream_api_key='upstream-secret', status='enabled')).encode()
+    status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', body, auth)
+    assert status == 201, response
+    return json.loads(response)['id']
+
+
+def issue_credential(admin_port, auth, account_id, provider_id, name):
+    """Issues a credential owned by an account and bound to a provider."""
+    body = json.dumps(dict(account_id=account_id, name=name, provider_ids=[provider_id],
+                           default_provider_id=provider_id, status='enabled')).encode()
+    status, _, response = exchange(admin_port, 'POST', '/admin/api/api-keys', body, auth)
+    assert status == 201, response
+    return json.loads(response)['api_key_secret']
+
+
+def owning_account_id(admin_port, auth):
+    """The bootstrap account's identifier, which owns every issued credential."""
+    status, _, response = exchange(admin_port, 'GET', '/admin/api/accounts?limit=100', None, auth)
+    assert status == 200, response
+    for account in json.loads(response)['items']:
+        if account['is_bootstrap']:
+            return account['id']
+    raise AssertionError('the bootstrap account was not listed')
+
+
+def provider_credential(admin_port, auth, name, protocol, endpoint):
+    """A provider plus a bootstrap-owned credential that reaches only it."""
+    provider_id = create_provider(admin_port, auth, name, protocol, endpoint)
+    credential = issue_credential(admin_port, auth, owning_account_id(admin_port, auth), provider_id, name)
+    return provider_id, credential
+
+
 def stored_key_recovery(directory, plain):
     """A stored provider stays usable after a restart under the same master key.
 
@@ -325,15 +376,9 @@ def stored_key_recovery(directory, plain):
     """
     first, data_port, admin_port = start(directory, 'recovery-first', '22' * 32)
     try:
-        status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', b'{"password":"test-admin"}')
-        assert status == 200, body
-        auth = {'Cookie': headers['set-cookie'].split(';')[0], 'x-csrf-token': json.loads(body)['csrf_token'], 'content-type': 'application/json'}
-        created = json.dumps(dict(name='recovery', protocol_type='openai',
-                                  endpoint=f'http://127.0.0.1:{plain.server_port}/prefix',
-                                  upstream_api_key='upstream-secret', status='enabled')).encode()
-        status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', created, auth)
-        assert status == 201, response
-        credential = json.loads(response)['gateway_api_key']
+        auth = sign_in(admin_port)
+        _, credential = provider_credential(
+            admin_port, auth, 'recovery', 'openai', f'http://127.0.0.1:{plain.server_port}/prefix')
         assert exchange(data_port, 'POST', '/v1/responses', PAYLOAD, {'authorization': 'Bearer ' + credential})[0] == 200
     finally:
         first.send_signal(signal.SIGINT)
@@ -360,15 +405,9 @@ def shutdown_by_signal(directory, plain, stop, label):
     process, data_port, admin_port = start(directory, f'shutdown-{label}', '22' * 32)
     opened = []
     try:
-        status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', b'{"password":"test-admin"}')
-        assert status == 200, body
-        auth = {'Cookie': headers['set-cookie'].split(';')[0], 'x-csrf-token': json.loads(body)['csrf_token'], 'content-type': 'application/json'}
-        created = json.dumps(dict(name=f'shutdown-{label}', protocol_type='openai',
-                                  endpoint=f'http://127.0.0.1:{plain.server_port}',
-                                  upstream_api_key='upstream-secret', status='enabled')).encode()
-        status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', created, auth)
-        assert status == 201, response
-        credential = json.loads(response)['gateway_api_key']
+        auth = sign_in(admin_port)
+        _, credential = provider_credential(
+            admin_port, auth, f'shutdown-{label}', 'openai', f'http://127.0.0.1:{plain.server_port}')
         baseline = active
         sock, stream = websocket(data_port, credential)
         opened += [stream, sock]
@@ -461,7 +500,8 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
     values = {
         'DATA_LISTEN_ADDR': f'127.0.0.1:{data_port}', 'ADMIN_LISTEN_ADDR': f'127.0.0.1:{admin_port}',
         'DATABASE_URL': f'sqlite://{db}', 'MASTER_KEY': '11' * 32,
-        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'DEVELOPMENT_MODE': str(development).lower(),
+        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'ADMIN_PASSWORD': 'test-admin',
+        'DEVELOPMENT_MODE': str(development).lower(),
         'UPSTREAM_CONNECT_TIMEOUT_MS': '500', 'UPSTREAM_HEADER_TIMEOUT_MS': '1500',
         'STREAM_IDLE_TIMEOUT_MS': '10000', 'SHUTDOWN_DRAIN_TIMEOUT_MS': '150', 'LOG_FLUSH_TIMEOUT_MS': '1000',
         'DATABASE_MAX_CONNECTIONS': '4', 'MAX_PROXY_CONNECTIONS': '2', 'HTTP_BUFFER_BYTES': '65536',
@@ -490,14 +530,9 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
             except OSError:
                 return False
         wait_for(ready, 'gateway did not listen')
-        status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', b'{"password":"test-admin"}')
-        assert status == 200, body
-        auth = {'Cookie': headers['set-cookie'].split(';')[0], 'x-csrf-token': json.loads(body)['csrf_token'], 'content-type': 'application/json'}
+        auth = sign_in(admin_port)
         def provider(name, protocol, endpoint):
-            body = json.dumps(dict(name=name, protocol_type=protocol, endpoint=endpoint, upstream_api_key='upstream-secret', status='enabled')).encode()
-            status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', body, auth)
-            assert status == 201, response
-            return json.loads(response)['gateway_api_key']
+            return provider_credential(admin_port, auth, name, protocol, endpoint)[1]
         endpoint = f'http://127.0.0.1:{plain.server_port}' if development else f'https://localhost:{trusted.server_port}'
         openai = provider('openai', 'openai', endpoint + '/prefix')
         anthropic = provider('anthropic', 'anthropic', endpoint + '/prefix')

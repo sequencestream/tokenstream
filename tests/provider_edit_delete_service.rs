@@ -1,20 +1,25 @@
 use std::path::Path;
 
 use chrono::Utc;
+use tokenstream::credentials::{CreateApiKeyRequest, CredentialService};
 use tokenstream::crypto::{
     AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher,
 };
 use tokenstream::domain::{
-    ProtocolType, ProviderId, ProviderSnapshot, ProviderStatus, RequestId, SecretString,
-    TransportType,
+    AccountId, ApiKeyId, ApiKeyStatus, ProtocolType, ProviderAdminView, ProviderId,
+    ProviderSnapshot, ProviderStatus, RequestId, SecretString, TransportType,
 };
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    ProviderListRequest, ProviderRepository, RequestLogRepository, RequestLogStarted,
+    ApiKeyRepository, ProviderListRequest, ProviderRepository, RequestLogRepository,
+    RequestLogStarted,
 };
 use tokenstream::providers::{
     CreateProviderRequest, ProviderService, ProviderServiceError, UpdateProviderRequest,
 };
+
+mod support;
+use support::bootstrap_account;
 
 const MASTER_KEY: [u8; 32] = [0x5c; 32];
 const UPSTREAM_KEY: &str = "sk-original-upstream-key";
@@ -32,11 +37,10 @@ async fn sqlite_database(path: &Path) -> SqliteDatabase {
 fn service(
     database: SqliteDatabase,
     allow_insecure_endpoints: bool,
-) -> ProviderService<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier> {
+) -> ProviderService<SqliteDatabase, AesGcmCipher> {
     ProviderService::new(
         database,
         AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
         allow_insecure_endpoints,
     )
 }
@@ -49,6 +53,28 @@ fn create_request(name: &str, endpoint: &str, upstream_key: &str) -> CreateProvi
         SecretString::new(upstream_key),
         ProviderStatus::Enabled,
     )
+}
+
+/// A bootstrap account and a credential bound to `provider`, the two internal
+/// identifiers a request snapshot now carries.
+async fn credential_for(
+    database: &SqliteDatabase,
+    provider_id: ProviderId,
+) -> (AccountId, ApiKeyId) {
+    let accounts = CredentialService::new(database.clone(), Argon2GatewaySecretVerifier::new());
+    let account = bootstrap_account(&accounts).await;
+    let issued = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "edit".to_owned(),
+            vec![provider_id],
+            Some(provider_id),
+            None,
+            ApiKeyStatus::Enabled,
+        ))
+        .await
+        .expect("issue a credential");
+    (account.id(), issued.api_key().api_key().id())
 }
 
 fn decrypt(cipher: &AesGcmCipher, provider: &tokenstream::domain::Provider) -> String {
@@ -69,7 +95,7 @@ async fn provider_count<R: ProviderRepository>(repository: &R) -> usize {
 }
 
 #[tokio::test]
-async fn edit_commits_only_named_fields_and_keeps_credential() {
+async fn edit_commits_only_named_fields_and_keeps_other_configuration() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("edit.db")).await;
     let service = service(database.clone(), false);
@@ -83,10 +109,9 @@ async fn edit_commits_only_named_fields_and_keeps_credential() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
-    let key_id = created.gateway_credential().key_id().clone();
-    let created_at = created.provider().created_at();
-    let ciphertext_before = created.provider().upstream_api_key_ciphertext().clone();
+    let id = created.id();
+    let created_at = created.created_at();
+    let ciphertext_before = created.upstream_api_key_ciphertext().clone();
 
     let renamed = service
         .update(id, UpdateProviderRequest::new().with_name("  renamed  "))
@@ -95,7 +120,6 @@ async fn edit_commits_only_named_fields_and_keeps_credential() {
     assert_eq!(renamed.name(), "renamed");
     assert_eq!(renamed.endpoint().as_str(), "https://api.example.com/base");
     assert_eq!(renamed.status(), ProviderStatus::Enabled);
-    assert_eq!(renamed.gateway_key_id(), &key_id);
     assert_eq!(renamed.created_at(), created_at);
     assert_eq!(
         renamed.upstream_api_key_ciphertext().expose(),
@@ -115,8 +139,7 @@ async fn edit_commits_only_named_fields_and_keeps_credential() {
     assert_eq!(decrypt(&cipher, &moved), UPSTREAM_KEY);
     assert_eq!(provider_count(&database).await, 1);
 
-    let stored = database
-        .find_by_id(id)
+    let stored = ProviderRepository::find_by_id(&database, id)
         .await
         .expect("find provider by id")
         .expect("provider exists");
@@ -139,7 +162,7 @@ async fn an_edit_that_names_no_field_changes_nothing() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
+    let id = created.id();
 
     assert_eq!(
         service
@@ -149,8 +172,7 @@ async fn an_edit_that_names_no_field_changes_nothing() {
         ProviderServiceError::NoFieldsToUpdate
     );
 
-    let stored = database
-        .find_by_id(id)
+    let stored = ProviderRepository::find_by_id(&database, id)
         .await
         .expect("find provider by id")
         .expect("provider exists");
@@ -161,13 +183,14 @@ async fn an_edit_that_names_no_field_changes_nothing() {
 }
 
 #[tokio::test]
-async fn a_late_configuration_edit_never_restores_a_rotated_credential() {
+async fn a_late_provider_edit_never_touches_credential_state() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("edit-after-rotate.db")).await;
     let service = service(database.clone(), false);
+    let accounts = CredentialService::new(database.clone(), Argon2GatewaySecretVerifier::new());
     let verifier = Argon2GatewaySecretVerifier::new();
 
-    let created = service
+    let provider = service
         .create(create_request(
             "primary",
             "https://api.example.com/base",
@@ -175,42 +198,50 @@ async fn a_late_configuration_edit_never_restores_a_rotated_credential() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
-    let old_secret = created.gateway_credential().secret().clone();
+    let issued = support::issue_api_key(
+        &accounts,
+        bootstrap_account(&accounts).await.id(),
+        vec![provider.id()],
+    )
+    .await;
+    let old_secret = issued.credential().secret().clone();
 
-    let rotated = service
-        .rotate_gateway_credential(id)
+    let rotated = accounts
+        .rotate_api_key(issued.api_key().api_key().id())
         .await
-        .expect("rotate gateway credential");
-    let new_secret = rotated.gateway_credential().secret().clone();
+        .expect("rotate the credential");
+    let new_secret = rotated.credential().secret().clone();
 
-    // The edit runs after the rotation committed, reading no earlier state
-    // from storage, so the write set it names is exactly the name column.
+    // A provider edit names only provider columns, so it cannot reach the
+    // credential that happens to select this provider.
     service
-        .update(id, UpdateProviderRequest::new().with_name("renamed"))
+        .update(
+            provider.id(),
+            UpdateProviderRequest::new().with_name("renamed"),
+        )
         .await
         .expect("rename after rotation");
 
-    let stored = database
-        .find_by_id(id)
+    let stored = ProviderRepository::find_by_id(&database, provider.id())
         .await
         .expect("find provider by id")
         .expect("provider exists");
     assert_eq!(stored.name(), "renamed");
-    assert_eq!(
-        stored.gateway_key_id(),
-        rotated.gateway_credential().key_id(),
-        "a configuration edit must not write the gateway key columns"
-    );
+
+    let stored_key =
+        ApiKeyRepository::find_by_key_id(&database, rotated.api_key().api_key().key_id())
+            .await
+            .expect("find credential by key id")
+            .expect("rotated credential resolves");
     assert!(
         !verifier
-            .verify(&old_secret, stored.gateway_api_key_hash())
+            .verify(&old_secret, stored_key.api_key().secret_hash())
             .expect("stored hash is well formed"),
         "the retired credential must stop verifying"
     );
     assert!(
         verifier
-            .verify(&new_secret, stored.gateway_api_key_hash())
+            .verify(&new_secret, stored_key.api_key().secret_hash())
             .expect("stored hash is well formed"),
         "the rotated credential must keep verifying after an edit"
     );
@@ -231,15 +262,17 @@ async fn edit_re_encrypts_upstream_key_and_leaves_snapshot_untouched() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
-    let key_id = created.gateway_credential().key_id().clone();
+    let id = created.id();
+    let (account_id, api_key_id) = credential_for(&database, id).await;
     let snapshot = ProviderSnapshot::new(
+        account_id,
+        api_key_id,
         id,
-        created.provider().protocol_type(),
-        created.provider().endpoint().clone(),
-        SecretString::new(decrypt(&cipher, created.provider())),
+        created.protocol_type(),
+        created.endpoint().clone(),
+        SecretString::new(decrypt(&cipher, &created)),
     );
-    let ciphertext_before = created.provider().upstream_api_key_ciphertext().clone();
+    let ciphertext_before = created.upstream_api_key_ciphertext().clone();
 
     let updated = service
         .update(
@@ -255,12 +288,12 @@ async fn edit_re_encrypts_upstream_key_and_leaves_snapshot_untouched() {
         "the upstream key must be re-encrypted"
     );
     assert_eq!(decrypt(&cipher, &updated), ROTATED_KEY);
-    assert_eq!(updated.gateway_key_id(), &key_id);
-    assert_eq!(
-        updated.gateway_api_key_hash().expose(),
-        created.provider().gateway_api_key_hash().expose(),
-        "an upstream-key edit must not rotate the gateway credential"
-    );
+    // A provider holds no credential material at all, so an edit cannot reach
+    // any credential that selects it.
+    let admin_json =
+        serde_json::to_string(&ProviderAdminView::from(&updated)).expect("serialize the view");
+    assert!(!admin_json.contains("gateway_key_id"));
+    assert!(!admin_json.contains("secret_hash"));
 
     assert_eq!(snapshot.endpoint().as_str(), "https://api.example.com/");
     assert_eq!(snapshot.upstream_api_key().expose(), UPSTREAM_KEY);
@@ -284,7 +317,7 @@ async fn set_status_disables_and_reenables_without_touching_other_fields() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
+    let id = created.id();
 
     let disabled = service
         .set_status(id, ProviderStatus::Disabled)
@@ -293,8 +326,7 @@ async fn set_status_disables_and_reenables_without_touching_other_fields() {
     assert_eq!(disabled.status(), ProviderStatus::Disabled);
     assert_eq!(disabled.endpoint().as_str(), "https://api.example.com/");
 
-    let stored = database
-        .find_by_id(id)
+    let stored = ProviderRepository::find_by_id(&database, id)
         .await
         .expect("find provider by id")
         .expect("provider exists");
@@ -322,7 +354,7 @@ async fn rejected_edits_leave_the_stored_record_untouched() {
         ))
         .await
         .expect("create provider");
-    let id = created.provider().id();
+    let id = created.id();
 
     let cases = [
         (
@@ -353,8 +385,7 @@ async fn rejected_edits_leave_the_stored_record_untouched() {
         assert_eq!(error, expected);
     }
 
-    let stored = database
-        .find_by_id(id)
+    let stored = ProviderRepository::find_by_id(&database, id)
         .await
         .expect("find provider by id")
         .expect("provider exists");
@@ -411,21 +442,23 @@ async fn delete_removes_unreferenced_provider_and_refuses_referenced_one() {
         .expect("create referenced provider");
 
     service
-        .delete(removable.provider().id())
+        .delete(removable.id())
         .await
         .expect("delete unreferenced provider");
     assert!(
-        database
-            .find_by_id(removable.provider().id())
+        ProviderRepository::find_by_id(&database, removable.id())
             .await
             .expect("find deleted provider")
             .is_none()
     );
 
+    let (account_id, api_key_id) = credential_for(&database, referenced.id()).await;
     database
         .insert_started(RequestLogStarted::new(
             RequestId::new("req-delete-guard").expect("non-empty request id"),
-            referenced.provider().id(),
+            account_id,
+            api_key_id,
+            referenced.id(),
             ProtocolType::OpenAi,
             TransportType::Http,
             "/v1/chat/completions".to_owned(),
@@ -436,14 +469,13 @@ async fn delete_removes_unreferenced_provider_and_refuses_referenced_one() {
 
     assert_eq!(
         service
-            .delete(referenced.provider().id())
+            .delete(referenced.id())
             .await
             .expect_err("referenced provider cannot be deleted"),
         ProviderServiceError::InUse
     );
     assert!(
-        database
-            .find_by_id(referenced.provider().id())
+        ProviderRepository::find_by_id(&database, referenced.id())
             .await
             .expect("find referenced provider")
             .is_some(),

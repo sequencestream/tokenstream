@@ -251,6 +251,8 @@ mod tests {
 
     fn snapshot(protocol_type: ProtocolType, endpoint: &str, key: &str) -> ProviderSnapshot {
         ProviderSnapshot::new(
+            crate::domain::AccountId::try_from(1).expect("positive account ID"),
+            crate::domain::ApiKeyId::try_from(1).expect("positive credential ID"),
             ProviderId::try_from(1).expect("positive ID"),
             protocol_type,
             Url::parse(endpoint).expect("valid endpoint"),

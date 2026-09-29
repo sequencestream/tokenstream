@@ -7,6 +7,8 @@
  * development server's proxy.
  */
 export const SESSION_PATH = '/admin/api/session'
+export const ACCOUNTS_PATH = '/admin/api/accounts'
+export const API_KEYS_PATH = '/admin/api/api-keys'
 export const PROVIDERS_PATH = '/admin/api/providers'
 export const REQUEST_LOGS_PATH = '/admin/api/request-logs'
 export const SETTINGS_PATH = '/admin/api/settings'
@@ -14,6 +16,46 @@ export const SETTINGS_PATH = '/admin/api/settings'
 export type ProtocolType = 'openai' | 'anthropic'
 export type ProviderStatus = 'enabled' | 'disabled'
 export type TransportType = 'http' | 'websocket'
+export type AccountRole = 'admin' | 'user'
+export type AccountStatus = 'enabled' | 'disabled'
+export type ApiKeyStatus = 'enabled' | 'disabled'
+
+/** A person or principal that owns data-plane credentials. */
+export interface Account {
+  id: number
+  name: string
+  role: AccountRole
+  status: AccountStatus
+  is_bootstrap: boolean
+  created_at: string
+}
+
+export interface AccountWrite {
+  name: string
+  role: AccountRole
+  status: AccountStatus
+}
+
+/** A credential belongs to an account, not to a provider. */
+export interface ApiKey {
+  id: number
+  account_id: number
+  name: string
+  key_id: string
+  status: ApiKeyStatus
+  expires_at: string | null
+  default_provider_id: number | null
+  provider_ids: number[]
+  created_at: string
+}
+
+export interface ApiKeyWrite {
+  account_id: number
+  name: string
+  provider_ids: number[]
+  default_provider_id?: number | null
+  status: ApiKeyStatus
+}
 
 export interface Provider {
   id: number
@@ -21,7 +63,6 @@ export interface Provider {
   protocol_type: ProtocolType
   endpoint: string
   status: ProviderStatus
-  gateway_key_id: string
   has_upstream_api_key: boolean
   created_at: string
 }
@@ -29,6 +70,8 @@ export interface Provider {
 export interface RequestLog {
   id: number
   request_id: string
+  account_id: number
+  api_key_id: number
   provider_id: number
   protocol_type: ProtocolType
   transport_type: TransportType
@@ -49,6 +92,9 @@ export interface Page<T> {
 export interface SessionResponse {
   signed_in: boolean
   csrf_token: string
+  /** The signed-in account, so the page renders only what its role reaches. */
+  account_name: string
+  role: AccountRole
 }
 
 export interface ProviderWrite {
@@ -61,10 +107,16 @@ export interface ProviderWrite {
 
 export type ProviderUpdate = Partial<Omit<ProviderWrite, 'protocol_type'>>
 
-/** A credential response is shown once and never persisted by the page. */
-export interface CredentialResponse {
-  provider: Provider
-  gateway_api_key: string
+/** A one-time plaintext, present only at creation and at rotation. */
+export interface ApiKeyIssueResponse {
+  api_key: ApiKey
+  api_key_secret: string
+}
+
+/** An account created without a password, whose password is shown once. */
+export interface AccountCreateResponse {
+  account: Account
+  generated_password: string | null
 }
 
 export interface Setting {
@@ -131,11 +183,11 @@ export class AdminApi {
     return session
   }
 
-  /** Signs in with the administrator password and adopts the new session. */
-  async signIn(password: string): Promise<SessionResponse> {
+  /** Signs in with an account name and password, and adopts the new session. */
+  async signIn(name: string, password: string): Promise<SessionResponse> {
     const session = await this.#request<SessionResponse>(SESSION_PATH, {
       method: 'POST',
-      body: JSON.stringify({ password }),
+      body: JSON.stringify({ name, password }),
     })
     this.#csrfToken = session.csrf_token
     return session
@@ -152,9 +204,9 @@ export class AdminApi {
     return this.#request<Page<T>>(`${path}?${query}`)
   }
 
-  /** Creates a provider and returns its first gateway credential. */
-  createProvider(body: ProviderWrite): Promise<CredentialResponse> {
-    return this.#request<CredentialResponse>(PROVIDERS_PATH, {
+  /** Creates a provider. A provider no longer issues any credential. */
+  createProvider(body: ProviderWrite): Promise<Provider> {
+    return this.#request<Provider>(PROVIDERS_PATH, {
       method: 'POST',
       body: JSON.stringify(body),
     })
@@ -173,11 +225,54 @@ export class AdminApi {
     return this.#request<void>(`${PROVIDERS_PATH}/${id}`, { method: 'DELETE' })
   }
 
-  /** Issues a new gateway credential and retires the previous one. */
-  rotateCredential(id: number): Promise<CredentialResponse> {
-    return this.#request<CredentialResponse>(`${PROVIDERS_PATH}/${id}/gateway-key:rotate`, {
+  /** Creates an account, optionally with a password the caller supplies. */
+  createAccount(body: Partial<AccountWrite> & { name: string; password?: string }): Promise<AccountCreateResponse> {
+    return this.#request<AccountCreateResponse>(ACCOUNTS_PATH, {
       method: 'POST',
+      body: JSON.stringify(body),
     })
+  }
+
+  /** Changes an account's name, password, role, or status. */
+  updateAccount(id: number, body: Partial<AccountWrite> & { password?: string }): Promise<Account> {
+    return this.#request<Account>(`${ACCOUNTS_PATH}/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  }
+
+  /** Deletes an account that owns nothing. */
+  deleteAccount(id: number): Promise<void> {
+    return this.#request<void>(`${ACCOUNTS_PATH}/${id}`, { method: 'DELETE' })
+  }
+
+  /** Issues a credential for an account and returns its one-time plaintext. */
+  createApiKey(body: ApiKeyWrite): Promise<ApiKeyIssueResponse> {
+    return this.#request<ApiKeyIssueResponse>(API_KEYS_PATH, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  }
+
+  /** Issues a fresh plaintext and retires the previous one. */
+  rotateApiKey(id: number): Promise<ApiKeyIssueResponse> {
+    return this.#request<ApiKeyIssueResponse>(`${API_KEYS_PATH}/${id}:rotate`, { method: 'POST' })
+  }
+
+  /** Changes a credential's name, status, providers, or default provider. */
+  updateApiKey(
+    id: number,
+    body: Partial<Pick<ApiKeyWrite, 'name' | 'status' | 'provider_ids' | 'default_provider_id'>>,
+  ): Promise<ApiKey> {
+    return this.#request<ApiKey>(`${API_KEYS_PATH}/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  }
+
+  /** Deletes a credential. */
+  deleteApiKey(id: number): Promise<void> {
+    return this.#request<void>(`${API_KEYS_PATH}/${id}`, { method: 'DELETE' })
   }
 
   /** Reads the process settings table. Secret values are omitted. */

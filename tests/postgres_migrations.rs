@@ -15,19 +15,47 @@ fn unique_value(prefix: &str) -> String {
     format!("{prefix}-{}-{nanos}", std::process::id())
 }
 
-async fn insert_provider(pool: &PgPool, name: &str, key_id: &str) -> i64 {
+/// Inserts a provider, which now holds configuration only and issues nothing.
+async fn insert_provider(pool: &PgPool, name: &str) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO provider (
-            name, protocol_type, endpoint, upstream_api_key_ciphertext,
-            gateway_key_id, gateway_api_key_hash, status, created_at
-         ) VALUES ($1, 'openai', 'https://example.com', 'ciphertext', $2, 'hash', 'enabled', 1)
+            name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at
+         ) VALUES ($1, 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)
          RETURNING id",
     )
     .bind(name)
-    .bind(key_id)
     .fetch_one(pool)
     .await
     .expect("insert provider")
+}
+
+/// Inserts the account and credential that request logs are attributed to.
+///
+/// The account is an ordinary one: at most one bootstrap administrator may
+/// exist, and the process that connected already created it.
+async fn insert_principal(pool: &PgPool, key_id: &str) -> (i64, i64) {
+    let account_id: i64 = sqlx::query_scalar(
+        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+         VALUES ($1, 'hash', 'user', 'enabled', FALSE, 1)
+         RETURNING id",
+    )
+    .bind(unique_value("migrated-admin"))
+    .fetch_one(pool)
+    .await
+    .expect("insert account");
+    let api_key_id: i64 = sqlx::query_scalar(
+        "INSERT INTO api_key (
+            account_id, name, key_id, secret_hash, status, default_provider_id,
+            expires_at, created_at
+         ) VALUES ($1, 'migrated', $2, 'hash', 'enabled', NULL, NULL, 1)
+         RETURNING id",
+    )
+    .bind(account_id)
+    .bind(key_id)
+    .fetch_one(pool)
+    .await
+    .expect("insert credential");
+    (account_id, api_key_id)
 }
 
 #[tokio::test]
@@ -46,7 +74,7 @@ async fn postgres_schema_matches_sqlite_constraints() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT c.relname AS name
@@ -62,10 +90,14 @@ async fn postgres_schema_matches_sqlite_constraints() {
     .map(|row| row.get("name"))
     .collect();
     for expected in [
+        "account",
+        "api_key",
+        "api_key_provider",
         "provider",
         "request_log",
         "request_log_start_time_idx",
         "request_log_provider_id_idx",
+        "request_log_account_id_idx",
     ] {
         assert!(objects.contains(expected), "missing {expected}");
     }
@@ -87,23 +119,28 @@ async fn postgres_schema_matches_sqlite_constraints() {
     let suffix = unique_value("constraints");
     let primary_name = format!("primary-{suffix}");
     let primary_key = format!("key-1-{suffix}");
-    let provider_id = insert_provider(database.pool(), &primary_name, &primary_key).await;
+    let provider_id = insert_provider(database.pool(), &primary_name).await;
 
     let duplicate_name = sqlx::query(
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at)
-         VALUES ($1, 'openai', 'https://example.com', 'ciphertext', $2, 'hash', 'enabled', 1)",
+        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at)
+         VALUES ($1, 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
     )
     .bind(&primary_name)
-    .bind(format!("key-2-{suffix}"))
     .execute(database.pool())
     .await;
     assert!(duplicate_name.is_err());
 
+    let (account_id, _api_key_id) = insert_principal(database.pool(), &primary_key).await;
+
+    // A credential identifier is unique across accounts, so the uniqueness the
+    // provider used to carry now belongs to the credential.
     let duplicate_key = sqlx::query(
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at)
-         VALUES ($1, 'openai', 'https://example.com', 'ciphertext', $2, 'hash', 'enabled', 1)",
+        "INSERT INTO api_key (
+            account_id, name, key_id, secret_hash, status, default_provider_id,
+            expires_at, created_at
+         ) VALUES ($1, 'other', $2, 'hash', 'enabled', NULL, NULL, 1)",
     )
-    .bind(format!("secondary-{suffix}"))
+    .bind(account_id)
     .bind(&primary_key)
     .execute(database.pool())
     .await;
@@ -111,12 +148,11 @@ async fn postgres_schema_matches_sqlite_constraints() {
 
     for (protocol_type, status) in [("unknown", "enabled"), ("openai", "retired")] {
         let result = sqlx::query(
-            "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at)
-             VALUES ($1, $2, 'https://example.com', 'ciphertext', $3, 'hash', $4, 1)",
+            "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at)
+             VALUES ($1, $2, 'https://example.com', 'ciphertext', $3, 1)",
         )
         .bind(unique_value("invalid-provider"))
         .bind(protocol_type)
-        .bind(unique_value("invalid-key"))
         .bind(status)
         .execute(database.pool())
         .await;
@@ -181,22 +217,12 @@ async fn postgres_schema_matches_sqlite_constraints() {
             .is_err()
     );
 
-    let deleted_id = insert_provider(
-        database.pool(),
-        &unique_value("deleted"),
-        &unique_value("deleted-key"),
-    )
-    .await;
+    let deleted_id = insert_provider(database.pool(), &unique_value("deleted")).await;
     sqlx::query("DELETE FROM provider WHERE id = $1")
         .bind(deleted_id)
         .execute(database.pool())
         .await
         .expect("delete unreferenced provider");
-    let next_id = insert_provider(
-        database.pool(),
-        &unique_value("next"),
-        &unique_value("next-key"),
-    )
-    .await;
+    let next_id = insert_provider(database.pool(), &unique_value("next")).await;
     assert!(next_id > deleted_id);
 }

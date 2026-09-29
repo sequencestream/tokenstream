@@ -2,14 +2,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
 use tokenstream::domain::{
-    GatewayKeyId, PasswordHash, ProtocolType, ProviderStatus, RequestId, SecretCiphertext,
-    TransportType,
+    ApiKeyStatus, GatewayKeyId, PasswordHash, ProtocolType, ProviderStatus, RequestId,
+    SecretCiphertext, TransportType,
 };
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    Database, DatabaseBackend, NewProvider, ProviderRepository, RepositoryError,
-    RequestLogCompleted, RequestLogQuery, RequestLogRepository, RequestLogStarted,
+    AccountRepository, ApiKeyRepository, Database, DatabaseBackend, NewApiKey, NewProvider,
+    ProviderRepository, RepositoryError, RequestLogCompleted, RequestLogQuery,
+    RequestLogRepository, RequestLogStarted,
 };
 use url::Url;
 
@@ -30,8 +31,6 @@ fn new_provider(prefix: &str, number: usize, created_at: DateTime<Utc>) -> NewPr
         ProtocolType::OpenAi,
         Url::parse("https://example.com").expect("valid endpoint"),
         SecretCiphertext::new("ciphertext"),
-        GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID"),
-        PasswordHash::new("hash"),
         ProviderStatus::Enabled,
         created_at,
     )
@@ -58,29 +57,46 @@ fn sample_instants() -> [DateTime<Utc>; 3] {
 
 async fn verify_time_round_trip<R>(repository: &R, prefix: &str)
 where
-    R: ProviderRepository + RequestLogRepository,
+    R: ProviderRepository + RequestLogRepository + ApiKeyRepository + AccountRepository,
 {
+    let account = support::ensure_bootstrap(repository).await;
     for (number, instant) in sample_instants().iter().enumerate() {
-        let created = repository
-            .create(new_provider(prefix, number, *instant))
-            .await
-            .expect("create provider");
+        let created =
+            ProviderRepository::create(repository, new_provider(prefix, number, *instant))
+                .await
+                .expect("create provider");
         assert_eq!(created.created_at(), *instant);
 
         let key = GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID");
-        let found = repository
-            .find_by_key_id(&key)
+        ApiKeyRepository::create(
+            repository,
+            NewApiKey::new(
+                account.id(),
+                format!("{prefix}-key-name-{number}"),
+                key.clone(),
+                PasswordHash::new("hash"),
+                ApiKeyStatus::Enabled,
+                Some(created.id()),
+                None,
+                vec![created.id()],
+                *instant,
+            ),
+        )
+        .await
+        .expect("issue a credential");
+        let found = ApiKeyRepository::find_by_key_id(repository, &key)
             .await
-            .expect("find provider")
-            .expect("provider exists");
-        assert_eq!(found.id(), created.id());
-        assert_eq!(found.created_at(), *instant);
+            .expect("find credential")
+            .expect("credential exists");
+        assert_eq!(found.api_key().created_at(), *instant);
 
         let request_id = format!("{prefix}-request-{number}");
         let (start, end) = (*instant, *instant + ChronoDuration::microseconds(789));
         repository
             .insert_started(RequestLogStarted::new(
                 RequestId::new(&request_id).expect("non-empty request ID"),
+                found.api_key().account_id(),
+                found.api_key().id(),
                 created.id(),
                 ProtocolType::OpenAi,
                 TransportType::Http,
@@ -104,6 +120,7 @@ where
                 RequestLogQuery::new(
                     None,
                     100,
+                    Some(found.api_key().account_id()),
                     Some(created.id()),
                     Some(TransportType::Http),
                     None,
@@ -183,9 +200,11 @@ async fn sqlite_exhausted_pool_fails_closed() {
         .await
         .expect("hold the only connection");
     let started = Instant::now();
-    let result = database
-        .find_by_key_id(&GatewayKeyId::new("absent").expect("non-empty key ID"))
-        .await;
+    let result = ApiKeyRepository::find_by_key_id(
+        &database,
+        &GatewayKeyId::new("absent").expect("non-empty key ID"),
+    )
+    .await;
     assert_eq!(
         result.expect_err("exhausted pool fails closed"),
         RepositoryError::Timeout

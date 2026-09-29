@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use tokenstream::crypto::{
-    AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher,
-};
+use tokenstream::crypto::{AesGcmCipher, SecretCipher};
 use tokenstream::domain::{ProtocolType, ProviderStatus, SecretString};
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{ProviderListRequest, ProviderRepository};
@@ -25,11 +23,10 @@ async fn sqlite_database(path: &Path) -> SqliteDatabase {
 fn service(
     database: SqliteDatabase,
     allow_insecure_endpoints: bool,
-) -> ProviderService<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier> {
+) -> ProviderService<SqliteDatabase, AesGcmCipher> {
     ProviderService::new(
         database,
         AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
         allow_insecure_endpoints,
     )
 }
@@ -54,14 +51,13 @@ async fn provider_count<R: ProviderRepository>(repository: &R) -> usize {
 }
 
 #[tokio::test]
-async fn creates_provider_with_encrypted_key_and_one_time_credential() {
+async fn creates_provider_with_an_encrypted_key_and_no_credential() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("create.db")).await;
     let service = service(database.clone(), false);
     let cipher = AesGcmCipher::new(&MASTER_KEY);
-    let verifier = Argon2GatewaySecretVerifier::new();
 
-    let created = service
+    let provider = service
         .create(request(
             "  primary-openai  ",
             "https://api.example.com/gateway",
@@ -70,7 +66,6 @@ async fn creates_provider_with_encrypted_key_and_one_time_credential() {
         .await
         .expect("create provider");
 
-    let provider = created.provider();
     assert!(provider.id().get() > 0);
     assert_eq!(provider.name(), "primary-openai");
     assert_eq!(provider.protocol_type(), ProtocolType::OpenAi);
@@ -79,19 +74,6 @@ async fn creates_provider_with_encrypted_key_and_one_time_credential() {
         "https://api.example.com/gateway"
     );
     assert_eq!(provider.status(), ProviderStatus::Enabled);
-    assert_eq!(
-        provider.gateway_key_id(),
-        created.gateway_credential().key_id()
-    );
-
-    assert!(
-        verifier
-            .verify(
-                created.gateway_credential().secret(),
-                provider.gateway_api_key_hash(),
-            )
-            .expect("verify credential hash")
-    );
 
     let decrypted = cipher
         .decrypt(provider.upstream_api_key_ciphertext())
@@ -99,22 +81,20 @@ async fn creates_provider_with_encrypted_key_and_one_time_credential() {
     assert_eq!(decrypted.expose(), UPSTREAM_KEY);
 
     let stored = database
-        .find_by_key_id(created.gateway_credential().key_id())
+        .find_by_id(provider.id())
         .await
-        .expect("lookup by key id")
+        .expect("lookup by id")
         .expect("provider exists");
     assert_eq!(stored.id(), provider.id());
 
-    let rendered = created.gateway_credential().render();
-    assert!(rendered.contains(created.gateway_credential().key_id().as_str()));
-    assert!(rendered.contains(created.gateway_credential().secret().expose()));
+    // A provider issues no credential, so no record of it holds credential
+    // material that a read could leak.
+    assert!(!format!("{provider:?}").contains(UPSTREAM_KEY));
     assert!(
-        !provider
-            .gateway_api_key_hash()
-            .expose()
+        !serde_json::to_string(&tokenstream::domain::ProviderAdminView::from(&provider))
+            .expect("serialize the redacted view")
             .contains(UPSTREAM_KEY)
     );
-    assert!(!format!("{created:?}").contains(UPSTREAM_KEY));
 }
 
 #[tokio::test]
@@ -231,8 +211,5 @@ async fn development_mode_admits_plain_http_endpoints() {
         ))
         .await
         .expect("create provider over plain HTTP in development mode");
-    assert_eq!(
-        created.provider().endpoint().as_str(),
-        "http://127.0.0.1:8080/base"
-    );
+    assert_eq!(created.endpoint().as_str(), "http://127.0.0.1:8080/base");
 }

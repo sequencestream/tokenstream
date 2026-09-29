@@ -42,8 +42,12 @@ macro_rules! positive_value {
     };
 }
 
+positive_value!(AccountId);
 positive_value!(ProviderId);
+positive_value!(ApiKeyId);
 positive_value!(RequestLogId);
+positive_value!(AccountCursor);
+positive_value!(ApiKeyCursor);
 positive_value!(ProviderCursor);
 positive_value!(RequestLogCursor);
 
@@ -160,6 +164,237 @@ pub enum TransportType {
     WebSocket,
 }
 
+/// The fixed set of control-plane roles.
+///
+/// This is deliberately a closed set rather than a table of permissions: the
+/// resources an operator can reach are still only accounts, credentials,
+/// providers, and process settings. Adding a role is an architectural change
+/// with its own record, not a configuration edit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountRole {
+    /// Manages accounts, credentials, providers, and process settings.
+    Admin,
+    /// Manages only its own credentials.
+    User,
+}
+
+impl AccountRole {
+    /// Whether this role may reach the administrator-only surfaces.
+    pub fn is_admin(self) -> bool {
+        matches!(self, Self::Admin)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccountStatus {
+    Enabled,
+    Disabled,
+}
+
+/// A principal that owns data-plane credentials and signs into the control plane.
+#[derive(Clone, Debug)]
+pub struct Account {
+    id: AccountId,
+    name: String,
+    password_hash: PasswordHash,
+    role: AccountRole,
+    status: AccountStatus,
+    is_bootstrap: bool,
+    created_at: DateTime<Utc>,
+}
+
+/// Longest accepted account or credential name, counted in Unicode scalar values.
+pub const MAX_ACCOUNT_NAME_LEN: usize = 128;
+
+impl Account {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: AccountId,
+        name: String,
+        password_hash: PasswordHash,
+        role: AccountRole,
+        status: AccountStatus,
+        is_bootstrap: bool,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            name,
+            password_hash,
+            role,
+            status,
+            is_bootstrap,
+            created_at,
+        }
+    }
+
+    pub fn id(&self) -> AccountId {
+        self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn password_hash(&self) -> &PasswordHash {
+        &self.password_hash
+    }
+
+    pub fn role(&self) -> AccountRole {
+        self.role
+    }
+
+    pub fn status(&self) -> AccountStatus {
+        self.status
+    }
+
+    /// Whether this is the one account that can never be disabled or demoted.
+    pub fn is_bootstrap(&self) -> bool {
+        self.is_bootstrap
+    }
+
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiKeyStatus {
+    Enabled,
+    Disabled,
+}
+
+/// A data-plane credential: it belongs to an account and names the providers
+/// that account's traffic may reach.
+///
+/// The credential carries no protocol and no endpoint. Both belong to the
+/// provider it resolves to, which is what makes one credential usable against
+/// several upstreams while every request still resolves to exactly one.
+#[derive(Clone, Debug)]
+pub struct ApiKey {
+    id: ApiKeyId,
+    account_id: AccountId,
+    name: String,
+    key_id: GatewayKeyId,
+    secret_hash: PasswordHash,
+    status: ApiKeyStatus,
+    default_provider_id: Option<ProviderId>,
+    expires_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+impl ApiKey {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: ApiKeyId,
+        account_id: AccountId,
+        name: String,
+        key_id: GatewayKeyId,
+        secret_hash: PasswordHash,
+        status: ApiKeyStatus,
+        default_provider_id: Option<ProviderId>,
+        expires_at: Option<DateTime<Utc>>,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            account_id,
+            name,
+            key_id,
+            secret_hash,
+            status,
+            default_provider_id,
+            expires_at,
+            created_at,
+        }
+    }
+
+    pub fn id(&self) -> ApiKeyId {
+        self.id
+    }
+
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn key_id(&self) -> &GatewayKeyId {
+        &self.key_id
+    }
+
+    pub fn secret_hash(&self) -> &PasswordHash {
+        &self.secret_hash
+    }
+
+    pub fn status(&self) -> ApiKeyStatus {
+        self.status
+    }
+
+    /// The provider used when the request names none of the allowed providers.
+    pub fn default_provider_id(&self) -> Option<ProviderId> {
+        self.default_provider_id
+    }
+
+    pub fn expires_at(&self) -> Option<DateTime<Utc>> {
+        self.expires_at
+    }
+
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+
+    /// Whether `now` is at or past this credential's expiration.
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|expires_at| now >= expires_at)
+    }
+}
+
+/// One allowed provider of a credential, in preference order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApiKeyBinding {
+    pub api_key_id: ApiKeyId,
+    pub provider_id: ProviderId,
+    pub position: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ApiKeyWithBindings {
+    api_key: ApiKey,
+    bindings: Vec<ApiKeyBinding>,
+}
+
+impl ApiKeyWithBindings {
+    pub fn new(api_key: ApiKey, bindings: Vec<ApiKeyBinding>) -> Self {
+        Self { api_key, bindings }
+    }
+
+    pub fn api_key(&self) -> &ApiKey {
+        &self.api_key
+    }
+
+    /// The allowed providers in preference order.
+    pub fn bindings(&self) -> &[ApiKeyBinding] {
+        &self.bindings
+    }
+
+    /// Whether `provider_id` is one of the allowed providers.
+    pub fn allows(&self, provider_id: ProviderId) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.provider_id == provider_id)
+    }
+
+    pub fn into_parts(self) -> (ApiKey, Vec<ApiKeyBinding>) {
+        (self.api_key, self.bindings)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Provider {
     id: ProviderId,
@@ -167,8 +402,6 @@ pub struct Provider {
     protocol_type: ProtocolType,
     endpoint: Url,
     upstream_api_key_ciphertext: SecretCiphertext,
-    gateway_key_id: GatewayKeyId,
-    gateway_api_key_hash: PasswordHash,
     status: ProviderStatus,
     created_at: DateTime<Utc>,
 }
@@ -181,8 +414,6 @@ impl Provider {
         protocol_type: ProtocolType,
         endpoint: Url,
         upstream_api_key_ciphertext: SecretCiphertext,
-        gateway_key_id: GatewayKeyId,
-        gateway_api_key_hash: PasswordHash,
         status: ProviderStatus,
         created_at: DateTime<Utc>,
     ) -> Self {
@@ -192,8 +423,6 @@ impl Provider {
             protocol_type,
             endpoint,
             upstream_api_key_ciphertext,
-            gateway_key_id,
-            gateway_api_key_hash,
             status,
             created_at,
         }
@@ -219,14 +448,6 @@ impl Provider {
         &self.upstream_api_key_ciphertext
     }
 
-    pub fn gateway_key_id(&self) -> &GatewayKeyId {
-        &self.gateway_key_id
-    }
-
-    pub fn gateway_api_key_hash(&self) -> &PasswordHash {
-        &self.gateway_api_key_hash
-    }
-
     pub fn status(&self) -> ProviderStatus {
         self.status
     }
@@ -236,8 +457,16 @@ impl Provider {
     }
 }
 
+/// The immutable configuration one request or connection owns for its lifetime.
+///
+/// Authentication freezes the account that presented the credential, the
+/// credential itself, and the single provider that request resolved to. Later
+/// edits to any of the three cannot reach work that was already admitted, and
+/// the snapshot never carries a credential plaintext or secret hash.
 #[derive(Debug)]
 pub struct ProviderSnapshot {
+    account_id: AccountId,
+    api_key_id: ApiKeyId,
     id: ProviderId,
     protocol_type: ProtocolType,
     endpoint: Url,
@@ -246,12 +475,16 @@ pub struct ProviderSnapshot {
 
 impl ProviderSnapshot {
     pub fn new(
+        account_id: AccountId,
+        api_key_id: ApiKeyId,
         id: ProviderId,
         protocol_type: ProtocolType,
         endpoint: Url,
         upstream_api_key: SecretString,
     ) -> Self {
         Self {
+            account_id,
+            api_key_id,
             id,
             protocol_type,
             endpoint,
@@ -259,6 +492,17 @@ impl ProviderSnapshot {
         }
     }
 
+    /// The account that owns the credential this request presented.
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// The credential this request presented.
+    pub fn api_key_id(&self) -> ApiKeyId {
+        self.api_key_id
+    }
+
+    /// The one provider this request resolved to.
     pub fn id(&self) -> ProviderId {
         self.id
     }
@@ -423,6 +667,8 @@ impl GatewayCredential {
 pub struct RequestLog {
     id: RequestLogId,
     request_id: RequestId,
+    account_id: AccountId,
+    api_key_id: ApiKeyId,
     provider_id: ProviderId,
     protocol_type: ProtocolType,
     transport_type: TransportType,
@@ -438,6 +684,8 @@ impl RequestLog {
     pub fn new(
         id: RequestLogId,
         request_id: RequestId,
+        account_id: AccountId,
+        api_key_id: ApiKeyId,
         provider_id: ProviderId,
         protocol_type: ProtocolType,
         transport_type: TransportType,
@@ -450,6 +698,8 @@ impl RequestLog {
         Self {
             id,
             request_id,
+            account_id,
+            api_key_id,
             provider_id,
             protocol_type,
             transport_type,
@@ -467,6 +717,16 @@ impl RequestLog {
 
     pub fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    /// The account whose credential presented this request.
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// The credential this request presented.
+    pub fn api_key_id(&self) -> ApiKeyId {
+        self.api_key_id
     }
 
     pub fn provider_id(&self) -> ProviderId {
@@ -509,7 +769,6 @@ pub struct ProviderAdminView {
     pub protocol_type: ProtocolType,
     pub endpoint: String,
     pub status: ProviderStatus,
-    pub gateway_key_id: String,
     pub has_upstream_api_key: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -522,9 +781,69 @@ impl From<&Provider> for ProviderAdminView {
             protocol_type: provider.protocol_type,
             endpoint: provider.endpoint.to_string(),
             status: provider.status,
-            gateway_key_id: provider.gateway_key_id.as_str().to_owned(),
             has_upstream_api_key: true,
             created_at: provider.created_at,
+        }
+    }
+}
+
+/// The redacted administration representation of an account.
+///
+/// It carries no password hash of any form. A generated password appears once,
+/// at creation, and only in the creation result.
+#[derive(Clone, Serialize)]
+pub struct AccountAdminView {
+    pub id: i64,
+    pub name: String,
+    pub role: AccountRole,
+    pub status: AccountStatus,
+    pub is_bootstrap: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Account> for AccountAdminView {
+    fn from(account: &Account) -> Self {
+        Self {
+            id: account.id.get(),
+            name: account.name.clone(),
+            role: account.role,
+            status: account.status,
+            is_bootstrap: account.is_bootstrap,
+            created_at: account.created_at,
+        }
+    }
+}
+
+/// The redacted administration representation of a credential.
+///
+/// The key identifier is a non-secret lookup value, so it is safe to show. The
+/// secret is not present in any field, and cannot be added to one by accident:
+/// the stored record never holds it.
+#[derive(Clone, Serialize)]
+pub struct ApiKeyAdminView {
+    pub id: i64,
+    pub account_id: i64,
+    pub name: String,
+    pub key_id: String,
+    pub status: ApiKeyStatus,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub default_provider_id: Option<i64>,
+    pub provider_ids: Vec<i64>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl ApiKeyAdminView {
+    pub fn new(api_key: &ApiKey, bindings: &[ApiKeyBinding]) -> Self {
+        Self {
+            id: api_key.id.get(),
+            account_id: api_key.account_id.get(),
+            name: api_key.name.clone(),
+            key_id: api_key.key_id.as_str().to_owned(),
+            status: api_key.status,
+            expires_at: api_key.expires_at,
+            default_provider_id: api_key.default_provider_id.map(ProviderId::get),
+            provider_ids: bindings.iter().map(|b| b.provider_id.get()).collect(),
+            created_at: api_key.created_at,
         }
     }
 }
@@ -593,6 +912,8 @@ mod tests {
             secret.clone(),
         );
         let snapshot = ProviderSnapshot::new(
+            AccountId::try_from(1).expect("positive account ID"),
+            ApiKeyId::try_from(1).expect("positive credential ID"),
             ProviderId::try_from(1).expect("positive ID"),
             ProtocolType::OpenAi,
             Url::parse("https://api.example.com").expect("valid URL"),
@@ -616,6 +937,8 @@ mod tests {
     fn snapshot_owns_an_immutable_copy_of_request_configuration() {
         let mut endpoint = Url::parse("https://api.example.com/base").expect("valid URL");
         let snapshot = ProviderSnapshot::new(
+            AccountId::try_from(2).expect("positive account ID"),
+            ApiKeyId::try_from(3).expect("positive credential ID"),
             ProviderId::try_from(7).expect("positive ID"),
             ProtocolType::Anthropic,
             endpoint.clone(),
@@ -623,6 +946,8 @@ mod tests {
         );
         endpoint.set_path("/changed");
 
+        assert_eq!(snapshot.account_id().get(), 2);
+        assert_eq!(snapshot.api_key_id().get(), 3);
         assert_eq!(snapshot.id().get(), 7);
         assert_eq!(snapshot.protocol_type(), ProtocolType::Anthropic);
         assert_eq!(snapshot.endpoint().path(), "/base");
@@ -637,8 +962,6 @@ mod tests {
             ProtocolType::OpenAi,
             Url::parse("https://api.example.com").expect("valid URL"),
             SecretCiphertext::new("encrypted-upstream-key"),
-            GatewayKeyId::new("lookup-id").expect("non-empty key ID"),
-            PasswordHash::new("gateway-secret-hash"),
             ProviderStatus::Enabled,
             Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0)
                 .single()
@@ -648,8 +971,8 @@ mod tests {
         let json = serde_json::to_string(&ProviderAdminView::from(&provider))
             .expect("admin view is serializable");
 
-        assert!(json.contains("\"gateway_key_id\":\"lookup-id\""));
         assert!(json.contains("\"has_upstream_api_key\":true"));
+        assert!(!json.contains("gateway_key_id"));
         assert!(!json.contains("encrypted-upstream-key"));
         assert!(!json.contains("gateway-secret-hash"));
         assert!(!json.contains("ciphertext"));

@@ -1,23 +1,19 @@
 //! Provider administration service.
 //!
 //! The service validates provider configuration, encrypts the upstream
-//! credential, issues a provider-scoped gateway credential, and persists the
-//! complete record in one write. The generated gateway secret is handed back
-//! only from the creation result; it is never stored, logged, or rendered by
-//! diagnostics.
+//! credential, and persists the complete record in one write. A provider issues
+//! no gateway credential: credentials belong to accounts and refer to a
+//! provider through their bindings, so a provider record never holds credential
+//! material at all.
 
-use crate::crypto::{PasswordWork, PasswordWorkError};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
 
 use chrono::Utc;
 use url::Url;
 
-use crate::crypto::{GatewaySecretVerifier, SecretCipher};
-use crate::domain::{
-    GatewayCredential, ProtocolType, Provider, ProviderId, ProviderStatus, SecretString,
-};
+use crate::crypto::SecretCipher;
+use crate::domain::{ProtocolType, Provider, ProviderId, ProviderStatus, SecretString};
 use crate::persistence::{
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderUpdate,
     RepositoryError,
@@ -128,69 +124,6 @@ impl fmt::Debug for UpdateProviderRequest {
     }
 }
 
-/// The stored provider record together with its one-time gateway credential.
-///
-/// The credential is returned here and only here; a caller that loses it must
-/// rotate the credential because the secret cannot be recovered from storage.
-#[derive(Debug)]
-pub struct CreatedProvider {
-    provider: Provider,
-    gateway_credential: GatewayCredential,
-}
-
-impl CreatedProvider {
-    fn new(provider: Provider, gateway_credential: GatewayCredential) -> Self {
-        Self {
-            provider,
-            gateway_credential,
-        }
-    }
-
-    pub fn provider(&self) -> &Provider {
-        &self.provider
-    }
-
-    pub fn gateway_credential(&self) -> &GatewayCredential {
-        &self.gateway_credential
-    }
-
-    pub fn into_parts(self) -> (Provider, GatewayCredential) {
-        (self.provider, self.gateway_credential)
-    }
-}
-
-/// The stored provider record together with its freshly rotated credential.
-///
-/// The new credential is returned here and only here. The previous credential
-/// stops authenticating as soon as the replacement is committed, while any
-/// snapshot already handed to an active stream or connection is unaffected.
-#[derive(Debug)]
-pub struct RotatedProvider {
-    provider: Provider,
-    gateway_credential: GatewayCredential,
-}
-
-impl RotatedProvider {
-    fn new(provider: Provider, gateway_credential: GatewayCredential) -> Self {
-        Self {
-            provider,
-            gateway_credential,
-        }
-    }
-
-    pub fn provider(&self) -> &Provider {
-        &self.provider
-    }
-
-    pub fn gateway_credential(&self) -> &GatewayCredential {
-        &self.gateway_credential
-    }
-
-    pub fn into_parts(self) -> (Provider, GatewayCredential) {
-        (self.provider, self.gateway_credential)
-    }
-}
-
 /// A provider service failure that carries no name, endpoint, key, or hash.
 ///
 /// Every variant renders as a stable, non-sensitive description so a failure
@@ -205,8 +138,6 @@ pub enum ProviderServiceError {
     InsecureEndpoint,
     /// The upstream API key is empty, too long, or contains control characters.
     InvalidUpstreamApiKey,
-    /// Gateway credential generation failed.
-    Credential,
     /// Compute or database capacity for this change is exhausted.
     Busy,
     /// Upstream credential encryption failed.
@@ -217,6 +148,8 @@ pub enum ProviderServiceError {
     NotFound,
     /// The provider is referenced by request logs and cannot be deleted.
     InUse,
+    /// The provider is bound to a credential and cannot be deleted.
+    Bound,
     /// The edit named no writable field, so nothing was changed.
     NoFieldsToUpdate,
     /// The record could not be persisted.
@@ -230,12 +163,12 @@ impl fmt::Display for ProviderServiceError {
             Self::InvalidEndpoint => "provider endpoint is invalid",
             Self::InsecureEndpoint => "provider endpoint must use HTTPS",
             Self::InvalidUpstreamApiKey => "upstream API key is invalid",
-            Self::Credential => "gateway credential generation failed",
             Self::Busy => "provider service has no spare capacity",
             Self::Cipher => "upstream credential encryption failed",
             Self::Conflict => "provider conflicts with existing data",
             Self::NotFound => "provider was not found",
             Self::InUse => "provider is referenced by request logs",
+            Self::Bound => "provider is bound to a credential",
             Self::NoFieldsToUpdate => "the edit named no writable field",
             Self::Storage => "provider could not be persisted",
         };
@@ -245,20 +178,20 @@ impl fmt::Display for ProviderServiceError {
 
 impl Error for ProviderServiceError {}
 
-/// Creates providers, encrypting upstream keys and issuing gateway credentials.
-pub struct ProviderService<R, C, V> {
+/// Creates providers and encrypts their upstream keys.
+///
+/// The service holds no credential verifier: a provider issues no credentials,
+/// so there is nothing here that needs to hash or compare a secret.
+pub struct ProviderService<R, C> {
     repository: R,
     cipher: C,
-    verifier: Arc<V>,
-    password_work: PasswordWork,
     allow_insecure_endpoints: bool,
 }
 
-impl<R, C, V> ProviderService<R, C, V>
+impl<R, C> ProviderService<R, C>
 where
     R: ProviderRepository,
     C: SecretCipher,
-    V: GatewaySecretVerifier + 'static,
 {
     /// Returns one provider for administration without exposing stored secrets.
     pub async fn get(&self, id: ProviderId) -> Result<Provider, ProviderServiceError> {
@@ -334,23 +267,12 @@ where
     ///
     /// `allow_insecure_endpoints` admits plain-HTTP endpoints and must only be
     /// set from an explicit development mode.
-    pub fn new(repository: R, cipher: C, verifier: V, allow_insecure_endpoints: bool) -> Self {
+    pub fn new(repository: R, cipher: C, allow_insecure_endpoints: bool) -> Self {
         Self {
             repository,
             cipher,
-            verifier: Arc::new(verifier),
-            password_work: PasswordWork::default(),
             allow_insecure_endpoints,
         }
-    }
-
-    pub fn set_password_work(&mut self, work: PasswordWork) {
-        self.password_work = work;
-    }
-
-    pub fn with_password_work(mut self, password_work: PasswordWork) -> Self {
-        self.password_work = password_work;
-        self
     }
 
     /// Reports whether plain-HTTP provider endpoints are admitted.
@@ -366,20 +288,11 @@ where
     pub async fn create(
         &self,
         request: CreateProviderRequest,
-    ) -> Result<CreatedProvider, ProviderServiceError> {
+    ) -> Result<Provider, ProviderServiceError> {
         let name = validate_name(&request.name)?;
         let endpoint = validate_endpoint(&request.endpoint, self.allow_insecure_endpoints)?;
         validate_upstream_api_key(&request.upstream_api_key)?;
 
-        let verifier = self.verifier.clone();
-        let (gateway_credential, gateway_api_key_hash) =
-            match self.password_work.run(move || verifier.issue()).await {
-                Ok(Ok(issued)) => issued,
-                Ok(Err(_)) | Err(PasswordWorkError::Failed) => {
-                    return Err(ProviderServiceError::Credential);
-                }
-                Err(PasswordWorkError::Busy) => return Err(ProviderServiceError::Busy),
-            };
         let upstream_api_key_ciphertext = self
             .cipher
             .encrypt(&request.upstream_api_key)
@@ -390,52 +303,13 @@ where
             request.protocol_type,
             endpoint,
             upstream_api_key_ciphertext,
-            gateway_credential.key_id().clone(),
-            gateway_api_key_hash,
             request.status,
             Utc::now(),
         );
-        let provider = self
-            .repository
+        self.repository
             .create(new_provider)
             .await
-            .map_err(map_repository_error)?;
-
-        Ok(CreatedProvider::new(provider, gateway_credential))
-    }
-
-    /// Issues a new gateway credential and replaces the stored key material.
-    ///
-    /// The key identifier and its hash are replaced together in one storage
-    /// write, so a concurrent reader never observes a half-rotated provider.
-    /// The new credential is returned once; requests that used the previous
-    /// one fail after the replacement is committed, while snapshots already
-    /// held by active streams or connections keep working.
-    pub async fn rotate_gateway_credential(
-        &self,
-        id: ProviderId,
-    ) -> Result<RotatedProvider, ProviderServiceError> {
-        let verifier = self.verifier.clone();
-        let (gateway_credential, gateway_api_key_hash) =
-            match self.password_work.run(move || verifier.issue()).await {
-                Ok(Ok(issued)) => issued,
-                Ok(Err(_)) | Err(PasswordWorkError::Failed) => {
-                    return Err(ProviderServiceError::Credential);
-                }
-                Err(PasswordWorkError::Busy) => return Err(ProviderServiceError::Busy),
-            };
-
-        let provider = self
-            .repository
-            .rotate_gateway_key(
-                id,
-                gateway_credential.key_id().clone(),
-                gateway_api_key_hash,
-            )
-            .await
-            .map_err(map_repository_error)?;
-
-        Ok(RotatedProvider::new(provider, gateway_credential))
+            .map_err(map_repository_error)
     }
 
     /// Applies a partial edit, committing only the named fields.

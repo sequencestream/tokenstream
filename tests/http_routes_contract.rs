@@ -18,7 +18,9 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame, SizeHint};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, StatusCode};
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::http::HttpProxy;
 use tokenstream::routing::{ResolvedRoute, resolve_route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -201,6 +203,8 @@ async fn read_body(stream: &mut TcpStream, head: &str, mut body: Vec<u8>) -> Vec
 
 fn snapshot(case: RouteCase, address: SocketAddr) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         case.protocol,
         Url::parse(&format!("http://{address}/provider-prefix")).expect("valid mock endpoint"),

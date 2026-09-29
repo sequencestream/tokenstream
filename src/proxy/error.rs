@@ -44,6 +44,12 @@ pub enum GatewayError {
     InvalidGatewayCredential,
     /// The credential resolved a provider that is disabled.
     ProviderDisabled,
+    /// The account that owns the presented credential is disabled.
+    AccountDisabled,
+    /// The presented credential carries an expiration that has passed.
+    KeyExpired,
+    /// The credential selected no provider and carries no default binding.
+    NoProviderSelected,
     /// The provider cannot serve the requested method, path, or transport.
     UnsupportedRoute,
     /// The request carried an upgrade that is not the one supported upgrade.
@@ -66,6 +72,9 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => "invalid_gateway_credential",
             Self::ProviderDisabled => "provider_disabled",
+            Self::AccountDisabled => "account_disabled",
+            Self::KeyExpired => "key_expired",
+            Self::NoProviderSelected => "no_provider_selected",
             Self::UnsupportedRoute => "unsupported_route",
             Self::InvalidUpgrade => "invalid_upgrade",
             Self::UpstreamConnectFailed => "upstream_connect_failed",
@@ -81,6 +90,9 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => StatusCode::UNAUTHORIZED,
             Self::ProviderDisabled => StatusCode::FORBIDDEN,
+            Self::AccountDisabled => StatusCode::FORBIDDEN,
+            Self::KeyExpired => StatusCode::UNAUTHORIZED,
+            Self::NoProviderSelected => StatusCode::BAD_REQUEST,
             Self::UnsupportedRoute => StatusCode::NOT_FOUND,
             Self::InvalidUpgrade => StatusCode::BAD_REQUEST,
             Self::UpstreamConnectFailed => StatusCode::BAD_GATEWAY,
@@ -98,6 +110,9 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => "The gateway credential is invalid.",
             Self::ProviderDisabled => "The provider is disabled.",
+            Self::AccountDisabled => "The account is disabled.",
+            Self::KeyExpired => "The gateway credential has expired.",
+            Self::NoProviderSelected => "No provider is selected for this credential.",
             Self::UnsupportedRoute => "The requested route is not available for this provider.",
             Self::InvalidUpgrade => "The requested WebSocket upgrade is not valid.",
             Self::UpstreamConnectFailed => "The upstream connection failed.",
@@ -157,6 +172,9 @@ impl From<GatewayAuthError> for GatewayError {
             | GatewayAuthError::UnknownCredential
             | GatewayAuthError::InvalidCredential => Self::InvalidGatewayCredential,
             GatewayAuthError::ProviderDisabled => Self::ProviderDisabled,
+            GatewayAuthError::AccountDisabled => Self::AccountDisabled,
+            GatewayAuthError::KeyExpired => Self::KeyExpired,
+            GatewayAuthError::NoProviderSelected => Self::NoProviderSelected,
             GatewayAuthError::Busy => Self::ResourceExhausted,
             GatewayAuthError::Unavailable => Self::InternalError,
         }
@@ -206,6 +224,9 @@ mod tests {
         let expected = [
             (GatewayError::InvalidGatewayCredential, 401),
             (GatewayError::ProviderDisabled, 403),
+            (GatewayError::AccountDisabled, 403),
+            (GatewayError::KeyExpired, 401),
+            (GatewayError::NoProviderSelected, 400),
             (GatewayError::UnsupportedRoute, 404),
             (GatewayError::InvalidUpgrade, 400),
             (GatewayError::UpstreamConnectFailed, 502),

@@ -245,7 +245,8 @@ def start_gateway(directory, db_name, capacity, log_queue, password_concurrency=
     values = {
         'DATA_LISTEN_ADDR': f'127.0.0.1:{data_port}', 'ADMIN_LISTEN_ADDR': f'127.0.0.1:{admin_port}',
         'DATABASE_URL': f'sqlite://{db}', 'MASTER_KEY': '11' * 32,
-        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'DEVELOPMENT_MODE': 'true',
+        'ADMIN_PASSWORD_HASH': os.environ['TEST_ADMIN_HASH'], 'ADMIN_PASSWORD': 'test-admin',
+        'DEVELOPMENT_MODE': 'true',
         'UPSTREAM_CONNECT_TIMEOUT_MS': '2000', 'UPSTREAM_HEADER_TIMEOUT_MS': '10000',
         'STREAM_IDLE_TIMEOUT_MS': '60000', 'SHUTDOWN_DRAIN_TIMEOUT_MS': '3000', 'LOG_FLUSH_TIMEOUT_MS': '5000',
         'DATABASE_MAX_CONNECTIONS': '16', 'MAX_PROXY_CONNECTIONS': str(capacity),
@@ -366,8 +367,8 @@ def _listening(port):
         return False
 
 
-def authenticate(admin_port, password='test-admin'):
-    status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'password': password}).encode())
+def authenticate(admin_port, name='admin', password='test-admin'):
+    status, headers, body = exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'name': name, 'password': password}).encode())
     assert status == 200, (status, body)
     return {
         'Cookie': headers['set-cookie'].split(';')[0],
@@ -383,7 +384,18 @@ def create_provider(admin_port, auth, name, endpoint):
     }).encode()
     status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', body, auth)
     assert status == 201, (status, response)
-    return json.loads(response)['gateway_api_key']
+    return issue_credential(admin_port, auth, name, json.loads(response)['id'])
+
+
+def issue_credential(admin_port, auth, name, provider_id):
+    """A provider no longer issues credentials; an account owns them."""
+    body = json.dumps({
+        'account_id': 1, 'name': f'key-{name}', 'provider_ids': [provider_id],
+        'default_provider_id': provider_id, 'status': 'enabled',
+    }).encode()
+    status, _, response = exchange(admin_port, 'POST', '/admin/api/api-keys', body, auth)
+    assert status == 201, (status, response)
+    return json.loads(response)['api_key_secret']
 
 
 def metrics(admin_port, auth):
@@ -614,7 +626,7 @@ def run():
 
                 def authenticate_once(_index):
                     barrier.wait()
-                    return exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'password': 'test-admin'}).encode())[0]
+                    return exchange(admin_port, 'POST', '/admin/api/session', json.dumps({'name': 'admin', 'password': 'test-admin'}).encode())[0]
 
                 auth_futures = [pool.submit(authenticate_once, index) for index in range(AUTH_PRESSURE_CLIENTS)]
                 assert exchange(data_port, 'POST', '/v1/responses', PAYLOAD, headers)[0] == 200

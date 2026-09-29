@@ -11,19 +11,65 @@ async fn database(path: &Path, max_connections: usize) -> SqliteDatabase {
         .expect("connect to SQLite")
 }
 
-async fn insert_provider(pool: &SqlitePool, name: &str, key_id: &str) -> i64 {
+/// Inserts a provider, which now holds configuration only and issues nothing.
+async fn insert_provider(pool: &SqlitePool, name: &str) -> i64 {
     sqlx::query(
         "INSERT INTO provider (
-            name, protocol_type, endpoint, upstream_api_key_ciphertext,
-            gateway_key_id, gateway_api_key_hash, status, created_at
-         ) VALUES (?, 'openai', 'https://example.com', 'ciphertext', ?, 'hash', 'enabled', 1)",
+            name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at
+         ) VALUES (?, 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
     )
     .bind(name)
-    .bind(key_id)
     .execute(pool)
     .await
     .expect("insert provider")
     .last_insert_rowid()
+}
+
+/// Inserts the account and credential a request log is attributed to.
+async fn insert_principal(pool: &SqlitePool) -> (i64, i64, i64) {
+    let account_id = sqlx::query(
+        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+         VALUES ('migrated-admin', 'hash', 'admin', 'enabled', 1, 1)",
+    )
+    .execute(pool)
+    .await
+    .expect("insert account")
+    .last_insert_rowid();
+    let api_key_id = sqlx::query(
+        "INSERT INTO api_key (
+            account_id, name, key_id, secret_hash, status, default_provider_id,
+            expires_at, created_at
+         ) VALUES (?, 'migrated', 'migrated-key', 'hash', 'enabled', NULL, NULL, 1)",
+    )
+    .bind(account_id)
+    .execute(pool)
+    .await
+    .expect("insert credential")
+    .last_insert_rowid();
+    (account_id, api_key_id, api_key_id)
+}
+
+/// Inserts a request log attributed to the account and credential above.
+async fn insert_request_log(
+    pool: &SqlitePool,
+    request_id: &str,
+    account_id: i64,
+    api_key_id: i64,
+    provider_id: i64,
+) {
+    sqlx::query(
+        "INSERT INTO request_log (
+            request_id, account_id, api_key_id, provider_id,
+            protocol_type, transport_type, path, start_time
+         ) VALUES (?, ?, ?, ?, 'openai', 'http', '/v1/responses', 1)",
+    )
+    .bind(request_id)
+    .bind(account_id)
+    .bind(api_key_id)
+    .bind(provider_id)
+    .execute(pool)
+    .await
+    .expect("insert request log");
 }
 
 #[tokio::test]
@@ -40,7 +86,7 @@ async fn migrations_are_versioned_and_repeatable() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
@@ -52,10 +98,14 @@ async fn migrations_are_versioned_and_repeatable() {
     .map(|row| row.get("name"))
     .collect();
     for expected in [
+        "account",
+        "api_key",
+        "api_key_provider",
         "provider",
         "request_log",
         "request_log_start_time_idx",
         "request_log_provider_id_idx",
+        "request_log_account_id_idx",
     ] {
         assert!(objects.contains(expected), "missing {expected}");
     }
@@ -85,37 +135,50 @@ async fn schema_rejects_invalid_unique_and_enum_values() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = database(&directory.path().join("constraints.db"), 1).await;
     database.migrate().await.expect("migrations");
-    let provider_id = insert_provider(database.pool(), "primary", "key-1").await;
+    let provider_id = insert_provider(database.pool(), "primary").await;
+    let (account_id, api_key_id, _) = insert_principal(database.pool()).await;
 
     for statement in [
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at) VALUES ('primary', 'openai', 'https://example.com', 'ciphertext', 'key-2', 'hash', 'enabled', 1)",
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at) VALUES ('secondary', 'openai', 'https://example.com', 'ciphertext', 'key-1', 'hash', 'enabled', 1)",
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at) VALUES ('secondary', 'unknown', 'https://example.com', 'ciphertext', 'key-3', 'hash', 'enabled', 1)",
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, gateway_key_id, gateway_api_key_hash, status, created_at) VALUES ('secondary', 'openai', 'https://example.com', 'ciphertext', 'key-3', 'hash', 'retired', 1)",
+        // A provider name is unique.
+        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('primary', 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
+        // Only the two known protocols and the two known statuses are accepted.
+        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'unknown', 'https://example.com', 'ciphertext', 'enabled', 1)",
+        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'openai', 'https://example.com', 'ciphertext', 'retired', 1)",
+        // An account name and a credential key identifier are each unique.
+        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('migrated-admin', 'hash', 'user', 'enabled', 0, 1)",
+        "INSERT INTO api_key (account_id, name, key_id, secret_hash, status, default_provider_id, expires_at, created_at) VALUES (1, 'other', 'migrated-key', 'hash', 'enabled', NULL, NULL, 1)",
+        // Only the two known roles and statuses are accepted.
+        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'owner', 'enabled', 0, 1)",
+        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'user', 'locked', 0, 1)",
     ] {
         assert!(database.pool().execute(statement).await.is_err());
     }
 
     let invalid_transport = sqlx::query(
-        "INSERT INTO request_log (request_id, provider_id, protocol_type, transport_type, path, start_time)
-         VALUES ('request-invalid', ?, 'openai', 'stream', '/v1/responses', 1)",
+        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time)
+         VALUES ('request-invalid', ?, ?, ?, 'openai', 'stream', '/v1/responses', 1)",
     )
+    .bind(account_id)
+    .bind(api_key_id)
     .bind(provider_id)
     .execute(database.pool())
     .await;
     assert!(invalid_transport.is_err());
 
-    sqlx::query(
-        "INSERT INTO request_log (request_id, provider_id, protocol_type, transport_type, path, start_time)
-         VALUES ('request-1', ?, 'openai', 'http', '/v1/responses', 1)",
+    insert_request_log(
+        database.pool(),
+        "request-1",
+        account_id,
+        api_key_id,
+        provider_id,
     )
-    .bind(provider_id)
-    .execute(database.pool())
-    .await
-    .expect("insert valid request log");
+    .await;
     for statement in [
-        "INSERT INTO request_log (request_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-1', 1, 'openai', 'http', '/v1/responses', 1)",
-        "INSERT INTO request_log (request_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-2', 1, 'unknown', 'http', '/v1/responses', 1)",
+        // A request identifier is unique, so a start event is recorded once.
+        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-1', 1, 1, 1, 'openai', 'http', '/v1/responses', 1)",
+        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-2', 1, 1, 1, 'unknown', 'http', '/v1/responses', 1)",
+        // A credential belongs to an account that exists.
+        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-3', 999, 999, 1, 'openai', 'http', '/v1/responses', 1)",
     ] {
         assert!(database.pool().execute(statement).await.is_err());
     }
@@ -127,16 +190,16 @@ async fn referenced_providers_cannot_be_deleted_and_ids_are_not_reused() {
     let database = database(&directory.path().join("identity.db"), 1).await;
     database.migrate().await.expect("migrations");
 
-    let referenced_id = insert_provider(database.pool(), "referenced", "key-1").await;
-    sqlx::query(
-        "INSERT INTO request_log (
-            request_id, provider_id, protocol_type, transport_type, path, start_time
-         ) VALUES ('request-1', ?, 'openai', 'http', '/v1/responses', 1)",
+    let referenced_id = insert_provider(database.pool(), "referenced").await;
+    let (account_id, api_key_id, _) = insert_principal(database.pool()).await;
+    insert_request_log(
+        database.pool(),
+        "request-1",
+        account_id,
+        api_key_id,
+        referenced_id,
     )
-    .bind(referenced_id)
-    .execute(database.pool())
-    .await
-    .expect("insert request log");
+    .await;
     assert!(
         sqlx::query("DELETE FROM provider WHERE id = ?")
             .bind(referenced_id)
@@ -145,12 +208,12 @@ async fn referenced_providers_cannot_be_deleted_and_ids_are_not_reused() {
             .is_err()
     );
 
-    let deleted_id = insert_provider(database.pool(), "deleted", "key-2").await;
+    let deleted_id = insert_provider(database.pool(), "deleted").await;
     sqlx::query("DELETE FROM provider WHERE id = ?")
         .bind(deleted_id)
         .execute(database.pool())
         .await
         .expect("delete unreferenced provider");
-    let next_id = insert_provider(database.pool(), "next", "key-3").await;
+    let next_id = insert_provider(database.pool(), "next").await;
     assert!(next_id > deleted_id);
 }

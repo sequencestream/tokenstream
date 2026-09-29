@@ -1,6 +1,6 @@
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 
-import { AdminApi, SessionExpiredError } from '../api/client.ts'
+import { AdminApi, type AccountRole, SessionExpiredError } from '../api/client.ts'
 
 /**
  * Owns the administrator session for the page.
@@ -13,16 +13,27 @@ import { AdminApi, SessionExpiredError } from '../api/client.ts'
 export function useAdminSession(api: AdminApi) {
   const signedIn = ref(false)
   const checking = ref(true)
+  const accountName = ref('')
+  const role = ref<AccountRole>('user')
+  /** Whether the session may reach the views only an administrator owns. */
+  const isAdmin = computed(() => role.value === 'admin')
+
+  function adopt(session: { signed_in: boolean; account_name: string; role: AccountRole }): boolean {
+    signedIn.value = session.signed_in
+    accountName.value = session.account_name
+    role.value = session.role
+    return session.signed_in
+  }
 
   /** Reads an existing session so a refresh keeps the administrator signed in. */
   async function restore(): Promise<boolean> {
     checking.value = true
     try {
-      const session = await api.session()
-      signedIn.value = session.signed_in
-      return session.signed_in
+      return adopt(await api.session())
     } catch {
       signedIn.value = false
+      accountName.value = ''
+      role.value = 'user'
       return false
     } finally {
       checking.value = false
@@ -30,15 +41,16 @@ export function useAdminSession(api: AdminApi) {
   }
 
   /** Signs in, reporting the sanitized reason on failure. */
-  async function signIn(password: string): Promise<void> {
-    const session = await api.signIn(password)
-    signedIn.value = session.signed_in
+  async function signIn(name: string, password: string): Promise<void> {
+    adopt(await api.signIn(name, password))
   }
 
   /** Revokes the session so later navigation and refresh require sign-in. */
   async function signOut(): Promise<void> {
     await api.signOut()
     signedIn.value = false
+    accountName.value = ''
+    role.value = 'user'
   }
 
   /**
@@ -55,5 +67,15 @@ export function useAdminSession(api: AdminApi) {
     return error instanceof Error ? error.message : 'The request could not be completed.'
   }
 
-  return { signedIn, checking, restore, signIn, signOut, handleFailure }
+  return {
+    signedIn,
+    checking,
+    accountName,
+    role,
+    isAdmin,
+    restore,
+    signIn,
+    signOut,
+    handleFailure,
+  }
 }

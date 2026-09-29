@@ -17,6 +17,7 @@ import { chromium } from 'playwright'
 
 const repositoryRoot = fileURLToPath(new URL('../..', import.meta.url))
 const webRoot = fileURLToPath(new URL('..', import.meta.url))
+const accountName = process.env.TEST_ADMIN_ACCOUNT ?? 'admin'
 const password = process.env.TEST_ADMIN_PASSWORD
 const gatewayBinary = process.env.GATEWAY_BINARY
 const mainSessionTtlMs = 60_000
@@ -74,6 +75,7 @@ async function startGateway({ name, directory, sessionTtlMs }) {
     TOKENSTREAM_DATABASE_URL: `sqlite://${join(directory, `${name}.db`)}`,
     TOKENSTREAM_MASTER_KEY: '11'.repeat(32),
     TOKENSTREAM_ADMIN_PASSWORD_HASH: process.env.TEST_ADMIN_HASH,
+    TOKENSTREAM_ADMIN_PASSWORD: password,
     TOKENSTREAM_DEVELOPMENT_MODE: 'true',
     TOKENSTREAM_ADMIN_SESSION_TTL_MS: String(sessionTtlMs),
     TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS: '5000',
@@ -181,9 +183,46 @@ async function storedCredentialTraces(page, credential) {
 async function signIn(page, origin) {
   await page.goto(origin, { waitUntil: 'networkidle' })
   await assert.equal(await page.getByRole('heading', { name: 'Sign in' }).count(), 1)
+  await page.getByLabel('Account').fill(accountName)
   await page.getByLabel('Password').fill(password)
   await page.getByRole('button', { name: 'Sign in' }).click()
-  await page.getByRole('heading', { name: 'Providers' }).waitFor()
+  await page.getByRole('heading', { name: 'Credentials' }).waitFor()
+}
+
+/** Creates a provider through the page, returning its name. */
+async function createProvider(page, name) {
+  await page.getByRole('button', { name: 'Providers' }).click()
+  await page.getByRole('button', { name: 'New provider' }).click()
+  await page.getByPlaceholder('primary-openai').waitFor()
+  await page.getByPlaceholder('primary-openai').fill(name)
+  await page.getByPlaceholder('https://api.example.com').fill('https://api.example.com')
+  await page.getByLabel('Upstream API key').fill('upstream-secret')
+  await page.getByRole('button', { name: 'Create provider' }).click()
+  await page.getByRole('row').filter({ hasText: name }).waitFor()
+}
+
+/** Issues a credential bound to one provider, returning its one-time plaintext. */
+async function issueCredential(page, providerName, keyName) {
+  await page.getByRole('button', { name: 'Credentials' }).click()
+  await page.getByPlaceholder('ci').fill(keyName)
+  await page.locator('.binding').filter({ hasText: providerName }).locator('input').check()
+  await page.getByRole('button', { name: 'Create credential' }).click()
+  await page.locator('.credential-card code').waitFor()
+  const secret = (await page.locator('.credential-card code').innerText()).trim()
+  await page.getByRole('button', { name: 'I have stored it' }).click()
+  return secret
+}
+
+/** Creates a regular account and returns its name with its one-time password. */
+async function createAccount(page, name) {
+  await page.getByRole('button', { name: 'Accounts' }).click()
+  await page.getByRole('button', { name: 'New account' }).click()
+  await page.getByPlaceholder('analyst').fill(name)
+  await page.getByRole('button', { name: 'Create account' }).click()
+  await page.getByRole('heading', { name: 'Password for the new account' }).waitFor()
+  const generated = (await page.locator('.credential-card code').innerText()).trim()
+  await page.getByRole('button', { name: 'I have stored it' }).click()
+  return generated
 }
 
 async function runSuite(browser, origin, label) {
@@ -206,77 +245,106 @@ async function runSuite(browser, origin, label) {
     }
 
     const unauthenticated = await page.evaluate(async () => {
-      const response = await fetch('/admin/api/providers', { credentials: 'same-origin' })
+      const response = await fetch('/admin/api/accounts', { credentials: 'same-origin' })
       return { status: response.status, cache: response.headers.get('cache-control') }
     })
     assert.equal(unauthenticated.status, 401)
     assert.equal(unauthenticated.cache, 'no-store')
 
+    // A wrong password and a wrong account name fail identically, so neither
+    // reveals whether the named account exists.
+    await page.getByLabel('Account').fill(accountName)
+    await page.getByLabel('Password').fill('not-the-password')
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('alert').filter({ hasText: 'Invalid credentials' }).waitFor()
+
+    await page.getByLabel('Account').fill(accountName)
     await page.getByLabel('Password').fill(password)
     await page.getByRole('button', { name: 'Sign in' }).click()
-    await page.getByRole('heading', { name: 'Providers' }).waitFor()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
 
     await page.reload({ waitUntil: 'networkidle' })
-    await page.getByRole('heading', { name: 'Providers' }).waitFor()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
 
     const csrf = await page.evaluate(async () => {
-      const response = await fetch('/admin/api/providers', {
+      const response = await fetch('/admin/api/accounts', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          name: 'csrf-rejected',
-          protocol_type: 'openai',
-          endpoint: 'https://api.example.com',
-          upstream_api_key: 'secret',
-          status: 'enabled',
-        }),
+        body: JSON.stringify({ name: 'csrf-rejected', role: 'user', status: 'enabled' }),
       })
       return { status: response.status, cache: response.headers.get('cache-control') }
     })
     assert.equal(csrf.status, 403)
     assert.equal(csrf.cache, 'no-store')
 
+    // A provider issues no credential of its own, so nothing is shown when one
+    // is created.
     const providerName = `browser-${label}`
     assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
+    await page.getByRole('button', { name: 'Providers' }).click()
     await page.getByRole('button', { name: 'New provider' }).click()
     await page.getByPlaceholder('primary-openai').waitFor()
     await page.getByRole('button', { name: 'Cancel' }).click()
     assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
-    await page.getByRole('button', { name: 'New provider' }).click()
-    await page.getByPlaceholder('primary-openai').fill(providerName)
-    await page.getByPlaceholder('https://api.example.com').fill('https://api.example.com')
-    await page.getByLabel('Upstream API key').fill('upstream-secret')
-    await page.getByRole('button', { name: 'Create provider' }).click()
-    await page.getByRole('heading', { name: `Credential for ${providerName}` }).waitFor()
-    assert.equal(await page.getByPlaceholder('primary-openai').count(), 0)
-    assert.equal(await page.getByRole('button', { name: 'New provider' }).count(), 1)
-    const createdCredential = (await page.locator('.credential-card code').innerText()).trim()
+    await createProvider(page, providerName)
+    assert.equal(await page.locator('.credential-card').count(), 0)
+
+    const keyName = `ci-${label}`
+    const createdCredential = await issueCredential(page, providerName, keyName)
     assert.match(createdCredential, /^.+\..+$/)
     assert.deepEqual(await storedCredentialTraces(page, createdCredential), {
       local: false,
       session: false,
     })
 
-    await page.getByRole('button', { name: 'I have stored it' }).click()
     await page.reload({ waitUntil: 'networkidle' })
-    await page.getByRole('heading', { name: 'Providers' }).waitFor()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
     assert.equal(await page.locator('.credential-card').count(), 0)
     assert.equal(await page.getByText(createdCredential).count(), 0)
 
     page.once('dialog', (dialog) => dialog.accept())
     await page
       .getByRole('row')
-      .filter({ hasText: providerName })
+      .filter({ has: page.getByRole('cell', { name: keyName, exact: true }) })
       .getByRole('button', { name: 'Rotate credential' })
       .click()
-    await page.getByRole('heading', { name: `New credential for ${providerName}` }).waitFor()
+    await page.getByRole('heading', { name: `New credential for ${keyName}` }).waitFor()
     const rotatedCredential = (await page.locator('.credential-card code').innerText()).trim()
     assert.notEqual(rotatedCredential, createdCredential)
     assert.deepEqual(await storedCredentialTraces(page, rotatedCredential), {
       local: false,
       session: false,
     })
+    await page.getByRole('button', { name: 'I have stored it' }).click()
+
+    // A regular user manages only its own credentials, so it never sees the
+    // administrator-only views.
+    const userName = `analyst-${label}`
+    const userPassword = await createAccount(page, userName)
+    await signOut(page)
+    await page.getByLabel('Account').fill(userName)
+    await page.getByLabel('Password').fill(userPassword)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
+    assert.equal(await page.getByRole('button', { name: 'Accounts' }).count(), 0)
+    assert.equal(await page.getByRole('button', { name: 'Settings' }).count(), 0)
+    const userScope = await page.evaluate(async () => {
+      const response = await fetch('/admin/api/accounts', { credentials: 'same-origin' })
+      return response.status
+    })
+    assert.equal(userScope, 403)
+    assert.equal(
+      await page.getByRole('cell', { name: keyName, exact: true }).count(),
+      0,
+      'a regular user must not see another account\'s credentials',
+    )
+
+    await signOut(page)
+    await page.getByLabel('Account').fill(accountName)
+    await page.getByLabel('Password').fill(password)
+    await page.getByRole('button', { name: 'Sign in' }).click()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
 
     const logQueries = []
     const onLogRequest = (request) => {
@@ -308,9 +376,9 @@ async function runSuite(browser, origin, label) {
     )
     page.off('request', onLogRequest)
 
-    const signOut = page.getByRole('button', { name: 'Sign out' })
-    await waitFor(() => signOut.isEnabled(), 'the page stayed busy after applying filters')
-    await signOut.click()
+    const signOutButton = page.getByRole('button', { name: 'Sign out' })
+    await waitFor(() => signOutButton.isEnabled(), 'the page stayed busy after applying filters')
+    await signOutButton.click()
     await page.getByRole('heading', { name: 'Sign in' }).waitFor()
     await page.reload({ waitUntil: 'networkidle' })
     await page.getByRole('heading', { name: 'Sign in' }).waitFor()
@@ -318,6 +386,13 @@ async function runSuite(browser, origin, label) {
   } finally {
     await context.close()
   }
+}
+
+async function signOut(page) {
+  const button = page.getByRole('button', { name: 'Sign out' })
+  await waitFor(() => button.isEnabled(), 'the page stayed busy')
+  await button.click()
+  await page.getByRole('heading', { name: 'Sign in' }).waitFor()
 }
 
 async function runExpiry(browser, origin) {

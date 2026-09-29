@@ -41,6 +41,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )
     .await?;
+    // Migrations run before anything reads or writes a row. The bootstrap
+    // account below depends on the tables this process is about to create, so
+    // an upgrade and a fresh deployment follow the same path.
+    tokenstream::MigrationRunner::run(&database).await?;
     let metrics = Metrics::default();
     let admission =
         AdmissionControl::with_metrics(ProxyLimits::from_config(&config), metrics.clone());
@@ -56,6 +60,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let admin_password_work =
         tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
     let cipher = SharedCipher::new(config.master_key().expose());
+    // The bootstrap account is created from the password this process was
+    // configured with. The plaintext is resolved once, here, and is never
+    // persisted: it comes from the environment when the operator supplied one,
+    // and otherwise from the documented default when the configured hash is
+    // still that default's. A hash whose plaintext is genuinely unknown — a
+    // hash supplied directly — gets a generated password shown once, because a
+    // hash cannot be reversed and a guessed password would be worse.
+    let bootstrap_password = match std::env::var("TOKENSTREAM_ADMIN_PASSWORD") {
+        Ok(password) => password,
+        Err(_) if config.uses_default_admin_password() => {
+            tokenstream::local_state::DEFAULT_ADMIN_PASSWORD.to_owned()
+        }
+        Err(_) => tokenstream::local_state::generate_admin_password()?,
+    };
     let admin_api = AdminApi::new(
         database.clone(),
         cipher.clone(),
@@ -68,6 +86,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // The compiled page is confirmed before either listener binds, so a
     // deployment never comes up claiming to serve a page it cannot serve.
     admin_api.verify_assets()?;
+    // The first account is created from the configured administrator
+    // credentials before the control plane starts serving, so a fresh
+    // deployment can sign in immediately and an upgraded one adopts the
+    // credentials it already has without operator action.
+    if admin_api
+        .ensure_bootstrap_account(config.bootstrap_account_name(), &bootstrap_password)
+        .await?
+    {
+        eprintln!(
+            "Created bootstrap account {}; change its password from the administration page.",
+            config.bootstrap_account_name()
+        );
+        if !config.uses_default_admin_password()
+            && std::env::var("TOKENSTREAM_ADMIN_PASSWORD").is_err()
+        {
+            eprintln!("Bootstrap account password: {bootstrap_password}");
+        }
+    }
     let gateway = Gateway::with_shared_cipher(
         &config,
         database.clone(),
@@ -79,7 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),
         config.admin_listen_addr(),
-        database,
+        tokenstream::RegisteredMigrations,
         gateway,
         admin_api,
         admission,

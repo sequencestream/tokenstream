@@ -11,12 +11,12 @@ A cache would hide database latency on the hot path, but it would also serve sta
 
 ## Decision
 
-Each admitted request or connection looks up its gateway-key identifier directly, verifies the secret, decrypts the upstream key, and then holds an immutable, request-local snapshot. There is no application-level credential cache. Provider edits, disabling, key rotation, and deletion affect new work only.
+Each admitted request or connection looks up the credential it was given, verifies the secret, resolves the account that owns it and the one provider it selects, decrypts the upstream key, and then holds an immutable, request-local snapshot of all four. There is no application-level credential cache. Account status, credential status and expiry, credential rotation, provider edits, provider disabling, and deletion affect new work only.
 
 Snapshot creation is in the [authentication design](../modules/authentication.md). Provider lifecycle is in the [providers design](../modules/providers.md).
 
 ## Consequences
 
-- Already admitted HTTP streams and WebSocket connections keep working with the snapshot they received, even if the provider is later disabled or rotated.
+- Already admitted HTTP streams and WebSocket connections keep working with the snapshot they received, even if the account is disabled, the credential is rotated, or the provider is later disabled.
 - New requests using an old credential fail as soon as the committed rotation is visible.
 - Lookup cost and database deadlines sit on every new admission and must fail closed under [ADR 0006](./0006-fail-closed-resource-bounds.md), rather than being absorbed by a cache.

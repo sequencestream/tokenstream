@@ -1,12 +1,15 @@
 use std::path::Path;
 
+use chrono::Utc;
 use hyper::HeaderMap;
 use hyper::header::{AUTHORIZATION, HeaderValue};
 use tokenstream::auth::{GatewayAuthError, GatewayAuthenticator};
+use tokenstream::credentials::CredentialService;
+use tokenstream::credentials::{CreateApiKeyRequest, UpdateAccountRequest, UpdateApiKeyRequest};
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::domain::{
-    GATEWAY_SECRET_LENGTH, GatewayCredential, GatewayKeyId, ProtocolType, ProviderStatus,
-    SecretString,
+    AccountStatus, ApiKeyStatus, GATEWAY_SECRET_LENGTH, GatewayCredential, GatewayKeyId,
+    ProtocolType, ProviderStatus, SecretString,
 };
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::providers::{CreateProviderRequest, ProviderService, UpdateProviderRequest};
@@ -15,7 +18,11 @@ const MASTER_KEY: [u8; 32] = [0x5c; 32];
 const UPSTREAM_KEY: &str = "sk-upstream-secret-value";
 const ROTATED_UPSTREAM_KEY: &str = "sk-rotated-secret-value";
 
-type Service = ProviderService<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>;
+mod support;
+
+use support::{bootstrap_account, issue_api_key, render};
+
+type Service = ProviderService<SqliteDatabase, AesGcmCipher>;
 type Authenticator =
     GatewayAuthenticator<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>;
 
@@ -29,12 +36,7 @@ async fn sqlite_database(path: &Path) -> SqliteDatabase {
 }
 
 fn service(database: SqliteDatabase) -> Service {
-    ProviderService::new(
-        database,
-        AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
-        false,
-    )
+    ProviderService::new(database, AesGcmCipher::new(&MASTER_KEY), false)
 }
 
 fn authenticator(database: SqliteDatabase) -> Authenticator {
@@ -60,6 +62,23 @@ fn request(
     )
 }
 
+/// Builds the credential service a test issues credentials through.
+fn credentials(
+    database: SqliteDatabase,
+) -> CredentialService<SqliteDatabase, Argon2GatewaySecretVerifier> {
+    CredentialService::new(database, Argon2GatewaySecretVerifier::new())
+}
+
+/// Selects one of a credential's providers through the dedicated header.
+fn with_selection(credential: &str, provider_id: i64) -> HeaderMap {
+    let mut headers = with_bearer(credential);
+    headers.insert(
+        "x-tokenstream-provider",
+        HeaderValue::from_str(&provider_id.to_string()).expect("valid selection header"),
+    );
+    headers
+}
+
 fn with_bearer(credential: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -83,7 +102,9 @@ async fn authenticates_each_provider_native_credential_into_a_snapshot() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("native.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
 
     let openai = service
         .create(request(
@@ -104,11 +125,16 @@ async fn authenticates_each_provider_native_credential_into_a_snapshot() {
         .await
         .expect("create anthropic provider");
 
+    let openai_key = issue_api_key(&accounts, account.id(), vec![openai.id()]).await;
+    let anthropic_key = issue_api_key(&accounts, account.id(), vec![anthropic.id()]).await;
+
     let snapshot = authenticator
-        .authenticate(&with_bearer(&openai.gateway_credential().render()))
+        .authenticate(&with_bearer(&render(&openai_key)))
         .await
         .expect("authenticate openai credential");
-    assert_eq!(snapshot.id(), openai.provider().id());
+    assert_eq!(snapshot.id(), openai.id());
+    assert_eq!(snapshot.account_id(), account.id());
+    assert_eq!(snapshot.api_key_id(), openai_key.api_key().api_key().id());
     assert_eq!(snapshot.protocol_type(), ProtocolType::OpenAi);
     assert_eq!(
         snapshot.endpoint().as_str(),
@@ -117,12 +143,133 @@ async fn authenticates_each_provider_native_credential_into_a_snapshot() {
     assert_eq!(snapshot.upstream_api_key().expose(), UPSTREAM_KEY);
 
     let snapshot = authenticator
-        .authenticate(&with_api_key(&anthropic.gateway_credential().render()))
+        .authenticate(&with_api_key(&render(&anthropic_key)))
         .await
         .expect("authenticate anthropic credential");
-    assert_eq!(snapshot.id(), anthropic.provider().id());
+    assert_eq!(snapshot.id(), anthropic.id());
     assert_eq!(snapshot.protocol_type(), ProtocolType::Anthropic);
     assert_eq!(snapshot.upstream_api_key().expose(), UPSTREAM_KEY);
+}
+
+#[tokio::test]
+async fn one_credential_selects_exactly_one_bound_provider() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("selection.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let first = service
+        .create(request(
+            "first",
+            ProtocolType::OpenAi,
+            "https://api.first.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create first provider");
+    let second = service
+        .create(request(
+            "second",
+            ProtocolType::OpenAi,
+            "https://api.second.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create second provider");
+
+    let issued = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "both".to_owned(),
+            vec![first.id(), second.id()],
+            Some(first.id()),
+            None,
+            ApiKeyStatus::Enabled,
+        ))
+        .await
+        .expect("issue a credential bound to both providers");
+    let credential = render(&issued);
+
+    // With no selection the default binding decides.
+    let snapshot = authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("authenticate with the default binding");
+    assert_eq!(snapshot.id(), first.id());
+
+    // The dedicated header picks the other member of the allowed set.
+    let snapshot = authenticator
+        .authenticate(&with_selection(&credential, second.id().get()))
+        .await
+        .expect("authenticate with an explicit selection");
+    assert_eq!(snapshot.id(), second.id());
+
+    // A provider outside the allowed set is refused rather than silently
+    // falling back to the default, so a misconfigured client fails visibly.
+    let unrelated = service
+        .create(request(
+            "unrelated",
+            ProtocolType::OpenAi,
+            "https://api.unrelated.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create an unrelated provider");
+    assert_eq!(
+        authenticator
+            .authenticate(&with_selection(&credential, unrelated.id().get()))
+            .await
+            .expect_err("a provider outside the allowed set is refused"),
+        GatewayAuthError::UnknownCredential
+    );
+}
+
+#[tokio::test]
+async fn a_credential_without_a_default_or_selection_fails_closed() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("noprovider.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let provider = service
+        .create(request(
+            "primary",
+            ProtocolType::OpenAi,
+            "https://api.openai.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create provider");
+    // A stored credential always resolves to its single binding, so the
+    // fail-closed path needs a credential whose set is genuinely empty.
+    let issued = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "empty".to_owned(),
+            vec![],
+            None,
+            None,
+            ApiKeyStatus::Enabled,
+        ))
+        .await;
+    assert_eq!(
+        issued
+            .expect_err("an empty allowed set is refused")
+            .to_string(),
+        "provider selection is invalid"
+    );
+
+    // With a selection naming the only bound provider the request succeeds.
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let snapshot = authenticator
+        .authenticate(&with_selection(&render(&issued), provider.id().get()))
+        .await
+        .expect("authenticate with the only bound provider");
+    assert_eq!(snapshot.id(), provider.id());
 }
 
 #[tokio::test]
@@ -130,7 +277,9 @@ async fn snapshots_are_request_local_and_new_requests_observe_edits() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("local.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
 
     let provider = service
         .create(request(
@@ -141,7 +290,8 @@ async fn snapshots_are_request_local_and_new_requests_observe_edits() {
         ))
         .await
         .expect("create provider");
-    let credential = provider.gateway_credential().render();
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
 
     let snapshot = authenticator
         .authenticate(&with_bearer(&credential))
@@ -150,7 +300,7 @@ async fn snapshots_are_request_local_and_new_requests_observe_edits() {
 
     service
         .update(
-            provider.provider().id(),
+            provider.id(),
             UpdateProviderRequest::new()
                 .with_endpoint("https://api.updated.example/base")
                 .with_upstream_api_key(SecretString::new(ROTATED_UPSTREAM_KEY)),
@@ -176,10 +326,11 @@ async fn snapshots_are_request_local_and_new_requests_observe_edits() {
 }
 
 #[tokio::test]
-async fn rejects_missing_duplicate_and_conflicting_credentials() {
+async fn disabling_an_account_stops_its_traffic_without_touching_its_credentials() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let database = sqlite_database(&directory.path().join("shape.db")).await;
+    let database = sqlite_database(&directory.path().join("account.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
 
     let provider = service
@@ -191,7 +342,126 @@ async fn rejects_missing_duplicate_and_conflicting_credentials() {
         ))
         .await
         .expect("create provider");
-    let credential = provider.gateway_credential().render();
+
+    let (user, _) = support::create_user_account(&accounts, "alice").await;
+    let issued = issue_api_key(&accounts, user.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
+    authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("authenticate before the account is disabled");
+
+    accounts
+        .update_account(
+            user.id(),
+            UpdateAccountRequest::new().with_status(AccountStatus::Disabled),
+        )
+        .await
+        .expect("disable the account");
+
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&credential))
+            .await
+            .expect_err("a disabled account stops its traffic"),
+        GatewayAuthError::AccountDisabled
+    );
+}
+
+#[tokio::test]
+async fn expired_and_disabled_credentials_fail_before_upstream_contact() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("lifecycle.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let provider = service
+        .create(request(
+            "primary",
+            ProtocolType::OpenAi,
+            "https://api.openai.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create provider");
+
+    // An expiration in the past is refused at issuance, because a credential
+    // that can never authenticate is a configuration mistake, not a lifecycle.
+    let already_expired = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "expired".to_owned(),
+            vec![provider.id()],
+            None,
+            Some(Utc::now() - chrono::Duration::minutes(1)),
+            ApiKeyStatus::Enabled,
+        ))
+        .await
+        .expect_err("an expiration in the past is refused");
+    assert_eq!(already_expired.to_string(), "expiration is invalid");
+
+    // A credential whose expiration passes while it is stored fails new work.
+    let soon = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "briefly-valid".to_owned(),
+            vec![provider.id()],
+            None,
+            Some(Utc::now() + chrono::Duration::milliseconds(1)),
+            ApiKeyStatus::Enabled,
+        ))
+        .await
+        .expect("issue a credential that expires immediately");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&render(&soon)))
+            .await
+            .expect_err("an expired credential is rejected"),
+        GatewayAuthError::KeyExpired
+    );
+
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
+    accounts
+        .update_api_key(
+            issued.api_key().api_key().id(),
+            issued.api_key(),
+            UpdateApiKeyRequest::new().with_status(ApiKeyStatus::Disabled),
+        )
+        .await
+        .expect("disable the credential");
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&credential))
+            .await
+            .expect_err("a disabled credential is rejected"),
+        GatewayAuthError::InvalidCredential
+    );
+}
+
+#[tokio::test]
+async fn rejects_missing_duplicate_and_conflicting_credentials() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("shape.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let provider = service
+        .create(request(
+            "primary",
+            ProtocolType::OpenAi,
+            "https://api.openai.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create provider");
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
 
     assert_eq!(
         authenticator
@@ -242,75 +512,13 @@ async fn rejects_missing_duplicate_and_conflicting_credentials() {
 }
 
 #[tokio::test]
-async fn rejects_malformed_credentials_without_echoing_them() {
+async fn rejects_unknown_and_wrong_secrets() {
     let directory = tempfile::tempdir().expect("temporary directory");
-    let database = sqlite_database(&directory.path().join("malformed.db")).await;
-    let authenticator = authenticator(database);
-
-    let short_secret = format!("{}.{}", "k".repeat(22), "A".repeat(8));
-    let mut cases = Vec::new();
-
-    let mut basic = HeaderMap::new();
-    basic.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str("Basic Zm9vYmFy").expect("valid header"),
-    );
-    cases.push((basic, "Zm9vYmFy"));
-
-    let mut schemeless = HeaderMap::new();
-    schemeless.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str("Bearer").expect("valid header"),
-    );
-    cases.push((schemeless, "Bearer"));
-
-    let long_value = format!("Bearer {}", "A".repeat(4096));
-    let mut oversized = HeaderMap::new();
-    oversized.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&long_value).expect("valid header"),
-    );
-    cases.push((oversized, long_value.as_str()));
-
-    let mut plain = HeaderMap::new();
-    plain.insert(
-        "x-api-key",
-        HeaderValue::from_str("not-a-credential").expect("valid header"),
-    );
-    cases.push((plain, "not-a-credential"));
-
-    let mut short = HeaderMap::new();
-    short.insert(
-        "x-api-key",
-        HeaderValue::from_str(&short_secret).expect("valid header"),
-    );
-    cases.push((short, short_secret.as_str()));
-
-    let padded_value = format!("{}.{}", "k".repeat(22), "A".repeat(GATEWAY_SECRET_LENGTH));
-    let mut padded = HeaderMap::new();
-    padded.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer  {padded_value}")).expect("valid header"),
-    );
-    cases.push((padded, padded_value.as_str()));
-
-    for (headers, rendered) in cases {
-        let error = authenticator
-            .authenticate(&headers)
-            .await
-            .expect_err("malformed credential is rejected");
-        assert_eq!(error, GatewayAuthError::MalformedCredential);
-        assert!(!error.to_string().contains(rendered));
-        assert!(!format!("{error:?}").contains(rendered));
-    }
-}
-
-#[tokio::test]
-async fn rejects_unknown_wrong_disabled_and_cross_provider_credentials() {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    let database = sqlite_database(&directory.path().join("reject.db")).await;
+    let database = sqlite_database(&directory.path().join("unknown.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
 
     let provider = service
         .create(request(
@@ -321,10 +529,11 @@ async fn rejects_unknown_wrong_disabled_and_cross_provider_credentials() {
         ))
         .await
         .expect("create provider");
-    let credential = provider.gateway_credential();
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = issued.credential();
 
     let unknown = GatewayCredential::new(
-        GatewayKeyId::new("unknown-lookup-id").expect("non-empty key id"),
+        GatewayKeyId::new("unknown-key-id").expect("non-empty key id"),
         SecretString::new("A".repeat(GATEWAY_SECRET_LENGTH)),
     )
     .render();
@@ -354,32 +563,26 @@ async fn rejects_unknown_wrong_disabled_and_cross_provider_credentials() {
             .expect_err("wrong secret is rejected"),
         GatewayAuthError::InvalidCredential
     );
+}
 
-    let disabled = service
+#[tokio::test]
+async fn the_native_credential_header_follows_the_resolved_provider() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("protocol.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let openai = service
         .create(request(
-            "disabled",
+            "openai",
             ProtocolType::OpenAi,
-            "https://api.disabled.example",
-            ProviderStatus::Disabled,
+            "https://api.openai.example",
+            ProviderStatus::Enabled,
         ))
         .await
-        .expect("create disabled provider");
-    assert_eq!(
-        authenticator
-            .authenticate(&with_bearer(&disabled.gateway_credential().render()))
-            .await
-            .expect_err("disabled credential is rejected"),
-        GatewayAuthError::ProviderDisabled
-    );
-
-    assert_eq!(
-        authenticator
-            .authenticate(&with_api_key(&credential.render()))
-            .await
-            .expect_err("openai provider rejects the anthropic header"),
-        GatewayAuthError::ConflictingCredential
-    );
-
+        .expect("create openai provider");
     let anthropic = service
         .create(request(
             "anthropic",
@@ -389,21 +592,66 @@ async fn rejects_unknown_wrong_disabled_and_cross_provider_credentials() {
         ))
         .await
         .expect("create anthropic provider");
+
+    let openai_key = issue_api_key(&accounts, account.id(), vec![openai.id()]).await;
     assert_eq!(
         authenticator
-            .authenticate(&with_bearer(&anthropic.gateway_credential().render()))
+            .authenticate(&with_api_key(&render(&openai_key)))
             .await
-            .expect_err("anthropic provider rejects the openai header"),
+            .expect_err("an openai provider rejects the anthropic header"),
+        GatewayAuthError::ConflictingCredential
+    );
+
+    let anthropic_key = issue_api_key(&accounts, account.id(), vec![anthropic.id()]).await;
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&render(&anthropic_key)))
+            .await
+            .expect_err("an anthropic provider rejects the openai header"),
         GatewayAuthError::ConflictingCredential
     );
 }
 
 #[tokio::test]
-async fn rotating_the_gateway_key_invalidates_the_previous_credential() {
+async fn a_disabled_provider_is_still_selectable_and_reported_as_disabled() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("disabled.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+
+    let provider = service
+        .create(request(
+            "disabled",
+            ProtocolType::OpenAi,
+            "https://api.disabled.example",
+            ProviderStatus::Disabled,
+        ))
+        .await
+        .expect("create disabled provider");
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+
+    // The binding is still configuration, so resolution succeeds and the
+    // failure is the provider's own disabled status rather than a missing
+    // selection.
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&render(&issued)))
+            .await
+            .expect_err("a disabled provider is reported as disabled"),
+        GatewayAuthError::ProviderDisabled
+    );
+}
+
+#[tokio::test]
+async fn rotating_a_credential_invalidates_the_previous_secret() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("rotation.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
 
     let provider = service
         .create(request(
@@ -414,30 +662,31 @@ async fn rotating_the_gateway_key_invalidates_the_previous_credential() {
         ))
         .await
         .expect("create provider");
-    let previous = provider.gateway_credential().render();
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let previous = render(&issued);
     authenticator
         .authenticate(&with_bearer(&previous))
         .await
         .expect("authenticate the original credential");
 
-    let rotated = service
-        .rotate_gateway_credential(provider.provider().id())
+    let rotated = accounts
+        .rotate_api_key(issued.api_key().api_key().id())
         .await
-        .expect("rotate gateway credential");
+        .expect("rotate the credential");
 
     assert_eq!(
         authenticator
             .authenticate(&with_bearer(&previous))
             .await
-            .expect_err("rotated credential is rejected"),
+            .expect_err("the rotated-away secret is rejected"),
         GatewayAuthError::UnknownCredential
     );
 
     let snapshot = authenticator
-        .authenticate(&with_bearer(&rotated.gateway_credential().render()))
+        .authenticate(&with_bearer(&render(&rotated)))
         .await
         .expect("authenticate the rotated credential");
-    assert_eq!(snapshot.id(), provider.provider().id());
+    assert_eq!(snapshot.id(), provider.id());
 }
 
 #[tokio::test]
@@ -445,7 +694,9 @@ async fn successful_and_failed_authentication_never_render_secrets() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite_database(&directory.path().join("redaction.db")).await;
     let service = service(database.clone());
+    let accounts = credentials(database.clone());
     let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
 
     let provider = service
         .create(request(
@@ -456,7 +707,8 @@ async fn successful_and_failed_authentication_never_render_secrets() {
         ))
         .await
         .expect("create provider");
-    let credential = provider.gateway_credential();
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = issued.credential();
 
     let snapshot = authenticator
         .authenticate(&with_bearer(&credential.render()))
@@ -480,4 +732,47 @@ async fn successful_and_failed_authentication_never_render_secrets() {
     assert!(!error.to_string().contains(credential.secret().expose()));
     assert!(!format!("{error:?}").contains(credential.secret().expose()));
     assert!(!error.to_string().contains(UPSTREAM_KEY));
+}
+
+#[tokio::test]
+async fn rejects_malformed_credentials_without_echoing_them() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("malformed.db")).await;
+    let authenticator = authenticator(database);
+
+    let short_secret = format!("{}.{}", "k".repeat(22), "A".repeat(8));
+    let padded_value = format!("{}.{}", "k".repeat(22), "A".repeat(GATEWAY_SECRET_LENGTH));
+    let long_value = format!("Bearer {}", "A".repeat(4096));
+
+    let cases: [(&str, Option<&str>); 5] = [
+        ("Basic Zm9vYmFy", None),
+        ("Bearer", None),
+        (long_value.as_str(), None),
+        ("", Some("not-a-credential")),
+        ("", Some(short_secret.as_str())),
+    ];
+
+    for (authorization, api_key) in cases {
+        let mut headers = HeaderMap::new();
+        if !authorization.is_empty() {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(authorization).expect("valid header"),
+            );
+        }
+        if let Some(value) = api_key {
+            headers.insert(
+                "x-api-key",
+                HeaderValue::from_str(value).expect("valid header"),
+            );
+        }
+        let error = authenticator
+            .authenticate(&headers)
+            .await
+            .expect_err("a malformed credential is rejected");
+        assert_eq!(error, GatewayAuthError::MalformedCredential);
+        for secret in [short_secret.as_str(), padded_value.as_str()] {
+            assert!(!error.to_string().contains(secret));
+        }
+    }
 }

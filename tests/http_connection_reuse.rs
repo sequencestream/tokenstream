@@ -18,7 +18,9 @@ use http_body_util::BodyExt;
 use hyper::body::{Body, Frame};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request};
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::http::HttpProxy;
 use tokenstream::routing::{ResolvedRoute, resolve_route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,6 +57,8 @@ impl Body for OnceBody {
 
 fn snapshot(endpoint: SocketAddr, secret: &'static str) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         ProtocolType::OpenAi,
         Url::parse(&format!("http://{endpoint}")).expect("valid endpoint"),

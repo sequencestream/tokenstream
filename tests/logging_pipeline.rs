@@ -5,8 +5,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{TimeZone, Utc};
 use tokenstream::domain::{
-    GatewayKeyId, PasswordHash, ProtocolType, ProviderId, ProviderStatus, RequestId,
-    SecretCiphertext, TransportType,
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderStatus, RequestId, SecretCiphertext,
+    TransportType,
 };
 use tokenstream::logging::{EmitResult, LogEvent, LogStore, channel};
 use tokenstream::persistence::postgres::PostgresDatabase;
@@ -19,7 +19,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 mod support;
-use support::require_postgres_url;
+use support::{ensure_bootstrap, require_postgres_url};
 
 #[derive(Default)]
 struct RecordingStore {
@@ -98,8 +98,29 @@ fn started(request_id: &str) -> LogEvent {
 }
 
 fn started_for(request_id: &str, provider_id: ProviderId) -> LogEvent {
+    started_for_account(
+        request_id,
+        AccountId::try_from(1).expect("account ID"),
+        test_api_key_id(),
+        provider_id,
+    )
+}
+
+/// The credential a synthetic event is attributed to when no real one exists.
+fn test_api_key_id() -> ApiKeyId {
+    ApiKeyId::try_from(1).expect("positive credential ID")
+}
+
+fn started_for_account(
+    request_id: &str,
+    account_id: AccountId,
+    api_key_id: ApiKeyId,
+    provider_id: ProviderId,
+) -> LogEvent {
     LogEvent::Started(RequestLogStarted::new(
         RequestId::new(request_id).expect("request ID"),
+        account_id,
+        api_key_id,
         provider_id,
         ProtocolType::OpenAi,
         TransportType::Http,
@@ -131,8 +152,6 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
         ProtocolType::OpenAi,
         Url::parse("https://example.com").expect("valid endpoint"),
         SecretCiphertext::new("ciphertext"),
-        GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID"),
-        PasswordHash::new("hash"),
         ProviderStatus::Enabled,
         Utc.with_ymd_and_hms(2026, 9, 28, 8, 0, 0)
             .single()
@@ -315,14 +334,16 @@ async fn sqlite_database(path: &Path) -> Database {
 }
 
 async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Database, prefix: &str) {
-    let removable = database
-        .create(new_provider(prefix, 0))
+    let removable = ProviderRepository::create(&database, new_provider(prefix, 0))
         .await
         .expect("create removable provider");
-    let kept = database
-        .create(new_provider(prefix, 1))
+    let kept = ProviderRepository::create(&database, new_provider(prefix, 1))
         .await
         .expect("create kept provider");
+    let account = ensure_bootstrap(&database).await;
+    // A stored log names the credential that presented the request, so the
+    // events are attributed to one that exists and is bound to the provider.
+    let api_key_id = support::stored_api_key(&database, &account, kept.id()).await;
     let store = Arc::new(database);
     let (sink, worker) = channel(Arc::clone(&store), 8, 8, Duration::from_secs(30));
     let metrics = sink.metrics().clone();
@@ -331,16 +352,24 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
     let orphan_id = format!("{prefix}-orphan");
     let kept_id = format!("{prefix}-kept");
     assert_eq!(
-        sink.try_emit(started_for(&orphan_id, removable.id())),
+        sink.try_emit(started_for_account(
+            &orphan_id,
+            account.id(),
+            api_key_id,
+            removable.id(),
+        )),
         EmitResult::Enqueued
     );
-    store
-        .as_ref()
-        .delete(removable.id())
+    ProviderRepository::delete(store.as_ref(), removable.id())
         .await
         .expect("delete succeeds while the start event is still queued");
     assert_eq!(
-        sink.try_emit(started_for(&kept_id, kept.id())),
+        sink.try_emit(started_for_account(
+            &kept_id,
+            account.id(),
+            api_key_id,
+            kept.id(),
+        )),
         EmitResult::Enqueued
     );
     assert_eq!(
@@ -364,8 +393,16 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
     let kept_logs = store
         .as_ref()
         .query(
-            RequestLogQuery::new(None, 100, Some(kept.id()), None, None, None)
-                .expect("valid request log query"),
+            RequestLogQuery::new(
+                None,
+                100,
+                Some(account.id()),
+                Some(kept.id()),
+                None,
+                None,
+                None,
+            )
+            .expect("valid request log query"),
         )
         .await
         .expect("query kept logs");
@@ -377,8 +414,16 @@ async fn verify_deleted_provider_start_does_not_poison_the_batch(database: Datab
     let orphan_logs = store
         .as_ref()
         .query(
-            RequestLogQuery::new(None, 100, Some(removable.id()), None, None, None)
-                .expect("valid request log query"),
+            RequestLogQuery::new(
+                None,
+                100,
+                Some(account.id()),
+                Some(removable.id()),
+                None,
+                None,
+                None,
+            )
+            .expect("valid request log query"),
         )
         .await
         .expect("query orphan logs");

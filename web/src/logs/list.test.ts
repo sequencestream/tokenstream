@@ -11,6 +11,8 @@ function row(id: number): RequestLog {
   return {
     id,
     request_id: `request-${id}`,
+    account_id: 1,
+    api_key_id: 1,
     provider_id: 1,
     protocol_type: 'openai',
     transport_type: 'http',

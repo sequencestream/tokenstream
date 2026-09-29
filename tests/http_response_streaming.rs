@@ -20,7 +20,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Incoming};
 use hyper::header::HeaderMap;
 use hyper::{Method, Request, Response, StatusCode};
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::http::{HttpProxy, IdleTimeoutBody, relay_response};
 use tokenstream::routing::{ResolvedRoute, resolve_route};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,6 +317,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn snapshot(endpoint: SocketAddr) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         ProtocolType::OpenAi,
         Url::parse(&format!("http://{endpoint}")).expect("valid endpoint"),

@@ -1,7 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 import { AdminApi, type ProviderStatus, type ProtocolType } from './api/client.ts'
+import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
+import { emptyApiKeyPage, loadApiKeys, type ApiKeyPage } from './keys/list.ts'
 import { emptyLogFilters, logFiltersChanged, type LogFilterValues } from './logs/filters.ts'
 import { loadLogs, type LogPage } from './logs/list.ts'
 import { emptyProviderPage, loadProviders, type ProviderPage } from './providers/list.ts'
@@ -11,20 +13,25 @@ import { useAdminSession } from './session/useAdminSession.ts'
 const api = new AdminApi()
 const session = useAdminSession(api)
 
+const accountName = ref('')
 const password = ref('')
 const busy = ref(false)
 const notice = ref('')
 const errorMessage = ref('')
-const activeView = ref<'providers' | 'logs' | 'settings'>('providers')
+type View = 'providers' | 'keys' | 'accounts' | 'logs' | 'settings'
+const activeView = ref<View>('keys')
 
 const settingsPage = ref({ items: [] as import('./api/client.ts').Setting[] })
 const settingDrafts = ref<Record<string, string>>({})
 
 const providerPage = ref<ProviderPage>({ ...emptyProviderPage })
+const keyPage = ref<ApiKeyPage>({ ...emptyApiKeyPage })
+const accountPage = ref<AccountPage>({ ...emptyAccountPage })
 const editingProviderId = ref<number | null>(null)
 const creatingProvider = ref(false)
-const oneTimeCredential = ref<string | null>(null)
-const credentialAction = ref('')
+const oneTimeSecret = ref<string | null>(null)
+const oneTimeAction = ref('')
+const oneTimePassword = ref<string | null>(null)
 
 function emptyCreateForm() {
   return {
@@ -44,6 +51,15 @@ const editForm = reactive({
   status: 'enabled' as ProviderStatus,
 })
 
+const accountForm = reactive({ name: '', role: 'user' as 'admin' | 'user' })
+const creatingAccount = ref(false)
+const keyForm = reactive({
+  account_id: 0,
+  name: '',
+  provider_ids: [] as number[],
+  default_provider_id: null as number | null,
+})
+
 const logPage = ref<LogPage>({ items: [], cursor: null, exhausted: true })
 
 // The conditions the administrator is editing, and the conditions that produced
@@ -56,6 +72,13 @@ const logFiltersDirty = computed(() => logFiltersChanged(logFilters, appliedLogF
 
 const providers = computed(() => providerPage.value.items)
 const providerById = computed(() => new Map(providers.value.map((item) => [item.id, item])))
+const accountById = computed(() => new Map(accountPage.value.items.map((item) => [item.id, item])))
+const isAdmin = computed(() => session.isAdmin.value)
+
+/** A regular user's own account identifier, once it is known. */
+const ownAccountId = computed(
+  () => accountPage.value.items.find((item) => item.name === session.accountName.value)?.id ?? 0,
+)
 
 function clearFeedback() {
   notice.value = ''
@@ -78,43 +101,51 @@ async function runAction(action: () => Promise<void>) {
     if (!session.signedIn.value) {
       providerPage.value = { ...emptyProviderPage }
       logPage.value = { items: [], cursor: null, exhausted: true }
+      keyPage.value = { ...emptyApiKeyPage }
+      accountPage.value = { ...emptyAccountPage }
       cancelCreate()
-      dismissCredential()
+      dismissSecret()
     }
   } finally {
     busy.value = false
   }
 }
 
+/** Loads the views this session's role can actually reach. */
+async function loadReachableViews(): Promise<void> {
+  const [nextProviders, nextLogs, nextKeys] = await Promise.all([
+    loadProviders(api, providerPage.value, true),
+    loadLogs(api, logPage.value, appliedLogFilters, true),
+    loadApiKeys(api, keyPage.value, true),
+  ])
+  providerPage.value = nextProviders
+  logPage.value = nextLogs
+  keyPage.value = nextKeys
+  if (session.isAdmin.value) {
+    const [nextAccounts, nextSettings] = await Promise.all([
+      loadAccounts(api, accountPage.value, true),
+      loadSettings(api),
+    ])
+    accountPage.value = nextAccounts
+    settingsPage.value = nextSettings
+    resetSettingDrafts()
+    keyForm.account_id = ownAccountId.value || (accountPage.value.items[0]?.id ?? 0)
+  }
+}
+
 async function restoreSession() {
   if (await session.restore()) {
-    await runAction(async () => {
-      const [nextProviders, nextLogs, nextSettings] = await Promise.all([
-        loadProviders(api, providerPage.value, true),
-        loadLogs(api, logPage.value, appliedLogFilters, true),
-        loadSettings(api),
-      ])
-      providerPage.value = nextProviders
-      logPage.value = nextLogs
-      settingsPage.value = nextSettings
-      resetSettingDrafts()
-    })
+    await runAction(loadReachableViews)
   }
 }
 
 async function signIn() {
   await runAction(async () => {
-    await session.signIn(password.value)
+    await session.signIn(accountName.value, password.value)
+    accountName.value = ''
     password.value = ''
-    const [nextProviders, nextLogs, nextSettings] = await Promise.all([
-      loadProviders(api, providerPage.value, true),
-      loadLogs(api, logPage.value, appliedLogFilters, true),
-      loadSettings(api),
-    ])
-    providerPage.value = nextProviders
-    logPage.value = nextLogs
-    settingsPage.value = nextSettings
-    resetSettingDrafts()
+    activeView.value = 'keys'
+    await loadReachableViews()
   })
 }
 
@@ -123,14 +154,34 @@ async function signOut() {
     await session.signOut()
     providerPage.value = { ...emptyProviderPage }
     logPage.value = { items: [], cursor: null, exhausted: true }
+    keyPage.value = { ...emptyApiKeyPage }
+    accountPage.value = { ...emptyAccountPage }
     cancelCreate()
-    dismissCredential()
+    dismissSecret()
+    activeView.value = 'keys'
   })
 }
+
+/** Keeps the credential form pointing at the signed-in account by default. */
+watch(ownAccountId, (id) => {
+  if (id && !keyForm.account_id) keyForm.account_id = id
+})
 
 async function loadMoreProviders() {
   await runAction(async () => {
     providerPage.value = await loadProviders(api, providerPage.value, false)
+  })
+}
+
+async function loadMoreKeys() {
+  await runAction(async () => {
+    keyPage.value = await loadApiKeys(api, keyPage.value, false)
+  })
+}
+
+async function loadMoreAccounts() {
+  await runAction(async () => {
+    accountPage.value = await loadAccounts(api, accountPage.value, false)
   })
 }
 
@@ -147,10 +198,10 @@ function cancelCreate() {
 
 async function createProvider() {
   await runAction(async () => {
-    const created = await api.createProvider({ ...createForm })
-    showCredential(created.gateway_api_key, `Credential for ${created.provider.name}`)
+    await api.createProvider({ ...createForm })
     Object.assign(createForm, emptyCreateForm())
     creatingProvider.value = false
+    notice.value = 'Provider created. Issue a credential to call it.'
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -189,27 +240,8 @@ async function toggleProvider(id: number, current: ProviderStatus) {
   })
 }
 
-async function rotateCredential(id: number, name: string) {
-  if (
-    !window.confirm(
-      `Rotate the gateway credential for ${name}? The old credential will stop working for new requests.`,
-    )
-  ) {
-    return
-  }
-  await runAction(async () => {
-    const rotated = await api.rotateCredential(id)
-    showCredential(rotated.gateway_api_key, `New credential for ${rotated.provider.name}`)
-    providerPage.value = await loadProviders(api, providerPage.value, true)
-  })
-}
-
 async function deleteProvider(id: number, name: string) {
-  if (
-    !window.confirm(
-      `Delete ${name}? Providers referenced by request logs cannot be deleted.`,
-    )
-  ) {
+  if (!window.confirm(`Delete ${name}? Providers referenced by request logs cannot be deleted.`)) {
     return
   }
   await runAction(async () => {
@@ -219,19 +251,128 @@ async function deleteProvider(id: number, name: string) {
   })
 }
 
-function showCredential(value: string, action: string) {
-  oneTimeCredential.value = value
-  credentialAction.value = action
+function beginAccount() {
+  accountForm.name = ''
+  accountForm.role = 'user'
+  creatingAccount.value = true
+  clearFeedback()
 }
 
-function dismissCredential() {
-  oneTimeCredential.value = null
-  credentialAction.value = ''
+function cancelAccount() {
+  creatingAccount.value = false
 }
 
-async function copyCredential() {
-  if (!oneTimeCredential.value) return
-  await navigator.clipboard.writeText(oneTimeCredential.value)
+async function createAccount() {
+  await runAction(async () => {
+    const created = await api.createAccount({
+      name: accountForm.name,
+      role: accountForm.role,
+      status: 'enabled',
+    })
+    creatingAccount.value = false
+    if (created.generated_password) {
+      oneTimePassword.value = created.generated_password
+    }
+    notice.value = `Account ${created.account.name} created.`
+    accountPage.value = await loadAccounts(api, accountPage.value, true)
+  })
+}
+
+async function toggleAccount(id: number, current: string, name: string) {
+  const status = current === 'enabled' ? 'disabled' : 'enabled'
+  if (status === 'disabled' && !window.confirm(`Disable ${name}? Its credentials stop working immediately.`)) {
+    return
+  }
+  await runAction(async () => {
+    await api.updateAccount(id, { status })
+    notice.value = status === 'disabled' ? 'Account disabled.' : 'Account enabled.'
+    accountPage.value = await loadAccounts(api, accountPage.value, true)
+  })
+}
+
+async function deleteAccount(id: number, name: string) {
+  if (!window.confirm(`Delete ${name}?`)) return
+  await runAction(async () => {
+    await api.deleteAccount(id)
+    notice.value = 'Account deleted.'
+    accountPage.value = await loadAccounts(api, accountPage.value, true)
+  })
+}
+
+function resetKeyForm() {
+  keyForm.name = ''
+  keyForm.provider_ids = []
+  keyForm.default_provider_id = null
+  keyForm.account_id = ownAccountId.value || keyForm.account_id
+}
+
+async function issueKey() {
+  await runAction(async () => {
+    const issued = await api.createApiKey({
+      account_id: keyForm.account_id,
+      name: keyForm.name,
+      provider_ids: keyForm.provider_ids,
+      default_provider_id: keyForm.default_provider_id,
+      status: 'enabled',
+    })
+    showSecret(issued.api_key_secret, `Credential for ${issued.api_key.name}`)
+    resetKeyForm()
+    keyPage.value = await loadApiKeys(api, keyPage.value, true)
+  })
+}
+
+async function toggleProviderBinding(providerId: number) {
+  const bound = keyForm.provider_ids.includes(providerId)
+  keyForm.provider_ids = bound
+    ? keyForm.provider_ids.filter((id) => id !== providerId)
+    : [...keyForm.provider_ids, providerId]
+  if (keyForm.default_provider_id !== null && !keyForm.provider_ids.includes(keyForm.default_provider_id)) {
+    keyForm.default_provider_id = null
+  }
+}
+
+async function rotateKey(id: number, name: string) {
+  if (!window.confirm(`Rotate the credential for ${name}? The old credential stops working immediately.`)) {
+    return
+  }
+  await runAction(async () => {
+    const rotated = await api.rotateApiKey(id)
+    showSecret(rotated.api_key_secret, `New credential for ${rotated.api_key.name}`)
+    keyPage.value = await loadApiKeys(api, keyPage.value, true)
+  })
+}
+
+async function deleteKey(id: number, name: string) {
+  if (!window.confirm(`Delete the credential for ${name}? Clients using it stop working immediately.`)) {
+    return
+  }
+  await runAction(async () => {
+    await api.deleteApiKey(id)
+    notice.value = 'Credential deleted.'
+    keyPage.value = await loadApiKeys(api, keyPage.value, true)
+  })
+}
+
+function showSecret(value: string, action: string) {
+  oneTimeSecret.value = value
+  oneTimeAction.value = action
+}
+
+function dismissSecret() {
+  oneTimeSecret.value = null
+  oneTimeAction.value = ''
+  oneTimePassword.value = null
+}
+
+async function copyPassword() {
+  if (!oneTimePassword.value) return
+  await navigator.clipboard.writeText(oneTimePassword.value)
+  notice.value = 'Password copied.'
+}
+
+async function copySecret() {
+  if (!oneTimeSecret.value) return
+  await navigator.clipboard.writeText(oneTimeSecret.value)
   notice.value = 'Credential copied. Store it securely before closing this message.'
 }
 
@@ -298,16 +439,29 @@ function formatDate(value: string | null) {
   }).format(new Date(value))
 }
 
-function viewTitle(view: typeof activeView.value) {
-  if (view === 'logs') return 'Request logs'
-  if (view === 'settings') return 'Settings'
-  return 'Providers'
+function providerName(providerId: number) {
+  return providerById.value.get(providerId)?.name ?? `#${providerId}`
 }
 
-function viewLede(view: typeof activeView.value) {
+function accountLabel(accountId: number) {
+  const account = accountById.value.get(accountId)
+  return account ? account.name : `#${accountId}`
+}
+
+function viewTitle(view: View) {
+  if (view === 'providers') return 'Providers'
+  if (view === 'accounts') return 'Accounts'
+  if (view === 'logs') return 'Request logs'
+  if (view === 'settings') return 'Settings'
+  return 'Credentials'
+}
+
+function viewLede(view: View) {
+  if (view === 'providers') return 'Upstream identities and endpoints. A provider issues no credential.'
+  if (view === 'accounts') return 'Principals that own data-plane credentials.'
   if (view === 'logs') return 'Transport metadata for proxied requests. Payloads are not stored.'
   if (view === 'settings') return 'Process configuration. Secrets are write-only; bind-time values apply after restart.'
-  return 'Upstream identities, endpoints, and gateway credentials.'
+  return 'API keys owned by an account, each bound to the providers it may reach.'
 }
 
 onMounted(restoreSession)
@@ -322,21 +476,38 @@ onMounted(restoreSession)
       </a>
       <nav v-if="session.signedIn.value" class="tabs" aria-label="Administration views">
         <button
+          :class="{ active: activeView === 'keys' }"
+          :aria-current="activeView === 'keys' ? 'page' : undefined"
+          @click="activeView = 'keys'"
+        >Credentials</button>
+        <button
+          v-if="isAdmin"
           :class="{ active: activeView === 'providers' }"
           :aria-current="activeView === 'providers' ? 'page' : undefined"
           @click="activeView = 'providers'"
         >Providers</button>
+        <button
+          v-if="isAdmin"
+          :class="{ active: activeView === 'accounts' }"
+          :aria-current="activeView === 'accounts' ? 'page' : undefined"
+          @click="activeView = 'accounts'"
+        >Accounts</button>
         <button
           :class="{ active: activeView === 'logs' }"
           :aria-current="activeView === 'logs' ? 'page' : undefined"
           @click="activeView = 'logs'"
         >Request logs</button>
         <button
+          v-if="isAdmin"
           :class="{ active: activeView === 'settings' }"
           :aria-current="activeView === 'settings' ? 'page' : undefined"
           @click="activeView = 'settings'"
         >Settings</button>
       </nav>
+      <span v-if="session.signedIn.value" class="identity">
+        {{ session.accountName.value }}
+        <span class="badge neutral">{{ session.role.value }}</span>
+      </span>
       <button v-if="session.signedIn.value" class="button ghost sign-out" :disabled="busy" @click="signOut">Sign out</button>
     </header>
 
@@ -348,10 +519,14 @@ onMounted(restoreSession)
     <main v-else-if="!session.signedIn.value" class="login-layout">
       <form class="card login-card" @submit.prevent="signIn">
         <h2>Sign in</h2>
-        <p class="login-note">Administrator access to this control plane.</p>
+        <p class="login-note">Access to this control plane.</p>
+        <label>
+          Account
+          <input v-model="accountName" autocomplete="username" required autofocus placeholder="admin" />
+        </label>
         <label>
           Password
-          <input v-model="password" type="password" autocomplete="current-password" required autofocus />
+          <input v-model="password" type="password" autocomplete="current-password" required />
         </label>
         <p v-if="errorMessage" class="alert error" role="alert">{{ errorMessage }}</p>
         <button class="button primary" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}</button>
@@ -365,30 +540,134 @@ onMounted(restoreSession)
           <p class="lede">{{ viewLede(activeView) }}</p>
         </div>
         <button
-          v-if="activeView === 'providers' && !creatingProvider"
+          v-if="isAdmin && activeView === 'providers' && !creatingProvider"
           class="button primary"
           type="button"
           :disabled="busy"
           @click="beginCreate"
         >New provider</button>
+        <button
+          v-if="isAdmin && activeView === 'accounts' && !creatingAccount"
+          class="button primary"
+          type="button"
+          :disabled="busy"
+          @click="beginAccount"
+        >New account</button>
       </section>
 
       <p v-if="errorMessage" class="alert error" role="alert">{{ errorMessage }}</p>
       <p v-if="notice" class="alert success" role="status">{{ notice }}</p>
 
-      <section v-if="oneTimeCredential" class="credential-card" aria-live="assertive">
+      <section v-if="oneTimeSecret" class="credential-card" aria-live="assertive">
         <div>
-          <h2>{{ credentialAction }}</h2>
+          <h2>{{ oneTimeAction }}</h2>
           <p>Shown once. Copy it now; it disappears when dismissed or when the page is refreshed.</p>
         </div>
-        <code>{{ oneTimeCredential }}</code>
+        <code>{{ oneTimeSecret }}</code>
         <div class="actions">
-          <button class="button primary" @click="copyCredential">Copy credential</button>
-          <button class="button ghost" @click="dismissCredential">I have stored it</button>
+          <button class="button primary" @click="copySecret">Copy credential</button>
+          <button class="button ghost" @click="dismissSecret">I have stored it</button>
         </div>
       </section>
 
-      <template v-if="activeView === 'providers'">
+      <section v-if="oneTimePassword" class="credential-card" aria-live="assertive">
+        <div>
+          <h2>Password for the new account</h2>
+          <p>Shown once. It is never returned again; a new password can be set at any time.</p>
+        </div>
+        <code>{{ oneTimePassword }}</code>
+        <div class="actions">
+          <button class="button primary" @click="copyPassword">Copy password</button>
+          <button class="button ghost" @click="dismissSecret">I have stored it</button>
+        </div>
+      </section>
+
+      <template v-if="activeView === 'keys'">
+        <section class="card create-card">
+          <div class="section-title">
+            <h2>Issue credential</h2>
+            <span class="section-note">The plaintext is shown once.</span>
+          </div>
+          <form class="provider-form" @submit.prevent="issueKey">
+            <label>Name<input v-model="keyForm.name" maxlength="128" required placeholder="ci" /></label>
+            <label v-if="isAdmin">
+              Owning account
+              <select v-model.number="keyForm.account_id" required>
+                <option v-for="account in accountPage.items" :key="account.id" :value="account.id">{{ account.name }}</option>
+              </select>
+            </label>
+            <fieldset class="wide bindings">
+              <legend>Providers this credential may reach</legend>
+              <label v-for="provider in providers" :key="provider.id" class="binding">
+                <input
+                  type="checkbox"
+                  :value="provider.id"
+                  :checked="keyForm.provider_ids.includes(provider.id)"
+                  @change="toggleProviderBinding(provider.id)"
+                />
+                {{ provider.name }}
+              </label>
+              <p v-if="providers.length === 0" class="section-note">No providers exist yet.</p>
+            </fieldset>
+            <label v-if="isAdmin" class="wide">
+              Default provider
+              <select v-model="keyForm.default_provider_id">
+                <option :value="null">First bound provider</option>
+                <option v-for="id in keyForm.provider_ids" :key="id" :value="id">{{ providerName(id) }}</option>
+              </select>
+            </label>
+            <div class="actions wide">
+              <button class="button primary" :disabled="busy" :title="keyForm.provider_ids.length === 0 ? 'Bind at least one provider' : undefined">Create credential</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card table-card" aria-label="Credentials">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>Name</th>
+                  <th v-if="isAdmin">Account</th>
+                  <th>Status</th>
+                  <th class="fill">Providers</th>
+                  <th>Key ID</th>
+                  <th>Expires</th>
+                  <th>Created</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="key in keyPage.items" :key="key.id">
+                  <td>{{ key.id }}</td>
+                  <td>{{ key.name }}</td>
+                  <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
+                  <td><span class="badge" :class="key.status">{{ key.status }}</span></td>
+                  <td class="fill">
+                    <span v-for="(id, index) in key.provider_ids" :key="id">
+                      {{ providerName(id) }}<span v-if="id === key.default_provider_id"> (default)</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
+                    </span>
+                  </td>
+                  <td><code>{{ key.key_id }}</code></td>
+                  <td>{{ formatDate(key.expires_at) }}</td>
+                  <td>{{ formatDate(key.created_at) }}</td>
+                  <td class="row-actions">
+                    <div class="actions">
+                      <button class="button ghost" :disabled="busy" @click="rotateKey(key.id, key.name)">Rotate credential</button>
+                      <button class="button danger" :disabled="busy" @click="deleteKey(key.id, key.name)">Delete</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="keyPage.items.length === 0" class="empty-state">No credentials issued.</div>
+          <button v-if="!keyPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreKeys">Load more</button>
+        </section>
+      </template>
+
+      <template v-else-if="activeView === 'providers'">
         <section v-if="creatingProvider" class="card create-card">
           <div class="section-title">
             <h2>Add provider</h2>
@@ -417,7 +696,6 @@ onMounted(restoreSession)
                   <th>Protocol</th>
                   <th>Status</th>
                   <th class="fill">Endpoint</th>
-                  <th>Gateway key ID</th>
                   <th>Upstream key</th>
                   <th>Created</th>
                   <th>Actions</th>
@@ -436,7 +714,6 @@ onMounted(restoreSession)
                       </select>
                     </td>
                     <td class="fill"><input v-model="editForm.endpoint" type="url" required aria-label="Endpoint" /></td>
-                    <td><code>{{ provider.gateway_key_id }}</code></td>
                     <td>
                       <input
                         v-model="editForm.upstream_api_key"
@@ -460,14 +737,12 @@ onMounted(restoreSession)
                     <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
                     <td><span class="badge" :class="provider.status">{{ provider.status }}</span></td>
                     <td class="fill">{{ provider.endpoint }}</td>
-                    <td><code>{{ provider.gateway_key_id }}</code></td>
                     <td>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</td>
                     <td>{{ formatDate(provider.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
                         <button class="button ghost" @click="beginEdit(provider.id, provider)">Edit</button>
                         <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
-                        <button class="button ghost" :disabled="busy" @click="rotateCredential(provider.id, provider.name)">Rotate credential</button>
                         <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">Delete</button>
                       </div>
                     </td>
@@ -478,6 +753,63 @@ onMounted(restoreSession)
           </div>
           <div v-if="providers.length === 0" class="empty-state">No providers configured.</div>
           <button v-if="!providerPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreProviders">Load more</button>
+        </section>
+      </template>
+
+      <template v-else-if="activeView === 'accounts'">
+        <section v-if="creatingAccount" class="card create-card">
+          <div class="section-title">
+            <h2>Add account</h2>
+            <span class="section-note">The password is shown once.</span>
+          </div>
+          <form class="provider-form" @submit.prevent="createAccount">
+            <label>Name<input v-model="accountForm.name" maxlength="128" required placeholder="analyst" /></label>
+            <label>Role<select v-model="accountForm.role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
+            <div class="actions wide">
+              <button class="button primary" :disabled="busy">Create account</button>
+              <button class="button ghost" type="button" @click="cancelAccount">Cancel</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card table-card" aria-label="Accounts">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>ID</th><th>Name</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="account in accountPage.items" :key="account.id">
+                  <td>{{ account.id }}</td>
+                  <td>
+                    {{ account.name }}
+                    <span v-if="account.is_bootstrap" class="badge neutral">bootstrap</span>
+                  </td>
+                  <td><span class="badge neutral">{{ account.role }}</span></td>
+                  <td><span class="badge" :class="account.status">{{ account.status }}</span></td>
+                  <td>{{ formatDate(account.created_at) }}</td>
+                  <td class="row-actions">
+                    <div class="actions">
+                      <button
+                        class="button ghost"
+                        :disabled="busy || account.is_bootstrap"
+                        :title="account.is_bootstrap ? 'The bootstrap account cannot be disabled' : undefined"
+                        @click="toggleAccount(account.id, account.status, account.name)"
+                      >{{ account.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
+                      <button
+                        class="button danger"
+                        :disabled="busy || account.is_bootstrap"
+                        :title="account.is_bootstrap ? 'The bootstrap account cannot be deleted' : undefined"
+                        @click="deleteAccount(account.id, account.name)"
+                      >Delete</button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div v-if="accountPage.items.length === 0" class="empty-state">No accounts.</div>
+          <button v-if="!accountPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreAccounts">Load more</button>
         </section>
       </template>
 
@@ -498,11 +830,12 @@ onMounted(restoreSession)
         <section class="card table-card">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Request</th><th>Provider</th><th>Transport</th><th class="fill">Route</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead>
+              <thead><tr><th>Request</th><th>Account</th><th>Provider</th><th>Transport</th><th class="fill">Route</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead>
               <tbody>
                 <tr v-for="log in logPage.items" :key="log.id">
                   <td><code>{{ log.request_id }}</code></td>
-                  <td>{{ providerById.get(log.provider_id)?.name ?? `#${log.provider_id}` }}</td>
+                  <td>{{ isAdmin ? accountLabel(log.account_id) : session.accountName.value }}</td>
+                  <td>{{ providerName(log.provider_id) }}</td>
                   <td>{{ log.transport_type }}</td>
                   <td class="fill"><code>{{ log.path }}</code></td>
                   <td><span v-if="log.incomplete" class="badge incomplete">Incomplete</span><span v-else>{{ log.status_code ?? '—' }}</span><small v-if="log.error_msg" class="row-error">{{ log.error_msg }}</small></td>
@@ -559,7 +892,6 @@ onMounted(restoreSession)
     </main>
   </div>
 </template>
-
 <style>
 :root {
   --color-ink: #1a211d;
@@ -648,13 +980,22 @@ code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere;
   top: 0;
   z-index: var(--z-masthead);
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto 1fr auto auto;
   align-items: stretch;
   column-gap: var(--space-3);
   min-height: var(--masthead-height);
   padding: 0 var(--space-5);
   border-bottom: 1px solid var(--color-line);
   background: var(--color-paper);
+}
+.identity {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: center;
+  color: var(--color-muted);
+  font-size: var(--font-size-ui);
+  white-space: nowrap;
 }
 .brand {
   display: inline-flex;
@@ -831,6 +1172,18 @@ input:focus, select:focus {
 .section-note { color: var(--color-muted); font-size: var(--font-size-ui); }
 .provider-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2) var(--space-3); }
 .provider-form .wide { grid-column: 1 / -1; }
+.bindings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+.bindings legend { padding: 0 var(--space-1); color: var(--color-muted); font-size: var(--font-size-meta); }
+.binding { display: inline-flex; align-items: center; gap: var(--space-1); margin: 0; }
+.binding input { width: auto; min-width: 0; }
 .badge {
   display: inline-flex;
   padding: 1px var(--space-compact);
@@ -877,12 +1230,13 @@ td small { display: block; margin-top: var(--space-1); color: var(--color-muted)
 
 @media (max-width: 780px) {
   .masthead {
-    grid-template-columns: 1fr auto;
-    grid-template-areas: "brand out" "tabs tabs";
+    grid-template-columns: 1fr auto auto;
+    grid-template-areas: "brand ident out" "tabs tabs tabs";
     min-height: 0;
     padding: 0 var(--space-3);
   }
   .brand { grid-area: brand; height: 40px; }
+  .identity { grid-area: ident; }
   .sign-out { grid-area: out; }
   .tabs { grid-area: tabs; }
   .tabs button { flex: 1; height: var(--control-height-lg); }

@@ -12,7 +12,9 @@ use futures_util::SinkExt;
 use http_body_util::{BodyExt, Empty};
 use hyper::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use hyper::{Method, Request};
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::proxy::http::HttpProxy;
 use tokenstream::proxy::websocket::relay;
@@ -159,6 +161,8 @@ async fn mixed_long_lived_transports_reach_stable_bounded_memory() {
     let (upstream_address, stop_upstream, upstream_task) =
         spawn_sse_upstream(HTTP_CONNECTIONS).await;
     let snapshot = Arc::new(ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         ProtocolType::OpenAi,
         Url::parse(&format!("http://{upstream_address}")).expect("upstream URL"),

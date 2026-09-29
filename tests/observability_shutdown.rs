@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use hyper::Request;
 use hyper::body::Incoming;
-use tokenstream::domain::{ProtocolType, ProviderId, RequestId, TransportType};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, RequestId, TransportType,
+};
 use tokenstream::logging::{LogEvent, LogStore, channel_with_metrics};
 use tokenstream::persistence::{RepositoryError, RequestLogStarted};
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
@@ -82,6 +84,8 @@ fn admission(metrics: Metrics) -> AdmissionControl {
 fn started() -> LogEvent {
     LogEvent::Started(RequestLogStarted::new(
         RequestId::new("request-before-shutdown").expect("request ID"),
+        AccountId::try_from(1).expect("account ID"),
+        ApiKeyId::try_from(1).expect("credential ID"),
         ProviderId::try_from(1).expect("provider ID"),
         ProtocolType::OpenAi,
         TransportType::Http,

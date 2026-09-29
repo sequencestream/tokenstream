@@ -3,14 +3,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use tokenstream::domain::{
-    GatewayKeyId, PasswordHash, ProtocolType, ProviderId, ProviderStatus, RequestId,
-    RequestLogCursor, SecretCiphertext, TransportType,
+    AccountId, ApiKeyId, ApiKeyStatus, GatewayKeyId, PasswordHash, ProtocolType, ProviderId,
+    ProviderStatus, RequestId, RequestLogCursor, SecretCiphertext, TransportType,
 };
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    NewProvider, ProviderRepository, RepositoryError, RequestLogCompleted, RequestLogQuery,
-    RequestLogQueryError, RequestLogRepository, RequestLogStarted,
+    AccountRepository, ApiKeyRepository, NewApiKey, NewProvider, ProviderRepository,
+    RepositoryError, RequestLogCompleted, RequestLogQuery, RequestLogQueryError,
+    RequestLogRepository, RequestLogStarted,
 };
 use url::Url;
 
@@ -31,8 +32,6 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
         ProtocolType::OpenAi,
         Url::parse("https://example.com").expect("valid endpoint"),
         SecretCiphertext::new("ciphertext"),
-        GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID"),
-        PasswordHash::new("hash"),
         ProviderStatus::Enabled,
         Utc.with_ymd_and_hms(2026, 9, 28, 8, 0, 0)
             .single()
@@ -40,8 +39,42 @@ fn new_provider(prefix: &str, number: usize) -> NewProvider {
     )
 }
 
+/// Issues a credential and returns it, so a log row has an owner to pin.
+async fn issue<R>(
+    repository: &R,
+    account_id: AccountId,
+    provider_id: ProviderId,
+    prefix: &str,
+    number: usize,
+) -> ApiKeyId
+where
+    R: ApiKeyRepository,
+{
+    ApiKeyRepository::create(
+        repository,
+        NewApiKey::new(
+            account_id,
+            format!("{prefix}-key-name-{number}"),
+            GatewayKeyId::new(format!("{prefix}-key-{number}")).expect("non-empty key ID"),
+            PasswordHash::new("hash"),
+            ApiKeyStatus::Enabled,
+            Some(provider_id),
+            None,
+            vec![provider_id],
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect("issue a credential")
+    .api_key()
+    .id()
+}
+
+#[allow(clippy::too_many_arguments)]
 fn started(
     request_id: &str,
+    account_id: AccountId,
+    api_key_id: ApiKeyId,
     provider_id: ProviderId,
     protocol_type: ProtocolType,
     transport_type: TransportType,
@@ -50,6 +83,8 @@ fn started(
 ) -> RequestLogStarted {
     RequestLogStarted::new(
         RequestId::new(request_id).expect("non-empty request ID"),
+        account_id,
+        api_key_id,
         provider_id,
         protocol_type,
         transport_type,
@@ -58,6 +93,7 @@ fn started(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query(
     after_id: Option<RequestLogCursor>,
     limit: usize,
@@ -69,6 +105,7 @@ fn query(
     RequestLogQuery::new(
         after_id,
         limit,
+        None,
         provider_id,
         transport_type,
         start_time_gte,
@@ -79,14 +116,14 @@ fn query(
 
 async fn verify_contract<R>(repository: &R, prefix: &str)
 where
-    R: ProviderRepository + RequestLogRepository,
+    R: ProviderRepository + RequestLogRepository + ApiKeyRepository + AccountRepository,
 {
     assert_eq!(
-        RequestLogQuery::new(None, 0, None, None, None, None),
+        RequestLogQuery::new(None, 0, None, None, None, None, None),
         Err(RequestLogQueryError::InvalidLimit)
     );
     assert_eq!(
-        RequestLogQuery::new(None, 101, None, None, None, None),
+        RequestLogQuery::new(None, 101, None, None, None, None, None),
         Err(RequestLogQueryError::InvalidLimit)
     );
 
@@ -95,18 +132,19 @@ where
         .single()
         .expect("valid timestamp");
     assert_eq!(
-        RequestLogQuery::new(None, 10, None, None, Some(base), Some(base)),
+        RequestLogQuery::new(None, 10, None, None, None, Some(base), Some(base)),
         Err(RequestLogQueryError::InvalidTimeRange)
     );
 
-    let provider = repository
-        .create(new_provider(prefix, 0))
+    let account = support::ensure_bootstrap(repository).await;
+    let provider = ProviderRepository::create(repository, new_provider(prefix, 0))
         .await
         .expect("create provider");
-    let other_provider = repository
-        .create(new_provider(prefix, 1))
+    let other_provider = ProviderRepository::create(repository, new_provider(prefix, 1))
         .await
         .expect("create other provider");
+    let api_key = issue(repository, account.id(), provider.id(), prefix, 0).await;
+    let other_key = issue(repository, account.id(), other_provider.id(), prefix, 1).await;
 
     let missing_request_id = format!("{prefix}-missing-start");
     repository
@@ -132,6 +170,8 @@ where
         repository
             .insert_started(started(
                 &format!("{prefix}-missing-provider"),
+                account.id(),
+                api_key,
                 missing_provider,
                 ProtocolType::OpenAi,
                 TransportType::Http,
@@ -147,6 +187,8 @@ where
     repository
         .insert_started(started(
             &first_request_id,
+            account.id(),
+            api_key,
             provider.id(),
             ProtocolType::OpenAi,
             TransportType::Http,
@@ -159,6 +201,8 @@ where
         repository
             .insert_started(started(
                 &first_request_id,
+                account.id(),
+                api_key,
                 provider.id(),
                 ProtocolType::Anthropic,
                 TransportType::WebSocket,
@@ -185,6 +229,8 @@ where
     repository
         .insert_started(started(
             &second_request_id,
+            account.id(),
+            api_key,
             provider.id(),
             ProtocolType::OpenAi,
             TransportType::WebSocket,
@@ -196,6 +242,8 @@ where
     repository
         .insert_started(started(
             &format!("{prefix}-other-provider"),
+            account.id(),
+            other_key,
             other_provider.id(),
             ProtocolType::Anthropic,
             TransportType::Http,

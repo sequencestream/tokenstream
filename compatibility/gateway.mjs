@@ -62,6 +62,7 @@ export async function startGateway({ databasePath, environment = {} }) {
     DATABASE_URL: `sqlite://${databasePath}`,
     MASTER_KEY: "11".repeat(32),
     ADMIN_PASSWORD_HASH,
+    ADMIN_PASSWORD,
     DEVELOPMENT_MODE: "true",
     UPSTREAM_CONNECT_TIMEOUT_MS: "2000",
     UPSTREAM_HEADER_TIMEOUT_MS: "5000",
@@ -112,15 +113,26 @@ export async function startGateway({ databasePath, environment = {} }) {
     return health.status === 200;
   }, "gateway did not listen");
 
-  const session = await request(adminPort, "POST", "/admin/api/session", JSON.stringify({ password: ADMIN_PASSWORD }), {
-    "content-type": "application/json",
-  });
+  const session = await request(
+    adminPort,
+    "POST",
+    "/admin/api/session",
+    JSON.stringify({ name: "admin", password: ADMIN_PASSWORD }),
+    { "content-type": "application/json" },
+  );
   if (session.status !== 200) throw new Error(`administration sign-in failed: ${session.text}`);
   const auth = {
     cookie: session.headers.get("set-cookie").split(";")[0],
     "x-csrf-token": JSON.parse(session.text).csrf_token,
     "content-type": "application/json",
   };
+
+  // A provider issues no credential of its own, so the profile obtains one the
+  // way a client does: from an account, bound to the provider it should reach.
+  const accounts = await request(adminPort, "GET", "/admin/api/accounts?limit=100", undefined, auth);
+  if (accounts.status !== 200) throw new Error(`account listing failed: ${accounts.text}`);
+  const owner = JSON.parse(accounts.text).items.find((account) => account.is_bootstrap);
+  if (!owner) throw new Error("the bootstrap account was not listed");
 
   gateway.createProvider = async ({ name, protocolType, endpoint, upstreamApiKey }) => {
     const created = await request(
@@ -137,7 +149,21 @@ export async function startGateway({ databasePath, environment = {} }) {
       auth,
     );
     if (created.status !== 201) throw new Error(`provider creation failed: ${created.text}`);
-    return JSON.parse(created.text).gateway_api_key;
+    const issued = await request(
+      adminPort,
+      "POST",
+      "/admin/api/api-keys",
+      JSON.stringify({
+        account_id: owner.id,
+        name,
+        provider_ids: [JSON.parse(created.text).id],
+        default_provider_id: JSON.parse(created.text).id,
+        status: "enabled",
+      }),
+      auth,
+    );
+    if (issued.status !== 201) throw new Error(`credential issuance failed: ${issued.text}`);
+    return JSON.parse(issued.text).api_key_secret;
   };
   gateway.auth = auth;
 

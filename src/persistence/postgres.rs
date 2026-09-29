@@ -2,21 +2,37 @@ use std::io;
 use std::time::Duration;
 
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Executor, PgPool, Postgres, QueryBuilder};
+use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row};
 
 use crate::MigrationRunner;
-use crate::domain::{GatewayKeyId, PasswordHash, Provider, ProviderId};
+use crate::domain::{
+    Account, AccountId, ApiKeyBinding, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, PasswordHash,
+    Provider, ProviderId,
+};
 use crate::logging::LogEvent;
 
 use super::time::to_epoch_micros;
 use super::{
-    DatabaseBounds, NewProvider, ProviderListRequest, ProviderPage, ProviderRepository,
-    ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage,
-    RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted, protocol_value,
-    status_value, timed, transport_value,
+    AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
+    ApiKeyBindingRow, ApiKeyListRequest, ApiKeyPage, ApiKeyRepository, ApiKeyRow, ApiKeyUpdate,
+    DatabaseBounds, NewAccount, NewApiKey, NewProvider, ProviderListRequest, ProviderPage,
+    ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted,
+    RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted,
+    account_status_value, api_key_status_value, protocol_value, role_value, status_value, timed,
+    transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+/// Deadline for one statement that runs inside a caller's transaction.
+///
+/// A transaction already holds its pooled connection, so this bounds the
+/// statement rather than an acquisition, and matches the connection's own busy
+/// timeout. A rollback releases the connection immediately.
+const BINDING_WRITE_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Names the backend in a persistence failure, so the log says which one failed.
+const LABEL: &str = "PostgreSQL";
 
 #[derive(Clone, Debug)]
 pub struct PostgresDatabase {
@@ -115,10 +131,13 @@ impl PostgresDatabase {
                 LogEvent::Started(event) => {
                     sqlx::query(
                         "INSERT INTO request_log (
-                             request_id, provider_id, protocol_type, transport_type, path, start_time
-                         ) VALUES ($1, $2, $3, $4, $5, $6)",
+                             request_id, account_id, api_key_id, provider_id, protocol_type,
+                             transport_type, path, start_time
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
                     )
                     .bind(event.request_id().as_str())
+                    .bind(event.account_id().get())
+                    .bind(event.api_key_id().get())
                     .bind(event.provider_id().get())
                     .bind(protocol_value(event.protocol_type()))
                     .bind(transport_value(event.transport_type()))
@@ -126,7 +145,7 @@ impl PostgresDatabase {
                     .bind(to_epoch_micros(event.start_time()))
                     .execute(&mut *transaction)
                     .await
-                    .map_err(map_write_error)?;
+                    .map_err(|error| map_write_error(error, LABEL))?;
                 }
                 LogEvent::Completed(event) => {
                     sqlx::query(
@@ -176,33 +195,12 @@ impl MigrationRunner for PostgresDatabase {
 }
 
 impl ProviderRepository for PostgresDatabase {
-    async fn find_by_key_id(
-        &self,
-        key_id: &GatewayKeyId,
-    ) -> Result<Option<Provider>, RepositoryError> {
-        timed(
-            self.auth_timeout,
-            sqlx::query_as::<_, ProviderRow>(
-                "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    gateway_key_id, gateway_api_key_hash, status, created_at
-             FROM provider
-             WHERE gateway_key_id = $1",
-            )
-            .bind(key_id.as_str())
-            .fetch_optional(&self.auth),
-        )
-        .await
-        .map_err(map_storage_error)?
-        .map(ProviderRow::into_provider)
-        .transpose()
-    }
-
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
         timed(
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    gateway_key_id, gateway_api_key_hash, status, created_at
+                    status, created_at
              FROM provider
              WHERE id = $1",
             )
@@ -223,7 +221,7 @@ impl ProviderRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    gateway_key_id, gateway_api_key_hash, status, created_at
+                    status, created_at
              FROM provider
              WHERE id > $1
              ORDER BY id ASC
@@ -249,24 +247,21 @@ impl ProviderRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "INSERT INTO provider (
-                 name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                 gateway_key_id, gateway_api_key_hash, status, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                       gateway_key_id, gateway_api_key_hash, status, created_at",
+                       status, created_at",
             )
             .bind(provider.name)
             .bind(protocol_value(provider.protocol_type))
             .bind(provider.endpoint.as_str())
             .bind(provider.upstream_api_key_ciphertext.expose())
-            .bind(provider.gateway_key_id.as_str())
-            .bind(provider.gateway_api_key_hash.expose())
             .bind(status_value(provider.status))
             .bind(to_epoch_micros(provider.created_at))
             .fetch_one(&self.shared),
         )
         .await
-        .map_err(map_write_error)?
+        .map_err(|error| map_write_error(error, LABEL))?
         .into_provider()
     }
 
@@ -313,7 +308,7 @@ impl ProviderRepository for PostgresDatabase {
         builder.push(" WHERE id = ").push_bind(id.get());
         builder.push(
             " RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                      gateway_key_id, gateway_api_key_hash, status, created_at",
+                      status, created_at",
         );
         timed(
             self.admin_timeout,
@@ -322,33 +317,7 @@ impl ProviderRepository for PostgresDatabase {
                 .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_write_error)?
-        .ok_or(RepositoryError::NotFound)?
-        .into_provider()
-    }
-
-    async fn rotate_gateway_key(
-        &self,
-        id: ProviderId,
-        key_id: GatewayKeyId,
-        hash: PasswordHash,
-    ) -> Result<Provider, RepositoryError> {
-        timed(
-            self.admin_timeout,
-            sqlx::query_as::<_, ProviderRow>(
-                "UPDATE provider
-             SET gateway_key_id = $1, gateway_api_key_hash = $2
-             WHERE id = $3
-             RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                       gateway_key_id, gateway_api_key_hash, status, created_at",
-            )
-            .bind(key_id.as_str())
-            .bind(hash.expose())
-            .bind(id.get())
-            .fetch_optional(&self.shared),
-        )
-        .await
-        .map_err(map_write_error)?
+        .map_err(|error| map_write_error(error, LABEL))?
         .ok_or(RepositoryError::NotFound)?
         .into_provider()
     }
@@ -382,10 +351,13 @@ impl RequestLogRepository for PostgresDatabase {
             self.log_timeout,
             sqlx::query(
                 "INSERT INTO request_log (
-                 request_id, provider_id, protocol_type, transport_type, path, start_time
-             ) VALUES ($1, $2, $3, $4, $5, $6)",
+                 request_id, account_id, api_key_id, provider_id, protocol_type,
+                 transport_type, path, start_time
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(event.request_id.as_str())
+            .bind(event.account_id.get())
+            .bind(event.api_key_id.get())
             .bind(event.provider_id.get())
             .bind(protocol_value(event.protocol_type))
             .bind(transport_value(event.transport_type))
@@ -394,7 +366,7 @@ impl RequestLogRepository for PostgresDatabase {
             .execute(&self.shared),
         )
         .await
-        .map_err(map_write_error)?;
+        .map_err(|error| map_write_error(error, LABEL))?;
         Ok(())
     }
 
@@ -419,12 +391,18 @@ impl RequestLogRepository for PostgresDatabase {
 
     async fn query(&self, query: RequestLogQuery) -> Result<RequestLogPage, RepositoryError> {
         let mut statement = QueryBuilder::<Postgres>::new(
-            "SELECT id, request_id, provider_id, protocol_type, transport_type, path,
-                    status_code::BIGINT AS status_code, start_time, end_time, error_msg
+            "SELECT id, request_id, account_id, api_key_id, provider_id, protocol_type,
+                    transport_type, path, status_code::BIGINT AS status_code,
+                    start_time, end_time, error_msg
              FROM request_log
              WHERE id > ",
         );
         statement.push_bind(query.after_id().map_or(0, |cursor| cursor.get()));
+        if let Some(account_id) = query.account_id() {
+            statement
+                .push(" AND account_id = ")
+                .push_bind(account_id.get());
+        }
         if let Some(provider_id) = query.provider_id() {
             statement
                 .push(" AND provider_id = ")
@@ -467,7 +445,546 @@ impl RequestLogRepository for PostgresDatabase {
     }
 }
 
-fn map_write_error(error: sqlx::Error) -> RepositoryError {
+impl AccountRepository for PostgresDatabase {
+    async fn find_bootstrap(&self) -> Result<Option<Account>, RepositoryError> {
+        timed(
+            self.auth_timeout,
+            sqlx::query_as::<_, AccountRow>(
+                "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
+             FROM account
+             WHERE is_bootstrap = TRUE",
+            )
+            .fetch_optional(&self.auth),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(AccountRow::into_account)
+        .transpose()
+    }
+
+    async fn find_by_name(&self, name: &str) -> Result<Option<Account>, RepositoryError> {
+        timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, AccountRow>(
+                "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
+             FROM account
+             WHERE name = $1",
+            )
+            .bind(name)
+            .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(AccountRow::into_account)
+        .transpose()
+    }
+
+    async fn find_by_id(&self, id: AccountId) -> Result<Option<Account>, RepositoryError> {
+        timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, AccountRow>(
+                "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
+             FROM account
+             WHERE id = $1",
+            )
+            .bind(id.get())
+            .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(AccountRow::into_account)
+        .transpose()
+    }
+
+    async fn list(&self, request: AccountListRequest) -> Result<AccountPage, RepositoryError> {
+        let after_id = request.after_id().map_or(0, |cursor| cursor.get());
+        let fetch_limit =
+            i64::try_from(request.limit() + 1).expect("bounded account page size fits in i64");
+        let mut rows = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, AccountRow>(
+                "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
+             FROM account
+             WHERE id > $1
+             ORDER BY id ASC
+             LIMIT $2",
+            )
+            .bind(after_id)
+            .bind(fetch_limit)
+            .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        let has_more = rows.len() > request.limit();
+        rows.truncate(request.limit());
+        let items = rows
+            .into_iter()
+            .map(AccountRow::into_account)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AccountPage::new(items, has_more))
+    }
+
+    /// Creates an account and, for the bootstrap one, adopts staged legacy keys.
+    ///
+    /// A credential issued before accounts existed resolves to a provider, not
+    /// to an owner. Adoption rewrites each staged row as a credential of this
+    /// account, bound to its original provider as the default, keeping the
+    /// stored identifier and hash. A client holding that credential therefore
+    /// keeps working across the upgrade. The staging table is cleared in the
+    /// same transaction, so the conversion happens exactly once.
+    async fn create(&self, account: NewAccount) -> Result<Account, RepositoryError> {
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let created = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, AccountRow>(
+                "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id, name, password_hash, role, status, is_bootstrap, created_at",
+            )
+            .bind(account.name())
+            .bind(account.password_hash().expose())
+            .bind(role_value(account.role()))
+            .bind(account_status_value(account.status()))
+            .bind(account.is_bootstrap())
+            .bind(to_epoch_micros(account.created_at()))
+            .fetch_one(&mut *transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .into_account()?;
+
+        if account.is_bootstrap() {
+            adopt_legacy_keys(&mut transaction, created.id()).await?;
+        }
+        transaction.commit().await.map_err(map_storage_error)?;
+        Ok(created)
+    }
+
+    async fn update(
+        &self,
+        id: AccountId,
+        update: AccountUpdate,
+    ) -> Result<Account, RepositoryError> {
+        if update.is_empty() {
+            return Err(RepositoryError::NoFieldsToUpdate);
+        }
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE account SET ");
+        {
+            let mut assignments = builder.separated(", ");
+            if let Some(name) = update.name() {
+                assignments.push("name = ").push_bind_unseparated(name);
+            }
+            if let Some(hash) = update.password_hash() {
+                assignments
+                    .push("password_hash = ")
+                    .push_bind_unseparated(hash.expose());
+            }
+            if let Some(role) = update.role() {
+                assignments
+                    .push("role = ")
+                    .push_bind_unseparated(role_value(role));
+            }
+            if let Some(status) = update.status() {
+                assignments
+                    .push("status = ")
+                    .push_bind_unseparated(account_status_value(status));
+            }
+        }
+        builder
+            .push(" WHERE id = ")
+            .push_bind(id.get())
+            .push(" RETURNING id, name, password_hash, role, status, is_bootstrap, created_at");
+        timed(
+            self.admin_timeout,
+            builder
+                .build_query_as::<AccountRow>()
+                .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .ok_or(RepositoryError::NotFound)?
+        .into_account()
+    }
+
+    async fn delete(&self, id: AccountId) -> Result<(), RepositoryError> {
+        let result = timed(
+            self.admin_timeout,
+            sqlx::query("DELETE FROM account WHERE id = $1")
+                .bind(id.get())
+                .execute(&self.shared),
+        )
+        .await
+        .map_err(|error| {
+            if is_foreign_key_violation(&error) {
+                RepositoryError::InUse
+            } else {
+                map_storage_error(error)
+            }
+        })?;
+        if result.rows_affected() == 0 {
+            Err(RepositoryError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn count(&self) -> Result<i64, RepositoryError> {
+        timed(
+            self.admin_timeout,
+            sqlx::query_scalar("SELECT COUNT(*) FROM account").fetch_one(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)
+    }
+}
+
+impl ApiKeyRepository for PostgresDatabase {
+    async fn find_by_key_id(
+        &self,
+        key_id: &GatewayKeyId,
+    ) -> Result<Option<ApiKeyWithBindings>, RepositoryError> {
+        let row = timed(
+            self.auth_timeout,
+            sqlx::query_as::<_, ApiKeyRow>(
+                "SELECT id, account_id, name, key_id, secret_hash, status,
+                        default_provider_id, expires_at, created_at
+                 FROM api_key
+                 WHERE key_id = $1",
+            )
+            .bind(key_id.as_str())
+            .fetch_optional(&self.auth),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(ApiKeyRow::into_api_key)
+        .transpose()?;
+        let Some(api_key) = row else {
+            return Ok(None);
+        };
+        let bindings = self.bindings_for(api_key.id()).await?;
+        Ok(Some(ApiKeyWithBindings::new(api_key, bindings)))
+    }
+
+    async fn find_by_id(
+        &self,
+        id: ApiKeyId,
+    ) -> Result<Option<ApiKeyWithBindings>, RepositoryError> {
+        let row = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ApiKeyRow>(
+                "SELECT id, account_id, name, key_id, secret_hash, status,
+                        default_provider_id, expires_at, created_at
+                 FROM api_key
+                 WHERE id = $1",
+            )
+            .bind(id.get())
+            .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(ApiKeyRow::into_api_key)
+        .transpose()?;
+        let Some(api_key) = row else {
+            return Ok(None);
+        };
+        let bindings = self.bindings_for(api_key.id()).await?;
+        Ok(Some(ApiKeyWithBindings::new(api_key, bindings)))
+    }
+
+    async fn list(&self, request: ApiKeyListRequest) -> Result<ApiKeyPage, RepositoryError> {
+        let after_id = request.after_id().map_or(0, |cursor| cursor.get());
+        let fetch_limit =
+            i64::try_from(request.limit() + 1).expect("bounded credential page size fits in i64");
+        let mut builder = QueryBuilder::<Postgres>::new(
+            "SELECT id, account_id, name, key_id, secret_hash, status,
+                    default_provider_id, expires_at, created_at
+             FROM api_key
+             WHERE id > $1",
+        );
+        builder.push_bind(after_id);
+        if let Some(account_id) = request.account_id() {
+            builder
+                .push(" AND account_id = $2")
+                .push_bind(account_id.get());
+        }
+        builder
+            .push(" ORDER BY id ASC LIMIT $")
+            .push_bind(fetch_limit);
+        let mut rows = timed(
+            self.admin_timeout,
+            builder
+                .build_query_as::<ApiKeyRow>()
+                .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        let has_more = rows.len() > request.limit();
+        rows.truncate(request.limit());
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let api_key = row.into_api_key()?;
+            let bindings = self.bindings_for(api_key.id()).await?;
+            items.push(ApiKeyWithBindings::new(api_key, bindings));
+        }
+        Ok(ApiKeyPage::new(items, has_more))
+    }
+
+    async fn create(&self, api_key: NewApiKey) -> Result<ApiKeyWithBindings, RepositoryError> {
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let created = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ApiKeyRow>(
+                "INSERT INTO api_key (
+                     account_id, name, key_id, secret_hash, status,
+                     default_provider_id, expires_at, created_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 RETURNING id, account_id, name, key_id, secret_hash, status,
+                           default_provider_id, expires_at, created_at",
+            )
+            .bind(api_key.account_id.get())
+            .bind(api_key.name.as_str())
+            .bind(api_key.key_id.as_str())
+            .bind(api_key.secret_hash.expose())
+            .bind(api_key_status_value(api_key.status))
+            .bind(api_key.default_provider_id.map(ProviderId::get))
+            .bind(api_key.expires_at.map(to_epoch_micros))
+            .bind(to_epoch_micros(api_key.created_at))
+            .fetch_one(&mut *transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .into_api_key()?;
+        write_bindings(&mut transaction, created.id(), api_key.provider_ids()).await?;
+        transaction.commit().await.map_err(map_storage_error)?;
+        let bindings = self.bindings_for(created.id()).await?;
+        Ok(ApiKeyWithBindings::new(created, bindings))
+    }
+
+    /// Writes only the named fields, then reloads the credential and its set.
+    ///
+    /// The binding set and the default are written in one transaction, so a
+    /// caller can never observe a default that points outside the allowed set.
+    async fn update(
+        &self,
+        id: ApiKeyId,
+        update: ApiKeyUpdate,
+    ) -> Result<ApiKeyWithBindings, RepositoryError> {
+        if update.is_empty() {
+            return Err(RepositoryError::NoFieldsToUpdate);
+        }
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        if let Some(provider_ids) = update.provider_ids() {
+            timed(
+                self.admin_timeout,
+                sqlx::query("DELETE FROM api_key_provider WHERE api_key_id = $1")
+                    .bind(id.get())
+                    .execute(&mut *transaction),
+            )
+            .await
+            .map_err(|error| map_write_error(error, LABEL))?;
+            write_bindings(&mut transaction, id, provider_ids).await?;
+        }
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE api_key SET ");
+        {
+            let mut assignments = builder.separated(", ");
+            if let Some(name) = update.name() {
+                assignments.push("name = ").push_bind_unseparated(name);
+            }
+            if let Some(status) = update.status() {
+                assignments
+                    .push("status = ")
+                    .push_bind_unseparated(api_key_status_value(status));
+            }
+            if let Some(Some(expires_at)) = update.expires_at() {
+                assignments
+                    .push("expires_at = ")
+                    .push_bind_unseparated(to_epoch_micros(expires_at));
+            }
+            if let Some(Some(provider_id)) = update.default_provider_id() {
+                assignments
+                    .push("default_provider_id = ")
+                    .push_bind_unseparated(provider_id.get());
+            }
+            if update.expires_at() == Some(None) {
+                assignments.push("expires_at = NULL");
+            }
+            if update.default_provider_id() == Some(None) {
+                assignments.push("default_provider_id = NULL");
+            }
+        }
+        builder.push(" WHERE id = ").push_bind(id.get()).push(
+            " RETURNING id, account_id, name, key_id, secret_hash, status,
+                          default_provider_id, expires_at, created_at",
+        );
+        let updated = timed(
+            self.admin_timeout,
+            builder
+                .build_query_as::<ApiKeyRow>()
+                .fetch_optional(&mut *transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .ok_or(RepositoryError::NotFound)?
+        .into_api_key()?;
+        transaction.commit().await.map_err(map_storage_error)?;
+        let bindings = self.bindings_for(id).await?;
+        Ok(ApiKeyWithBindings::new(updated, bindings))
+    }
+
+    async fn rotate(
+        &self,
+        id: ApiKeyId,
+        key_id: GatewayKeyId,
+        hash: PasswordHash,
+    ) -> Result<ApiKeyWithBindings, RepositoryError> {
+        let updated = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ApiKeyRow>(
+                "UPDATE api_key
+                 SET key_id = $1, secret_hash = $2
+                 WHERE id = $3
+                 RETURNING id, account_id, name, key_id, secret_hash, status,
+                           default_provider_id, expires_at, created_at",
+            )
+            .bind(key_id.as_str())
+            .bind(hash.expose())
+            .bind(id.get())
+            .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .ok_or(RepositoryError::NotFound)?
+        .into_api_key()?;
+        let bindings = self.bindings_for(id).await?;
+        Ok(ApiKeyWithBindings::new(updated, bindings))
+    }
+
+    async fn delete(&self, id: ApiKeyId) -> Result<(), RepositoryError> {
+        let result = timed(
+            self.admin_timeout,
+            sqlx::query("DELETE FROM api_key WHERE id = $1")
+                .bind(id.get())
+                .execute(&self.shared),
+        )
+        .await
+        .map_err(|error| {
+            if is_foreign_key_violation(&error) {
+                RepositoryError::InUse
+            } else {
+                map_storage_error(error)
+            }
+        })?;
+        if result.rows_affected() == 0 {
+            Err(RepositoryError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl PostgresDatabase {
+    /// Reads one credential's allowed providers in preference order.
+    async fn bindings_for(&self, id: ApiKeyId) -> Result<Vec<ApiKeyBinding>, RepositoryError> {
+        let rows = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ApiKeyBindingRow>(
+                "SELECT api_key_id, provider_id, position
+                 FROM api_key_provider
+                 WHERE api_key_id = $1
+                 ORDER BY position ASC",
+            )
+            .bind(id.get())
+            .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        rows.into_iter()
+            .map(ApiKeyBindingRow::into_binding)
+            .collect()
+    }
+}
+
+/// Writes a credential's allowed providers in preference order.
+///
+/// The statements run inside the caller's transaction, so a failure part way
+/// through rolls the whole credential back rather than leaving a partial set.
+async fn write_bindings(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    api_key_id: ApiKeyId,
+    provider_ids: &[ProviderId],
+) -> Result<(), RepositoryError> {
+    for (position, provider_id) in provider_ids.iter().enumerate() {
+        let position = i64::try_from(position).map_err(|_| RepositoryError::InvalidStoredData)?;
+        timed(
+            BINDING_WRITE_DEADLINE,
+            sqlx::query(
+                "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(api_key_id.get())
+            .bind(provider_id.get())
+            .bind(position)
+            .execute(&mut **transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?;
+    }
+    Ok(())
+}
+
+/// Rewrites staged provider-issued credentials as credentials of `account_id`.
+///
+/// Each adopted credential keeps its identifier and hash, and is bound to its
+/// original provider as the default, so a running client is never interrupted by
+/// the upgrade. The staging rows are deleted, which is what makes the
+/// conversion run once.
+async fn adopt_legacy_keys(
+    transaction: &mut sqlx::Transaction<'_, Postgres>,
+    account_id: AccountId,
+) -> Result<(), RepositoryError> {
+    let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM legacy_gateway_key")
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(map_storage_error)?;
+    for row in staged {
+        let provider_id: i64 = row.get("provider_id");
+        let key_id: String = row.get("key_id");
+        let secret_hash: String = row.get("secret_hash");
+        let created = sqlx::query(
+            "INSERT INTO api_key (
+                 account_id, name, key_id, secret_hash, status,
+                 default_provider_id, expires_at, created_at
+             ) VALUES ($1, $2, $3, $4, 'enabled', $5, NULL, $6)
+             RETURNING id",
+        )
+        .bind(account_id.get())
+        .bind(format!("migrated-{provider_id}"))
+        .bind(&key_id)
+        .bind(&secret_hash)
+        .bind(provider_id)
+        .bind(to_epoch_micros(chrono::Utc::now()))
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?;
+        let api_key_id: i64 = created.get("id");
+        sqlx::query(
+            "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+             VALUES ($1, $2, 0)",
+        )
+        .bind(api_key_id)
+        .bind(provider_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?;
+    }
+    sqlx::query("DELETE FROM legacy_gateway_key")
+        .execute(&mut **transaction)
+        .await
+        .map_err(map_storage_error)?;
+    Ok(())
+}
+
+fn map_write_error(error: sqlx::Error, label: &str) -> RepositoryError {
     if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else if error
@@ -478,6 +995,12 @@ fn map_write_error(error: sqlx::Error) -> RepositoryError {
     } else if is_foreign_key_violation(&error) {
         RepositoryError::NotFound
     } else {
+        // A generic failure would send an operator to the wrong place: the
+        // database's own message names the constraint or the column that
+        // rejected the write, so it is reported rather than discarded.
+        if let Some(database_error) = error.as_database_error() {
+            eprintln!("{label} write failed: {database_error}");
+        }
         RepositoryError::Storage
     }
 }

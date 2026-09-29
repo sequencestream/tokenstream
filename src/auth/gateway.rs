@@ -1,20 +1,26 @@
-//! Data-plane authentication of provider-scoped gateway credentials.
+//! Data-plane authentication of account-owned gateway credentials.
 //!
 //! Authentication reads the provider-native header, parses the external
 //! `<key-id>.<secret>` credential under strict length and character bounds,
-//! resolves exactly one provider through its key identifier, verifies the
-//! secret against the stored hash, and decrypts the upstream key. The result is
-//! an immutable snapshot that a single request or connection owns for its whole
-//! lifetime.
+//! resolves the account that owns it, resolves exactly one provider from the
+//! credential's own bindings, verifies the secret against the stored hash, and
+//! decrypts the upstream key. The result is an immutable snapshot that a single
+//! request or connection owns for its whole lifetime.
 //!
 //! Every call performs its own lookup: there is no application-level credential
 //! cache, so an edit, disable, or key rotation is observed by the next request
 //! while already admitted work keeps its snapshot. Failures are returned before
 //! any upstream is contacted and never carry credential, hash, or ciphertext
 //! material.
+//!
+//! Nothing here reads the request body. Provider selection reads only the
+//! credential's bindings and one dedicated request header, so payload
+//! transparency holds for a credential that reaches several upstreams.
 
 use crate::crypto::{PasswordWork, PasswordWorkError};
-use crate::persistence::{ProviderRepository, RepositoryError};
+use crate::persistence::{
+    AccountRepository, ApiKeyRepository, ProviderRepository, RepositoryError,
+};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -24,7 +30,8 @@ use hyper::header::AUTHORIZATION;
 
 use crate::crypto::{GatewaySecretVerifier, SecretCipher};
 use crate::domain::{
-    GatewayCredential, MAX_GATEWAY_CREDENTIAL_LEN, ProtocolType, ProviderSnapshot, ProviderStatus,
+    AccountStatus, ApiKeyStatus, ApiKeyWithBindings, GatewayCredential, MAX_GATEWAY_CREDENTIAL_LEN,
+    ProtocolType, Provider, ProviderId, ProviderSnapshot, ProviderStatus,
 };
 
 /// Header carrying the gateway credential on Anthropic-native routes.
@@ -32,6 +39,13 @@ const ANTHROPIC_CREDENTIAL_HEADER: &str = "x-api-key";
 
 /// Authorization scheme token that precedes an OpenAI-native gateway credential.
 const BEARER_SCHEME: &str = "Bearer";
+
+/// Dedicated non-payload header that selects one of a credential's providers.
+///
+/// This is the only field besides the credential that may influence routing. It
+/// is read before route validation, is accepted only when it names a provider
+/// the credential is bound to, and is never logged.
+pub const PROVIDER_SELECTION_HEADER: &str = "x-tokenstream-provider";
 
 /// Longest accepted Authorization header value, including the scheme token.
 const MAX_AUTHORIZATION_LEN: usize = BEARER_SCHEME.len() + 1 + MAX_GATEWAY_CREDENTIAL_LEN;
@@ -66,6 +80,12 @@ pub enum GatewayAuthError {
     InvalidCredential,
     /// The resolved provider is disabled.
     ProviderDisabled,
+    /// The account that owns the credential is disabled.
+    AccountDisabled,
+    /// The credential carries an expiration that has already passed.
+    KeyExpired,
+    /// The credential selected no provider and has no default binding.
+    NoProviderSelected,
     /// Storage or cryptographic infrastructure failed; authentication fails closed.
     Unavailable,
     /// Compute or database capacity for this lookup is exhausted.
@@ -82,6 +102,9 @@ impl fmt::Display for GatewayAuthError {
             Self::UnknownCredential => "gateway credential is not recognized",
             Self::InvalidCredential => "gateway credential is invalid",
             Self::ProviderDisabled => "provider is disabled",
+            Self::AccountDisabled => "account is disabled",
+            Self::KeyExpired => "gateway credential has expired",
+            Self::NoProviderSelected => "no provider is selected for this credential",
             Self::Unavailable => "gateway authentication is unavailable",
             Self::Busy => "gateway authentication is busy",
         };
@@ -91,7 +114,7 @@ impl fmt::Display for GatewayAuthError {
 
 impl Error for GatewayAuthError {}
 
-/// Resolves a downstream gateway credential into a request-local provider snapshot.
+/// Resolves a downstream gateway credential into a request-local snapshot.
 ///
 /// The authenticator owns its storage and cryptographic collaborators and holds
 /// no per-request state, so it can be shared across connection tasks while each
@@ -103,9 +126,22 @@ pub struct GatewayAuthenticator<R, C, V> {
     password_work: PasswordWork,
 }
 
+/// The provider one request resolved to, before it is loaded in full.
+///
+/// Selection happens before the provider row is read, so a credential bound to
+/// several upstreams costs one small indexed read, not one read per binding.
+enum ProviderSelection {
+    Id(ProviderId),
+    Default,
+}
+
 impl<R, C, V> GatewayAuthenticator<R, C, V>
 where
-    R: ProviderRepository,
+    // One lookup resolves the credential, the account that owns it, and the one
+    // provider it selects, so the hot path needs all three stores and nothing
+    // else. Keeping them on one repository is what makes that a single
+    // consistent read rather than three independently drifting ones.
+    R: ApiKeyRepository + AccountRepository + ProviderRepository,
     C: SecretCipher,
     V: GatewaySecretVerifier + 'static,
 {
@@ -124,12 +160,12 @@ where
         self
     }
 
-    /// Authenticates `headers` and returns an immutable provider snapshot.
+    /// Authenticates `headers` and returns an immutable request snapshot.
     ///
-    /// Missing, duplicated, conflicting, malformed, unknown, wrong, and disabled
-    /// credentials all fail here, before any upstream is contacted. A successful
-    /// result owns the decrypted upstream key for the lifetime of the request or
-    /// connection that holds it.
+    /// Missing, duplicated, conflicting, malformed, unknown, wrong, disabled,
+    /// and expired credentials all fail here, before any upstream is contacted.
+    /// A successful result owns the account, the credential, and the decrypted
+    /// upstream key for the lifetime of the request or connection.
     pub async fn authenticate(
         &self,
         headers: &HeaderMap,
@@ -138,11 +174,34 @@ where
         let credential =
             GatewayCredential::parse(raw).map_err(|_| GatewayAuthError::MalformedCredential)?;
 
-        let provider = match self.repository.find_by_key_id(credential.key_id()).await {
-            Ok(provider) => provider.ok_or(GatewayAuthError::UnknownCredential)?,
-            Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
-            Err(_) => return Err(GatewayAuthError::Unavailable),
-        };
+        let owned =
+            match ApiKeyRepository::find_by_key_id(&self.repository, credential.key_id()).await {
+                Ok(owned) => owned.ok_or(GatewayAuthError::UnknownCredential)?,
+                Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
+                Err(_) => return Err(GatewayAuthError::Unavailable),
+            };
+        let api_key = owned.api_key();
+
+        if api_key.status() == ApiKeyStatus::Disabled {
+            return Err(GatewayAuthError::InvalidCredential);
+        }
+        if api_key.is_expired_at(chrono::Utc::now()) {
+            return Err(GatewayAuthError::KeyExpired);
+        }
+
+        let account =
+            match AccountRepository::find_by_id(&self.repository, api_key.account_id()).await {
+                Ok(account) => account.ok_or(GatewayAuthError::UnknownCredential)?,
+                Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
+                Err(_) => return Err(GatewayAuthError::Unavailable),
+            };
+        if account.status() == AccountStatus::Disabled {
+            return Err(GatewayAuthError::AccountDisabled);
+        }
+
+        let provider = self
+            .resolve_provider(&owned, selection_header(headers))
+            .await?;
 
         if source != native_source(provider.protocol_type()) {
             return Err(GatewayAuthError::ConflictingCredential);
@@ -153,7 +212,7 @@ where
 
         let verifier = self.verifier.clone();
         let secret = credential.secret().clone();
-        let hash = provider.gateway_api_key_hash().clone();
+        let hash = api_key.secret_hash().clone();
         let verified = match self
             .password_work
             .run(move || verifier.verify(&secret, &hash))
@@ -175,12 +234,71 @@ where
             .map_err(|_| GatewayAuthError::Unavailable)?;
 
         Ok(Arc::new(ProviderSnapshot::new(
+            account.id(),
+            api_key.id(),
             provider.id(),
             provider.protocol_type(),
             provider.endpoint().clone(),
             upstream_api_key,
         )))
     }
+
+    /// Resolves the single provider this request reaches.
+    ///
+    /// The only inputs are the credential's own bindings and the dedicated
+    /// selection header. A selection naming a provider the credential is not
+    /// bound to is rejected as an unknown credential rather than silently
+    /// falling back, so a misconfigured client fails visibly instead of
+    /// reaching an unintended upstream. A credential that names nothing and has
+    /// no default fails closed rather than guessing.
+    async fn resolve_provider(
+        &self,
+        owned: &ApiKeyWithBindings,
+        selected: Option<&str>,
+    ) -> Result<Provider, GatewayAuthError> {
+        let selection = match selected {
+            Some(name) => {
+                let provider_id = name
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|id| ProviderId::try_from(id).ok())
+                    .ok_or(GatewayAuthError::UnknownCredential)?;
+                if !owned.allows(provider_id) {
+                    return Err(GatewayAuthError::UnknownCredential);
+                }
+                ProviderSelection::Id(provider_id)
+            }
+            None => ProviderSelection::Default,
+        };
+
+        let provider_id = match selection {
+            ProviderSelection::Id(provider_id) => Some(provider_id),
+            ProviderSelection::Default => owned
+                .api_key()
+                .default_provider_id()
+                .or_else(|| owned.bindings().first().map(|b| b.provider_id)),
+        };
+        let provider_id = provider_id.ok_or(GatewayAuthError::NoProviderSelected)?;
+
+        match ProviderRepository::find_by_id(&self.repository, provider_id).await {
+            Ok(provider) => provider.ok_or(GatewayAuthError::UnknownCredential),
+            Err(RepositoryError::Timeout) => Err(GatewayAuthError::Busy),
+            Err(_) => Err(GatewayAuthError::Unavailable),
+        }
+    }
+}
+
+/// Reads the provider-selection header, rejecting a repeated or non-text value.
+///
+/// A repeated selection is ambiguous, so it is treated as a conflicting
+/// credential rather than resolved to whichever copy happened to come first.
+fn selection_header(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(PROVIDER_SELECTION_HEADER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().filter(|value| !value.is_empty())
 }
 
 impl<R, C, V> fmt::Debug for GatewayAuthenticator<R, C, V> {

@@ -8,7 +8,9 @@
 use std::net::SocketAddr;
 
 use hyper::HeaderMap;
-use tokenstream::domain::{ProtocolType, ProviderId, ProviderSnapshot, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, SecretString,
+};
 use tokenstream::proxy::headers::{
     HeaderError, build_downstream_response_headers, build_upstream_request_headers,
 };
@@ -16,6 +18,8 @@ use url::Url;
 
 fn snapshot(protocol_type: ProtocolType, endpoint: &str, upstream_key: &str) -> ProviderSnapshot {
     ProviderSnapshot::new(
+        AccountId::try_from(1).expect("positive account ID"),
+        ApiKeyId::try_from(1).expect("positive credential ID"),
         ProviderId::try_from(1).expect("positive provider ID"),
         protocol_type,
         Url::parse(endpoint).expect("valid endpoint"),

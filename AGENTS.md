@@ -21,6 +21,7 @@ Entry point for agents and contributors. Defines the rules governing Tokenstream
 | Decisions | `doc/adr/` | Accepted forks among real alternatives |
 | Process | `doc/modules/process.md` | Configuration, listeners, and graceful shutdown |
 | Authentication | `doc/modules/authentication.md` | Gateway credential verification and snapshots |
+| Accounts and credentials | `doc/modules/credentials.md` | Account ownership, credential lifecycle, provider bindings |
 | Routing | `doc/modules/routing.md` | Route and transport allowlist decisions |
 | Proxy | `doc/modules/proxy.md` | HTTP/SSE streaming and WebSocket relay |
 | Providers | `doc/modules/providers.md` | Provider lifecycle and snapshot loading |

@@ -11,25 +11,30 @@ use hyper::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use tokenstream::admin::AdminApi;
 use tokenstream::auth::{GatewayAuthError, GatewayAuthenticator};
+use tokenstream::credentials::{CreateApiKeyRequest, CredentialService};
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier, PasswordWork};
-use tokenstream::domain::{GatewayKeyId, ProtocolType, ProviderStatus, SecretString};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ApiKeyStatus, GatewayKeyId, ProtocolType, ProviderStatus, SecretString,
+};
 use tokenstream::logging::{LogEvent, LogSink, channel};
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    DatabaseBounds, ProviderListRequest, ProviderRepository, RepositoryError, RequestLogStarted,
+    ApiKeyRepository, DatabaseBounds, ProviderListRequest, ProviderRepository, RepositoryError,
+    RequestLogStarted,
 };
 use tokenstream::providers::{CreateProviderRequest, ProviderService};
 use tokenstream::telemetry::{Metrics, ProxyFailureCategory};
 use tokio::sync::oneshot;
 
 mod support;
-use support::require_postgres_url;
+use support::{bootstrap_account, require_postgres_url};
 
 static POSTGRES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const MASTER_KEY: [u8; 32] = [0x5c; 32];
 const UPSTREAM_KEY: &str = "sk-upstream-secret-value";
+const ADMIN_NAME: &str = "admin";
 const ADMIN_PASSWORD: &str = "correct horse battery staple";
 
 fn short_bounds(max_connections: usize, auth_connections: usize) -> DatabaseBounds {
@@ -100,16 +105,24 @@ async fn exhausted_password_work_fails_closed_as_busy() {
         DatabaseBounds::for_tests(2),
     )
     .await;
-    let service = ProviderService::new(
-        database.clone(),
-        AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
-        false,
-    );
+    let service = ProviderService::new(database.clone(), AesGcmCipher::new(&MASTER_KEY), false);
     let created = service
         .create(create_request("primary"))
         .await
         .expect("create provider");
+    let accounts = CredentialService::new(database.clone(), Argon2GatewaySecretVerifier::new());
+    let account = bootstrap_account(&accounts).await;
+    let issued = accounts
+        .create_api_key(CreateApiKeyRequest::new(
+            account.id(),
+            "busy".to_owned(),
+            vec![created.id()],
+            Some(created.id()),
+            None,
+            ApiKeyStatus::Enabled,
+        ))
+        .await
+        .expect("issue a credential");
     let work = PasswordWork::new(1);
     let authenticator = GatewayAuthenticator::new(
         database,
@@ -134,7 +147,7 @@ async fn exhausted_password_work_fails_closed_as_busy() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert(
         AUTHORIZATION,
-        format!("Bearer {}", created.gateway_credential().render())
+        format!("Bearer {}", issued.credential().render())
             .parse()
             .expect("valid header"),
     );
@@ -173,6 +186,9 @@ async fn administrator_sign_in_reports_resource_exhausted_without_internal_error
     )
     .with_password_work(work.clone())
     .with_metrics(metrics.clone());
+    api.ensure_bootstrap_account(ADMIN_NAME, ADMIN_PASSWORD)
+        .await
+        .expect("create the bootstrap account");
 
     let (started, ready) = oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
@@ -192,7 +208,8 @@ async fn administrator_sign_in_reports_resource_exhausted_without_internal_error
         .uri("/admin/api/session")
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(
-            serde_json::to_vec(&json!({ "password": ADMIN_PASSWORD })).expect("JSON"),
+            serde_json::to_vec(&json!({ "name": ADMIN_NAME, "password": ADMIN_PASSWORD }))
+                .expect("JSON"),
         )))
         .expect("request");
     let response = api.handle(request, Metrics::default()).await;
@@ -229,21 +246,19 @@ async fn sqlite_reserved_auth_connections_survive_shared_pool_exhaustion() {
         database.pool().acquire().await.expect("shared slot 2"),
     );
     let started = Instant::now();
-    database
-        .find_by_key_id(&GatewayKeyId::new("absent").expect("key"))
+    ApiKeyRepository::find_by_key_id(&database, &GatewayKeyId::new("absent").expect("key"))
         .await
         .expect("auth lookup uses reserved capacity");
     assert!(started.elapsed() < Duration::from_millis(500));
-    let list = database
-        .list(ProviderListRequest::new(None, 10).expect("page"))
-        .await;
+    let list =
+        ProviderRepository::list(&database, ProviderListRequest::new(None, 10).expect("page"))
+            .await;
     assert_eq!(
         list.expect_err("shared pool is exhausted"),
         RepositoryError::Timeout
     );
     drop(held);
-    database
-        .list(ProviderListRequest::new(None, 10).expect("page"))
+    ProviderRepository::list(&database, ProviderListRequest::new(None, 10).expect("page"))
         .await
         .expect("shared pool recovers");
 }
@@ -258,12 +273,7 @@ async fn sqlite_write_lock_wait_fails_within_the_deadline_and_pool_recovers() {
         .await
         .expect("reserved lock");
     let started = Instant::now();
-    let service = ProviderService::new(
-        database.clone(),
-        AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
-        false,
-    );
+    let service = ProviderService::new(database.clone(), AesGcmCipher::new(&MASTER_KEY), false);
     let result = service.create(create_request("blocked")).await;
     assert_eq!(
         result.expect_err("write lock wait fails closed"),
@@ -285,12 +295,7 @@ async fn sqlite_write_lock_wait_fails_within_the_deadline_and_pool_recovers() {
 async fn sqlite_log_batch_deadline_does_not_block_a_later_write() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = sqlite(&directory.path().join("log-timeout.db"), short_bounds(2, 2)).await;
-    let service = ProviderService::new(
-        database.clone(),
-        AesGcmCipher::new(&MASTER_KEY),
-        Argon2GatewaySecretVerifier::new(),
-        false,
-    );
+    let service = ProviderService::new(database.clone(), AesGcmCipher::new(&MASTER_KEY), false);
     service
         .create(create_request("logged"))
         .await
@@ -312,6 +317,8 @@ async fn sqlite_log_batch_deadline_does_not_block_a_later_write() {
     assert_eq!(
         sink.try_emit(LogEvent::Started(RequestLogStarted::new(
             tokenstream::domain::RequestId::new("req-log-timeout").expect("id"),
+            AccountId::try_from(1).expect("account"),
+            ApiKeyId::try_from(1).expect("credential"),
             tokenstream::domain::ProviderId::try_from(1).expect("provider"),
             ProtocolType::OpenAi,
             tokenstream::domain::TransportType::Http,
@@ -356,9 +363,11 @@ async fn postgres_lock_wait_and_sleep_fail_within_deadlines() {
         .await
         .expect("lock table");
     let started = Instant::now();
-    let result = database
-        .find_by_key_id(&GatewayKeyId::new("absent").expect("key"))
-        .await;
+    let result = ProviderRepository::find_by_id(
+        &database,
+        tokenstream::domain::ProviderId::try_from(1).expect("positive provider ID"),
+    )
+    .await;
     assert_eq!(
         result.expect_err("lock wait fails closed"),
         RepositoryError::Timeout
@@ -381,8 +390,7 @@ async fn postgres_lock_wait_and_sleep_fail_within_deadlines() {
         "execution stall is cancelled"
     );
     assert!(started.elapsed() < Duration::from_secs(2));
-    database
-        .find_by_key_id(&GatewayKeyId::new("absent").expect("key"))
+    ApiKeyRepository::find_by_key_id(&database, &GatewayKeyId::new("absent").expect("key"))
         .await
         .expect("pool is usable after a cancelled stall");
 }
@@ -399,13 +407,11 @@ async fn postgres_reserved_auth_connections_survive_shared_pool_exhaustion() {
         database.pool().acquire().await.expect("shared slot 1"),
         database.pool().acquire().await.expect("shared slot 2"),
     );
-    database
-        .find_by_key_id(&GatewayKeyId::new("absent").expect("key"))
+    ApiKeyRepository::find_by_key_id(&database, &GatewayKeyId::new("absent").expect("key"))
         .await
         .expect("auth lookup uses reserved capacity");
     assert_eq!(
-        database
-            .list(ProviderListRequest::new(None, 10).expect("page"))
+        ProviderRepository::list(&database, ProviderListRequest::new(None, 10).expect("page"),)
             .await
             .expect_err("shared pool is exhausted"),
         RepositoryError::Timeout

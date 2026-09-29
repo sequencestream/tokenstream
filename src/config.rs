@@ -62,6 +62,29 @@ impl fmt::Debug for AdminPasswordHash {
     }
 }
 
+/// The name of the account created from the configured administrator password.
+#[derive(Clone)]
+pub struct BootstrapAccount(String);
+
+impl BootstrapAccount {
+    fn new(value: &str) -> Result<Self, ConfigError> {
+        let value = value.trim();
+        if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
+            return Err(ConfigError::Invalid {
+                name: "TOKENSTREAM_BOOTSTRAP_ACCOUNT",
+                requirement: "must be a short, non-empty account name",
+            });
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl fmt::Debug for BootstrapAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("BootstrapAccount([REDACTED])")
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     data_listen_addr: SocketAddr,
@@ -69,6 +92,7 @@ pub struct Config {
     database_url: DatabaseUrl,
     master_key: MasterKey,
     admin_password_hash: AdminPasswordHash,
+    bootstrap_account: BootstrapAccount,
     upstream_connect_timeout: Duration,
     upstream_header_timeout: Duration,
     stream_idle_timeout: Duration,
@@ -240,6 +264,11 @@ impl Config {
         };
         validate_admin_password_hash(&admin_hash_value)?;
         let admin_password_hash = AdminPasswordHash(admin_hash_value);
+        let bootstrap_account = BootstrapAccount::new(&parse_optional_value::<String>(
+            &mut get,
+            "TOKENSTREAM_BOOTSTRAP_ACCOUNT",
+            crate::admin::DEFAULT_BOOTSTRAP_ACCOUNT_NAME,
+        )?)?;
 
         let upstream_connect_timeout = parse_optional_duration(
             &mut get,
@@ -434,6 +463,7 @@ impl Config {
             database_url,
             master_key,
             admin_password_hash,
+            bootstrap_account,
             upstream_connect_timeout,
             upstream_header_timeout,
             stream_idle_timeout,
@@ -522,6 +552,15 @@ impl Config {
 
     pub fn admin_password_hash(&self) -> &AdminPasswordHash {
         &self.admin_password_hash
+    }
+
+    /// The name given to the account created from the administrator password.
+    pub fn bootstrap_account(&self) -> &BootstrapAccount {
+        &self.bootstrap_account
+    }
+
+    pub fn bootstrap_account_name(&self) -> &str {
+        &self.bootstrap_account.0
     }
 
     pub fn upstream_connect_timeout(&self) -> Duration {
@@ -626,6 +665,10 @@ impl Config {
                 self.database_url.expose().to_owned(),
             ),
             ("TOKENSTREAM_MASTER_KEY".to_owned(), self.master_key_hex()),
+            (
+                "TOKENSTREAM_BOOTSTRAP_ACCOUNT".to_owned(),
+                self.bootstrap_account_name().to_owned(),
+            ),
             (
                 "TOKENSTREAM_ADMIN_PASSWORD_HASH".to_owned(),
                 self.admin_password_hash.expose().to_owned(),

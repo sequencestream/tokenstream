@@ -10,11 +10,14 @@ use hyper::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use tokenstream::admin::AdminApi;
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
-use tokenstream::domain::{ProtocolType, ProviderId, RequestId, TransportType};
+use tokenstream::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, RequestId, TransportType,
+};
 use tokenstream::persistence::sqlite::SqliteDatabase;
-use tokenstream::persistence::{RequestLogRepository, RequestLogStarted};
+use tokenstream::persistence::{AccountRepository, RequestLogRepository, RequestLogStarted};
 use tokenstream::telemetry::Metrics;
 
+const ADMIN_NAME: &str = "admin";
 const PASSWORD: &str = "correct horse battery staple";
 const MASTER_KEY: [u8; 32] = [0x53; 32];
 
@@ -44,6 +47,11 @@ async fn api(
         hash,
         ttl,
     );
+    // The first account is the one a client signs in as, so the control plane
+    // is only usable once the deployment has created it.
+    api.ensure_bootstrap_account(ADMIN_NAME, PASSWORD)
+        .await
+        .expect("create the bootstrap account");
     (api, database, directory)
 }
 
@@ -92,20 +100,29 @@ async fn send(
     (status, headers, value)
 }
 
-async fn sign_in(
+/// Signs in as the named account and returns its cookie and CSRF token.
+async fn sign_in_as(
     api: &AdminApi<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>,
+    name: &str,
+    password: &str,
 ) -> (String, String) {
     let (status, headers, body) = send(
         api,
         request(
             Method::POST,
             "/admin/api/session",
-            json!({"password": PASSWORD}),
+            json!({"name": name, "password": password}),
             None,
             None,
         ),
     )
     .await;
+    if status != StatusCode::OK {
+        panic!(
+            "sign-in for {name} failed: {status} {}",
+            body.get("error").cloned().unwrap_or(Value::Null)
+        );
+    }
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers.get(CACHE_CONTROL).expect("cache policy"),
@@ -125,7 +142,47 @@ async fn sign_in(
         .expect("cookie pair")
         .to_owned();
     let csrf = body["csrf_token"].as_str().expect("CSRF token").to_owned();
+    assert_eq!(body["account_name"], name);
     (cookie, csrf)
+}
+
+async fn sign_in(
+    api: &AdminApi<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>,
+) -> (String, String) {
+    sign_in_as(api, ADMIN_NAME, PASSWORD).await
+}
+
+/// Creates a regular account and returns its identifier with its password.
+async fn create_user(
+    api: &AdminApi<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>,
+    cookie: &str,
+    csrf: &str,
+    name: &str,
+) -> (i64, String) {
+    let (status, _, created) = send(
+        api,
+        request(
+            Method::POST,
+            "/admin/api/accounts",
+            json!({"name": name, "role": "user", "status": "enabled"}),
+            Some(cookie),
+            Some(csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let id = created["account"]["id"].as_i64().expect("account ID");
+    let password = created["generated_password"]
+        .as_str()
+        .expect("a one-time password")
+        .to_owned();
+    assert!(
+        !serde_json::to_string(&created)
+            .expect("render")
+            .contains("password_hash"),
+        "an account view must never carry a password hash"
+    );
+    (id, password)
 }
 
 #[tokio::test]
@@ -136,7 +193,7 @@ async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_acce
         request(
             Method::POST,
             "/admin/api/session",
-            json!({"password": "wrong-secret"}),
+            json!({"name": ADMIN_NAME, "password": "wrong-secret"}),
             None,
             None,
         ),
@@ -260,11 +317,10 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
         headers.get(CACHE_CONTROL).expect("cache policy"),
         "no-store"
     );
-    let provider_id = created["provider"]["id"].as_i64().expect("provider ID");
-    let first_gateway_key = created["gateway_api_key"]
-        .as_str()
-        .expect("one-time credential")
-        .to_owned();
+    let provider_id = created["id"].as_i64().expect("provider ID");
+    // A provider no longer issues a credential, so creation returns the record
+    // alone and nothing a client could present as a key.
+    assert!(created.get("gateway_api_key").is_none());
     let rendered = created.to_string();
     assert!(!rendered.contains("upstream-secret"));
     assert!(!rendered.contains("ciphertext"));
@@ -351,23 +407,52 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    let _ = &rotated;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(
         headers.get(CACHE_CONTROL).expect("cache policy"),
         "no-store"
-    );
-    assert_ne!(
-        rotated["gateway_api_key"].as_str().expect("rotated key"),
-        first_gateway_key
     );
 
     let started_at = Utc
         .with_ymd_and_hms(2026, 9, 28, 8, 0, 0)
         .single()
         .expect("timestamp");
+    let account_id = AccountId::try_from(
+        database
+            .find_bootstrap()
+            .await
+            .expect("read the bootstrap account")
+            .expect("the bootstrap account exists")
+            .id()
+            .get(),
+    )
+    .expect("positive account ID");
+    let (status, _, issued) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/api-keys",
+            json!({
+                "account_id": account_id.get(),
+                "name": "ci",
+                "provider_ids": [provider_id],
+                "default_provider_id": provider_id,
+                "status": "enabled"
+            }),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let api_key_id = ApiKeyId::try_from(issued["api_key"]["id"].as_i64().expect("credential ID"))
+        .expect("positive credential ID");
     database
         .insert_started(RequestLogStarted::new(
             RequestId::new("admin-api-log").expect("request ID"),
+            account_id,
+            api_key_id,
             ProviderId::try_from(provider_id).expect("provider ID"),
             ProtocolType::OpenAi,
             TransportType::Http,
@@ -478,7 +563,7 @@ async fn settings_table_lists_and_updates_live_password() {
         request(
             Method::POST,
             "/admin/api/session",
-            json!({"password": PASSWORD}),
+            json!({"name": ADMIN_NAME, "password": PASSWORD}),
             None,
             None,
         ),
@@ -491,7 +576,7 @@ async fn settings_table_lists_and_updates_live_password() {
         request(
             Method::POST,
             "/admin/api/session",
-            json!({"password": "new-admin-password"}),
+            json!({"name": ADMIN_NAME, "password": "new-admin-password"}),
             None,
             None,
         ),
@@ -499,4 +584,240 @@ async fn settings_table_lists_and_updates_live_password() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["csrf_token"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn accounts_and_credentials_are_role_scoped_and_never_return_a_secret() {
+    let (api, _database, _directory) = api(Duration::from_secs(60)).await;
+    let (cookie, csrf) = sign_in(&api).await;
+
+    // A regular account can sign in and issue credentials for itself, but it
+    // cannot reach accounts, providers, or settings.
+    let (user_id, user_password) = create_user(&api, &cookie, &csrf, "analyst").await;
+    let (user_cookie, user_csrf) = sign_in_as(&api, "analyst", &user_password).await;
+    for (method, path) in [
+        (Method::GET, "/admin/api/accounts"),
+        (Method::GET, "/admin/api/settings"),
+    ] {
+        let (status, _, _) = send(
+            &api,
+            request(method, path, Value::Null, Some(&user_cookie), None),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path} must stay administrator-only"
+        );
+    }
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/providers",
+            json!({
+                "name": "forbidden",
+                "protocol_type": "openai",
+                "endpoint": "https://api.example.com/base",
+                "upstream_api_key": "upstream-secret",
+                "status": "enabled"
+            }),
+            Some(&user_cookie),
+            Some(&user_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A provider has to exist before a credential can bind to it, and only an
+    // administrator can create one.
+    let (status, _, provider) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/providers",
+            json!({
+                "name": "primary-openai",
+                "protocol_type": "openai",
+                "endpoint": "https://api.example.com/base",
+                "upstream_api_key": "upstream-secret",
+                "status": "enabled"
+            }),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let provider_id = provider["id"].as_i64().expect("provider ID");
+
+    let (status, _, issued) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/api-keys",
+            json!({
+                "account_id": user_id,
+                "name": "ci",
+                "provider_ids": [provider_id],
+                "default_provider_id": provider_id,
+                "status": "enabled"
+            }),
+            Some(&user_cookie),
+            Some(&user_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let first_secret = issued["api_key_secret"]
+        .as_str()
+        .expect("a one-time plaintext")
+        .to_owned();
+    let key_id = issued["api_key"]["id"].as_i64().expect("credential ID");
+    assert_eq!(issued["api_key"]["account_id"], user_id);
+    assert!(!issued.to_string().contains("secret_hash"));
+
+    // A regular user may not issue a credential in another account's name.
+    let bootstrap_id = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/accounts?limit=100",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await
+    .2["items"]
+        .as_array()
+        .expect("accounts")
+        .iter()
+        .find(|item| item["is_bootstrap"] == json!(true))
+        .expect("the bootstrap account")["id"]
+        .as_i64()
+        .expect("account ID");
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/api-keys",
+            json!({
+                "account_id": bootstrap_id,
+                "name": "stolen",
+                "provider_ids": [provider_id],
+                "status": "enabled"
+            }),
+            Some(&user_cookie),
+            Some(&user_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // The listing is scoped to the caller, so an administrator sees the
+    // bootstrap credential-less account and the user's own credential.
+    let (status, _, listed) = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/api-keys?limit=100",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed["items"].as_array().expect("items").len(), 1);
+    let (status, _, own) = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/api-keys?limit=100",
+            Value::Null,
+            Some(&user_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let own_items = own["items"].as_array().expect("items");
+    assert_eq!(own_items.len(), 1);
+    assert_eq!(own_items[0]["id"], key_id);
+    assert!(
+        own_items[0].get("api_key_secret").is_none(),
+        "a listing must never repeat the plaintext"
+    );
+
+    // Rotation retires the previous plaintext and returns a fresh one.
+    let (status, _, rotated) = send(
+        &api,
+        request(
+            Method::POST,
+            &format!("/admin/api/api-keys/{key_id}:rotate"),
+            Value::Null,
+            Some(&user_cookie),
+            Some(&user_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let second_secret = rotated["api_key_secret"]
+        .as_str()
+        .expect("a rotated plaintext")
+        .to_owned();
+    assert_ne!(second_secret, first_secret);
+
+    // A credential that names a provider nobody created is refused rather
+    // than issued into a state it could never resolve.
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/api-keys",
+            json!({
+                "account_id": user_id,
+                "name": "dangling",
+                "provider_ids": [i64::MAX],
+                "status": "enabled"
+            }),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "provider_not_found");
+
+    // The bootstrap account is the operator's way back in, so it can be
+    // neither disabled nor demoted nor deleted.
+    for (method, path, change) in [
+        (
+            Method::PATCH,
+            format!("/admin/api/accounts/{bootstrap_id}"),
+            json!({"status": "disabled"}),
+        ),
+        (
+            Method::PATCH,
+            format!("/admin/api/accounts/{bootstrap_id}"),
+            json!({"role": "user"}),
+        ),
+        (
+            Method::DELETE,
+            format!("/admin/api/accounts/{bootstrap_id}"),
+            Value::Null,
+        ),
+    ] {
+        let (status, _, _) = send(
+            &api,
+            request(method, &path, change, Some(&cookie), Some(&csrf)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{path} must protect the bootstrap account"
+        );
+    }
 }
