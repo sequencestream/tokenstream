@@ -96,6 +96,7 @@ pub struct Config {
     admin_max_connections: usize,
     downstream_header_timeout: Duration,
     admin_body_timeout: Duration,
+    admin_session_ttl: Duration,
     development_mode: bool,
     admin_static_root: Option<PathBuf>,
 }
@@ -239,6 +240,12 @@ impl Config {
             1,
             300000,
         )? as u64);
+        let admin_session_ttl = parse_optional_duration(
+            &mut get,
+            "TOKENSTREAM_ADMIN_SESSION_TTL_MS",
+            15 * 60 * 1000,
+            MAX_IDLE_TIMEOUT_MS,
+        )?;
         let http_buffer_bytes = parse_bounded(
             &mut get,
             "TOKENSTREAM_HTTP_BUFFER_BYTES",
@@ -330,6 +337,7 @@ impl Config {
             admin_max_connections,
             downstream_header_timeout,
             admin_body_timeout,
+            admin_session_ttl,
             development_mode,
             admin_static_root,
         })
@@ -367,6 +375,10 @@ impl Config {
     }
     pub fn admin_body_timeout(&self) -> Duration {
         self.admin_body_timeout
+    }
+
+    pub fn admin_session_ttl(&self) -> Duration {
+        self.admin_session_ttl
     }
     pub fn data_listen_addr(&self) -> SocketAddr {
         self.data_listen_addr
@@ -897,6 +909,8 @@ mod tests {
             ("TOKENSTREAM_ADMIN_MAX_CONNECTIONS", "0"),
             ("TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS", "0"),
             ("TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS", "300001"),
+            ("TOKENSTREAM_ADMIN_SESSION_TTL_MS", "0"),
+            ("TOKENSTREAM_ADMIN_SESSION_TTL_MS", "3600001"),
         ] {
             let mut values = valid_values();
             values.insert(name, invalid.into());
@@ -920,6 +934,7 @@ mod tests {
         assert_eq!(config.admin_max_connections(), 128);
         assert_eq!(config.downstream_header_timeout().as_millis(), 10000);
         assert_eq!(config.admin_body_timeout().as_millis(), 30000);
+        assert_eq!(config.admin_session_ttl().as_millis(), 15 * 60 * 1000);
         assert_eq!(config.upstream_idle_per_host(), 8);
         assert_eq!(config.upstream_pool_idle_timeout().as_millis(), 30_000);
         assert!(
@@ -936,6 +951,7 @@ mod tests {
             ("TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS", "2000"),
             ("TOKENSTREAM_UPSTREAM_IDLE_PER_HOST", "0"),
             ("TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS", "1500"),
+            ("TOKENSTREAM_ADMIN_SESSION_TTL_MS", "2000"),
         ] {
             explicit.insert(name, value.into());
         }
@@ -947,6 +963,7 @@ mod tests {
         assert_eq!(config.admin_max_connections(), 64);
         assert_eq!(config.downstream_header_timeout().as_millis(), 1500);
         assert_eq!(config.admin_body_timeout().as_millis(), 2000);
+        assert_eq!(config.admin_session_ttl().as_millis(), 2000);
         assert_eq!(config.upstream_idle_per_host(), 0);
         assert_eq!(config.upstream_pool_idle_timeout().as_millis(), 1500);
     }

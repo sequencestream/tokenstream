@@ -30,6 +30,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 - Gateway secrets are hashed with a memory-hard password hashing function (Argon2id) and verified with data-independent, constant-time comparison. A secret is returned only at creation or rotation and is never persisted in plaintext.
 - `Authorization`, `Proxy-Authorization`, `x-api-key`, cookies, credential values, URL query strings, and application bodies are redacted from logs and error messages.
 - APIs never expose ciphertext or password hashes. Provider reads may return non-secret configuration fields and an indication of whether a secret is configured, but never plaintext secrets.
+- Control-plane JSON responses forbid shared caching so session material and one-time credentials cannot be retained by intermediaries or the browser HTTP cache.
 - Decrypted keys live only in short-lived secret wrappers: they are never logged, serialized, rendered by debug output, or returned by an API.
 
 ## 5. Route and Transport Policy
@@ -74,5 +75,6 @@ Transparency and safety are proven by tests, not assumed:
 - Security tests assert redaction, fail-closed behavior, and the absence of secrets from logs and API responses.
 - Load tests demonstrate stable memory under the documented concurrency profile for mixed short requests and long-lived streams and enforce every queue, buffer, hashing, idle-connection, and semaphore bound.
 - A version-controlled manifest of pinned client and SDK versions, run against a controllable mock upstream, is the release compatibility gate; external live services are never the CI correctness dependency.
+- Administration page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are accepted through real browser interaction; a successful page build is never the release substitute for that interaction.
 
 A change is complete only when all applicable layers pass. Milestone designs may add tests, but may not remove or weaken any of these layers.

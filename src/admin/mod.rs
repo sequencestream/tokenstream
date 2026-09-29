@@ -14,7 +14,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::{Body, Incoming};
-use hyper::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
+use hyper::header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, SET_COOKIE};
 use hyper::{Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
@@ -130,6 +130,7 @@ where
         self.body_timeout = config.admin_body_timeout();
         self.connection_settings = crate::ConnectionSettings::control(config);
         self.development_mode = config.development_mode();
+        self.session_ttl = config.admin_session_ttl();
         self
     }
 
@@ -224,14 +225,14 @@ where
                 .lock()
                 .expect("session lock is not poisoned")
                 .remove(&session_token);
-            return Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .header(
-                    SET_COOKIE,
-                    self.session_cookie(&format!("{SESSION_COOKIE}=; Max-Age=0")),
-                )
-                .body(Full::new(Bytes::new()))
-                .expect("logout response is valid");
+            let mut response = empty_response(StatusCode::NO_CONTENT);
+            response.headers_mut().insert(
+                SET_COOKIE,
+                self.session_cookie(&format!("{SESSION_COOKIE}=; Max-Age=0"))
+                    .parse()
+                    .expect("cleared session cookie is valid"),
+            );
+            return response;
         }
 
         if path == "/admin/api/providers" {
@@ -483,10 +484,7 @@ where
 
     async fn delete_provider(&self, id: ProviderId) -> Response<ApiBody> {
         match self.providers.delete(id).await {
-            Ok(()) => Response::builder()
-                .status(StatusCode::NO_CONTENT)
-                .body(Full::new(Bytes::new()))
-                .expect("delete response is valid"),
+            Ok(()) => empty_response(StatusCode::NO_CONTENT),
             Err(error) => self.provider_error(error),
         }
     }
@@ -873,8 +871,17 @@ fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response<ApiBod
     Response::builder()
         .status(status)
         .header(CONTENT_TYPE, "application/json")
+        .header(CACHE_CONTROL, "no-store")
         .body(Full::new(Bytes::from(body)))
         .expect("JSON response is valid")
+}
+
+fn empty_response(status: StatusCode) -> Response<ApiBody> {
+    Response::builder()
+        .status(status)
+        .header(CACHE_CONTROL, "no-store")
+        .body(Full::new(Bytes::new()))
+        .expect("empty administration response is valid")
 }
 
 fn api_error(status: StatusCode, code: &'static str, message: &'static str) -> Response<ApiBody> {

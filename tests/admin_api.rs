@@ -5,7 +5,7 @@ use argon2::password_hash::{PasswordHasher, SaltString};
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
 use http_body_util::{BodyExt, Full};
-use hyper::header::{COOKIE, SET_COOKIE};
+use hyper::header::{CACHE_CONTROL, COOKIE, SET_COOKIE};
 use hyper::{Method, Request, StatusCode};
 use serde_json::{Value, json};
 use tokenstream::admin::AdminApi;
@@ -107,6 +107,10 @@ async fn sign_in(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     let set_cookie = headers
         .get(SET_COOKIE)
         .expect("session cookie")
@@ -127,7 +131,7 @@ async fn sign_in(
 #[tokio::test]
 async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_access() {
     let (api, _, _directory) = api(Duration::from_millis(20)).await;
-    let (status, _, body) = send(
+    let (status, headers, body) = send(
         &api,
         request(
             Method::POST,
@@ -139,6 +143,10 @@ async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_acce
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert!(!body.to_string().contains("wrong-secret"));
 
     let (cookie, csrf) = sign_in(&api).await;
@@ -154,7 +162,7 @@ async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_acce
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _, body) = send(
+    let (status, headers, body) = send(
         &api,
         request(
             Method::GET,
@@ -166,6 +174,10 @@ async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_acce
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert_eq!(body["signed_in"], true);
 
     let (status, headers, _) = send(
@@ -180,6 +192,10 @@ async fn sessions_require_valid_password_csrf_and_reject_expired_or_revoked_acce
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert!(
         headers
             .get(SET_COOKIE)
@@ -228,7 +244,7 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
         "upstream_api_key": "upstream-secret",
         "status": "enabled"
     });
-    let (status, _, created) = send(
+    let (status, headers, created) = send(
         &api,
         request(
             Method::POST,
@@ -240,6 +256,10 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     let provider_id = created["provider"]["id"].as_i64().expect("provider ID");
     let first_gateway_key = created["gateway_api_key"]
         .as_str()
@@ -250,7 +270,7 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     assert!(!rendered.contains("ciphertext"));
     assert!(!rendered.contains("password_hash"));
 
-    let (status, _, listed) = send(
+    let (status, headers, listed) = send(
         &api,
         request(
             Method::GET,
@@ -262,6 +282,10 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert_eq!(listed["items"].as_array().expect("items").len(), 1);
     assert!(listed["items"][0].get("gateway_api_key").is_none());
     assert_eq!(listed["next_after_id"], provider_id);
@@ -316,7 +340,7 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(updated["status"], "disabled");
-    let (status, _, rotated) = send(
+    let (status, headers, rotated) = send(
         &api,
         request(
             Method::POST,
@@ -328,6 +352,10 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert_ne!(
         rotated["gateway_api_key"].as_str().expect("rotated key"),
         first_gateway_key
@@ -351,17 +379,21 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     let filter = format!(
         "/admin/api/request-logs?provider_id={provider_id}&transport_type=http&start_time_gte=2026-09-28T07%3A00%3A00Z&start_time_lt=2026-09-28T09%3A00%3A00Z"
     );
-    let (status, _, logs) = send(
+    let (status, headers, logs) = send(
         &api,
         request(Method::GET, &filter, Value::Null, Some(&cookie), None),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert_eq!(logs["items"].as_array().expect("log items").len(), 1);
     assert_eq!(logs["items"][0]["incomplete"], true);
     assert_eq!(logs["items"][0]["path"], "/v1/responses");
 
-    let (status, _, conflict) = send(
+    let (status, headers, conflict) = send(
         &api,
         request(
             Method::DELETE,
@@ -373,5 +405,9 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
     assert_eq!(conflict["error"]["code"], "provider_in_use");
 }

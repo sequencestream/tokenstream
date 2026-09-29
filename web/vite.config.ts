@@ -9,7 +9,10 @@ import vue from '@vitejs/plugin-vue'
 // relative, same-origin requests.
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), 'TOKENSTREAM_')
-  const controlPlane = env.TOKENSTREAM_ADMIN_PROXY_TARGET || 'http://127.0.0.1:3001'
+  const controlPlane =
+    process.env.TOKENSTREAM_ADMIN_PROXY_TARGET ||
+    env.TOKENSTREAM_ADMIN_PROXY_TARGET ||
+    'http://127.0.0.1:3001'
   const proxied = ['/admin/api', '/healthz', '/metrics']
 
   return {

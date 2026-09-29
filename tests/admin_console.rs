@@ -135,9 +135,14 @@ async fn the_page_is_served_before_a_session_and_only_its_own_assets_are_readabl
         headers.get(CONTENT_TYPE).expect("content type"),
         "text/javascript; charset=utf-8"
     );
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "public, max-age=31536000, immutable"
+    );
 
     // Files outside the page, traversal attempts and the administration API keep
-    // their own behaviour instead of becoming page content.
+    // their own behaviour instead of becoming page content. Unauthenticated API
+    // JSON still forbids storage; it must not inherit the page's CSP.
     for path in [
         "/secrets.txt",
         "/../secrets.txt",
@@ -148,8 +153,13 @@ async fn the_page_is_served_before_a_session_and_only_its_own_assets_are_readabl
         let (status, headers, _) = send(&api, Method::GET, path).await;
         assert_ne!(status, StatusCode::OK, "{path} must not serve page content");
         assert!(
-            !headers.contains_key(CACHE_CONTROL),
-            "{path} must not receive a page cache policy"
+            !headers.contains_key(CONTENT_SECURITY_POLICY),
+            "{path} must not receive the page content security policy"
+        );
+        assert_eq!(
+            headers.get(CACHE_CONTROL).expect("cache policy"),
+            "no-store",
+            "{path} must forbid storage of administration JSON"
         );
     }
     let (status, _, _) = send(&api, Method::GET, "/admin/api/providers").await;
