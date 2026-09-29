@@ -487,7 +487,7 @@ impl RequestLogRepository for SqliteDatabase {
 }
 
 fn map_write_error(error: sqlx::Error) -> RepositoryError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+    if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else if error.as_database_error().is_some_and(|database_error| {
         database_error.is_unique_violation()
@@ -502,11 +502,22 @@ fn map_write_error(error: sqlx::Error) -> RepositoryError {
 }
 
 fn map_storage_error(error: sqlx::Error) -> RepositoryError {
-    if matches!(error, sqlx::Error::PoolTimedOut) {
+    if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else {
         RepositoryError::Storage
     }
+}
+
+fn is_timeout_error(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::PoolTimedOut)
+        || error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref()
+            .and_then(|code| code.parse::<i32>().ok())
+            // SQLITE_BUSY (5) and SQLITE_LOCKED (6), including extended codes.
+            .is_some_and(|code| matches!(code & 0xff, 5 | 6))
 }
 
 fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
