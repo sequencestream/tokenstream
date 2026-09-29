@@ -16,6 +16,7 @@ http-body-util = "0.1.4"
 hyper = { version = "1.11.0", features = ["client", "http1", "server"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 hyper-util = { version = "0.1.20", features = ["client-legacy", "http1", "tokio"] }
+include_dir = "0.7.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sqlx = { version = "0.8.6", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "sqlite"] }

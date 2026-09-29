@@ -1,6 +1,6 @@
 //! The administration page is reachable on the control-plane origin, its assets
-//! are confined to that origin's own directory, and session cookies keep their
-//! production attributes while a development deployment runs on plaintext.
+//! are confined to the compiled page, and session cookies keep their production
+//! attributes while a development deployment runs on plaintext.
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHasher, SaltString};
@@ -10,6 +10,7 @@ use hyper::header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, SET_CO
 use hyper::{Method, Request, StatusCode};
 use serde_json::json;
 use tokenstream::admin::AdminApi;
+use tokenstream::admin::assets::AdminAssets;
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::telemetry::Metrics;
@@ -19,25 +20,15 @@ const MASTER_KEY: [u8; 32] = [0x53; 32];
 
 type Api = AdminApi<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>;
 
-fn built_page() -> tempfile::TempDir {
-    let directory = tempfile::tempdir().expect("temporary directory");
-    std::fs::write(
-        directory.path().join("index.html"),
-        b"<div id=\"app\"></div>",
-    )
-    .expect("entry document");
-    std::fs::create_dir_all(directory.path().join("assets")).expect("assets directory");
-    std::fs::write(
-        directory.path().join("assets/index-abc123.js"),
-        b"console.log('page')",
-    )
-    .expect("page script");
-    std::fs::write(directory.path().join("secrets.txt"), b"not page content")
-        .expect("non-page file");
-    directory
+fn built_page() -> AdminAssets {
+    AdminAssets::from_files([
+        ("index.html", b"<div id=\"app\"></div>" as &[u8]),
+        ("assets/index-abc123.js", b"console.log('page')"),
+        ("secrets.txt", b"not page content"),
+    ])
 }
 
-async fn api(development: bool, page: Option<&std::path::Path>) -> Api {
+async fn api(development: bool, page: Option<AdminAssets>) -> Api {
     let directory = tempfile::tempdir().expect("temporary directory");
     let database = SqliteDatabase::connect(
         &format!("sqlite://{}", directory.path().join("console.db").display()),
@@ -106,9 +97,8 @@ async fn sign_in(api: &Api) -> String {
 
 #[tokio::test]
 async fn the_page_is_served_before_a_session_and_only_its_own_assets_are_readable() {
-    let page = built_page();
-    let api = api(false, Some(page.path())).await;
-    api.verify_assets().expect("configured page is usable");
+    let api = api(false, Some(built_page())).await;
+    api.verify_assets().expect("compiled page is usable");
 
     for path in ["/", "/index.html"] {
         let (status, headers, body) = send(&api, Method::GET, path).await;
@@ -167,20 +157,14 @@ async fn the_page_is_served_before_a_session_and_only_its_own_assets_are_readabl
 }
 
 #[tokio::test]
-async fn a_page_root_without_a_built_document_fails_before_listening() {
-    let empty = tempfile::tempdir().expect("temporary directory");
-    let without_page = api(false, Some(empty.path())).await;
+async fn a_page_without_a_built_document_fails_before_listening() {
+    let without_page = api(false, Some(AdminAssets::from_files::<&str, Vec<u8>>([]))).await;
     assert!(without_page.verify_assets().is_err());
-
-    let missing = empty.path().join("absent");
-    let absent = api(false, Some(&missing)).await;
-    assert!(absent.verify_assets().is_err());
 }
 
 #[tokio::test]
 async fn session_cookies_keep_production_attributes_and_development_drops_only_secure() {
-    let page = built_page();
-    let production = api(false, Some(page.path())).await;
+    let production = api(false, Some(built_page())).await;
     let cookie = sign_in(&production).await;
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("Secure"), "{cookie}");
@@ -188,7 +172,7 @@ async fn session_cookies_keep_production_attributes_and_development_drops_only_s
 
     // A plaintext development origin cannot keep a cookie marked secure, but
     // every other restriction of the cookie is retained.
-    let development = api(true, Some(page.path())).await;
+    let development = api(true, Some(built_page())).await;
     let cookie = sign_in(&development).await;
     assert!(cookie.contains("HttpOnly"), "{cookie}");
     assert!(cookie.contains("SameSite=Strict"), "{cookie}");
@@ -197,11 +181,25 @@ async fn session_cookies_keep_production_attributes_and_development_drops_only_s
 }
 
 #[tokio::test]
-async fn the_api_is_unaffected_when_no_page_is_configured() {
+async fn the_compiled_page_is_served_from_the_process() {
     let api = api(false, None).await;
-    api.verify_assets().expect("no configured page is valid");
-    let (status, _, _) = send(&api, Method::GET, "/").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    api.verify_assets()
+        .expect("the compiled page is present in the process");
+    let (status, headers, body) = send(&api, Method::GET, "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        headers
+            .get(CONTENT_TYPE)
+            .expect("content type")
+            .to_str()
+            .expect("ASCII content type")
+            .starts_with("text/html")
+    );
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    assert!(!body.is_empty());
     let (status, _, _) = send(&api, Method::GET, "/admin/api/providers").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

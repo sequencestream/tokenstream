@@ -451,6 +451,11 @@ async fn settings_table_lists_and_updates_live_password() {
             .iter()
             .any(|item| item["name"] == "TOKENSTREAM_MASTER_KEY" && item["value"].is_null())
     );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["name"] != "TOKENSTREAM_ADMIN_STATIC_ROOT")
+    );
 
     let (status, _, _) = send(
         &api,

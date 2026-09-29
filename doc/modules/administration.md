@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Serve the control plane: a single administrator session, provider and request-log APIs, and the optional administration page.
+Serve the control plane: a single administrator session, provider and request-log APIs, and the administration page compiled into the process.
 
 ## Design
 
-The page and the API share one origin ([ADR 0009](../adr/0009-same-origin-administration.md), [ADR 0002](../adr/0002-dual-planes-in-one-process.md)). When a compiled page directory is configured, the control-plane listener serves the entry document and its own assets. There is no second origin and no cross-site cookie exception.
+The page and the API share one origin ([ADR 0009](../adr/0009-same-origin-administration.md), [ADR 0002](../adr/0002-dual-planes-in-one-process.md)). The control-plane listener serves the compiled entry document and its own assets from the process. There is no second origin and no cross-site cookie exception.
 
 The control plane authenticates one administrator from a password hash supplied at deployment or created from the documented default. Sessions are short-lived HTTP-only same-site cookies, also marked secure on a secure origin. State-changing endpoints require CSRF protection. Every administration API path stays behind the session. The page itself is served before a session exists, because it must load in order to offer sign-in.
 
@@ -61,7 +61,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - A half-edited filter form never combines one condition set with another set's cursor.
 - Provider deletion that is blocked by log association returns `409` with `provider_in_use` and directs the administrator to disable.
 - Control-plane hashing and database work use the reserved control-plane budgets so a burst of sign-ins or rotations cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
-- Hashed page assets may cache long-lived. The entry document does not, so a redeploy is picked up on the next navigation.
+- Hashed page assets may cache long-lived. The entry document does not, so a replaced binary is picked up on the next navigation.
 
 ## Failures and bounds
 

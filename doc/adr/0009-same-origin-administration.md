@@ -11,7 +11,7 @@ A role system and general request rate limiting were also possible. They would e
 
 ## Decision
 
-The administration page and the administration API share one origin. When a compiled page directory is configured, the control-plane listener serves the entry document and its own compiled assets. There is a single administrator account, no role system, and no application-level request rate limiter.
+The administration page and the administration API share one origin. The control-plane listener serves the compiled entry document and its own compiled assets from the process. There is a single administrator account, no role system, and no application-level request rate limiter.
 
 A successful sign-in sets a short-lived, HTTP-only, same-site session cookie, also marked secure on a secure origin. State-changing endpoints require CSRF protection. Every administration API path stays behind session authentication. Control-plane JSON responses, including errors and empty success bodies, forbid shared caching. A page build is not a release substitute for real browser sign-in, session restoration, credential handling, expiry, and sign-out.
 
@@ -21,5 +21,5 @@ The public surfaces are in the [architecture document](../architecture.md). Sess
 
 - Requests to the page are answered before a session exists, because the page must load in order to offer sign-in.
 - A plaintext development origin drops only the secure cookie attribute and keeps HTTP-only and same-site restrictions. It may also allow non-HTTPS provider endpoints.
-- Hashed page assets may use their own long-lived cache policy. The entry document is not stored, so a redeploy is picked up on the next navigation.
+- Hashed page assets may use their own long-lived cache policy. The entry document is not stored, so a replaced binary is picked up on the next navigation.
 - Control-plane hashing uses the reserved control-plane budget so sign-ins cannot consume data-plane verification capacity ([ADR 0006](./0006-fail-closed-resource-bounds.md)).

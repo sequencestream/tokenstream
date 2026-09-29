@@ -28,6 +28,13 @@ stage() {
 
 cd "$repository_root"
 
+stage "administration frontend"
+npm --prefix web ci
+npm --prefix web run check
+npm --prefix web run test
+npm --prefix web run build
+export TOKENSTREAM_SKIP_FRONTEND_BUILD=1
+
 stage "format and static analysis"
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
@@ -101,12 +108,6 @@ cargo test --locked --test release_load_profile \
 
 stage "sustained mixed load against the real gateway process"
 cargo test --locked --test gateway_load -- --nocapture
-
-stage "administration frontend"
-npm --prefix web ci
-npm --prefix web run check
-npm --prefix web run test
-npm --prefix web run build
 
 stage "pinned client compatibility"
 npm --prefix compatibility ci --ignore-scripts

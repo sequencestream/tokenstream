@@ -231,12 +231,6 @@ pub fn setting_catalog() -> &'static [SettingSpec] {
             secret: false,
         },
         SettingSpec {
-            name: "TOKENSTREAM_ADMIN_STATIC_ROOT",
-            label: "Administration page directory",
-            restart_required: true,
-            secret: false,
-        },
-        SettingSpec {
             name: "TOKENSTREAM_DATA_DIR",
             label: "Process data directory",
             restart_required: true,
@@ -407,29 +401,6 @@ pub fn password_matches(password: &str, encoded_hash: &str) -> bool {
     Argon2::default()
         .verify_password(password.as_bytes(), &hash)
         .is_ok()
-}
-
-/// Finds a compiled administration page next to the executable or in a local build.
-pub fn discover_admin_static_root() -> Option<PathBuf> {
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        let beside = directory.join("admin");
-        if beside.join("index.html").is_file() {
-            return Some(beside);
-        }
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        let dist = cwd.join("web").join("dist");
-        if dist.join("index.html").is_file() {
-            return Some(dist);
-        }
-        let admin = cwd.join("admin");
-        if admin.join("index.html").is_file() {
-            return Some(admin);
-        }
-    }
-    None
 }
 
 fn read_optional_secret(path: PathBuf, name: &'static str) -> Result<Option<String>, ConfigError> {

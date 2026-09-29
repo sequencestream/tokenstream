@@ -30,6 +30,6 @@ Requires Rust 1.97 or newer and Node.js 22 or newer.
 ./scripts/build.sh
 ```
 
-That compiles the release binary and the administration page. Local development, environment settings, production launch, tests, and publishing a GitHub Release are in the [development guide](doc/develop.md).
+That compiles the release binary, including the administration page. Local development, environment settings, production launch, tests, and publishing a GitHub Release are in the [development guide](doc/develop.md).
 
 Prebuilt binaries for Linux, macOS, and Windows are attached to GitHub Releases.

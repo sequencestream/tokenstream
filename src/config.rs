@@ -98,7 +98,6 @@ pub struct Config {
     admin_body_timeout: Duration,
     admin_session_ttl: Duration,
     development_mode: bool,
-    admin_static_root: Option<PathBuf>,
     data_dir: Option<PathBuf>,
 }
 
@@ -106,7 +105,6 @@ struct SourceOptions<'a> {
     data_dir: Option<&'a Path>,
     file_master: Option<&'a str>,
     file_hash: Option<&'a str>,
-    discover_page: bool,
 }
 
 impl Config {
@@ -131,7 +129,6 @@ impl Config {
                 data_dir: Some(&data_dir),
                 file_master: file_master.as_deref(),
                 file_hash: file_hash.as_deref(),
-                discover_page: true,
             },
             &mut persist_master,
             &mut persist_hash,
@@ -168,7 +165,6 @@ impl Config {
                 data_dir: None,
                 file_master: None,
                 file_hash: None,
-                discover_page: false,
             },
             &mut persist_master,
             &mut persist_hash,
@@ -431,11 +427,6 @@ impl Config {
             data_listen_addr.ip().is_loopback() && admin_listen_addr.ip().is_loopback();
         let development_mode =
             parse_optional_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE", loopback_listeners)?;
-        let mut admin_static_root =
-            parse_optional_text(&mut get, "TOKENSTREAM_ADMIN_STATIC_ROOT")?.map(PathBuf::from);
-        if admin_static_root.is_none() && options.discover_page {
-            admin_static_root = crate::local_state::discover_admin_static_root();
-        }
 
         Ok(Self {
             data_listen_addr,
@@ -472,7 +463,6 @@ impl Config {
             admin_body_timeout,
             admin_session_ttl,
             development_mode,
-            admin_static_root,
             data_dir: options.data_dir.map(Path::to_path_buf),
         })
     }
@@ -604,16 +594,6 @@ impl Config {
     /// sets it to `true`.
     pub fn development_mode(&self) -> bool {
         self.development_mode
-    }
-
-    /// Directory holding the compiled administration page, when it is served.
-    ///
-    /// The value is read from configuration and never inferred from the
-    /// working directory, so a deployment states where the compiled page
-    /// lives instead of the process discovering it. The path is validated as
-    /// an existing directory during startup, before either listener binds.
-    pub fn admin_static_root(&self) -> Option<&Path> {
-        self.admin_static_root.as_deref()
     }
 
     pub fn data_dir(&self) -> Option<&Path> {
@@ -767,12 +747,6 @@ impl Config {
                 },
             ),
         ]);
-        if let Some(root) = &self.admin_static_root {
-            values.insert(
-                "TOKENSTREAM_ADMIN_STATIC_ROOT".to_owned(),
-                root.display().to_string(),
-            );
-        }
         if let Some(data_dir) = &self.data_dir {
             values.insert(
                 "TOKENSTREAM_DATA_DIR".to_owned(),
@@ -931,26 +905,6 @@ fn parse_optional(
     match value {
         None => Ok(default),
         Some(value) => parse_bounded(&mut |_| Ok(Some(value.clone())), name, minimum, maximum),
-    }
-}
-
-/// Reads an optional non-empty text setting. An absent value disables the
-/// feature; an empty value is a configuration mistake rather than "unset".
-fn parse_optional_text(
-    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
-    name: &'static str,
-) -> Result<Option<String>, ConfigError> {
-    match get(name) {
-        Ok(None) => Ok(None),
-        Ok(Some(value)) if value.is_empty() => Err(ConfigError::Invalid {
-            name,
-            requirement: "must be a non-empty path when present",
-        }),
-        Ok(Some(value)) => Ok(Some(value)),
-        Err(()) => Err(ConfigError::Invalid {
-            name,
-            requirement: "must contain valid Unicode",
-        }),
     }
 }
 

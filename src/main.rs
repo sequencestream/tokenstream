@@ -29,9 +29,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             tokenstream::local_state::DEFAULT_ADMIN_PASSWORD
         );
     }
-    if let Some(root) = config.admin_static_root() {
-        eprintln!("Administration page served from {}", root.display());
-    }
     let database = tokenstream::persistence::Database::connect_with_bounds(
         config.database_url().expose(),
         tokenstream::persistence::DatabaseBounds {
@@ -59,7 +56,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let admin_password_work =
         tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
     let cipher = SharedCipher::new(config.master_key().expose());
-    let mut admin_api = AdminApi::new(
+    let admin_api = AdminApi::new(
         database.clone(),
         cipher.clone(),
         Argon2GatewaySecretVerifier::new(),
@@ -68,11 +65,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_runtime(&config, admin_password_work)
     .with_metrics(metrics.clone());
-    if let Some(root) = config.admin_static_root() {
-        admin_api = admin_api.with_assets(root);
-    }
-    // A configured page directory is confirmed before either listener binds, so
-    // a deployment never comes up claiming to serve a page it cannot serve.
+    // The compiled page is confirmed before either listener binds, so a
+    // deployment never comes up claiming to serve a page it cannot serve.
     admin_api.verify_assets()?;
     let gateway = Gateway::with_shared_cipher(
         &config,

@@ -6,13 +6,13 @@ Design constraints and public contracts are in the [architecture document](./arc
 
 ## Build
 
-Compile a release binary and the administration page:
+Compile a release binary that includes the administration page:
 
 ```sh
 ./scripts/build.sh
 ```
 
-The release binary is `target/release/tokenstream` and the compiled page is `web/dist`.
+The release binary is `target/release/tokenstream`. The administration page is compiled into that binary.
 
 ## Local development
 
@@ -28,7 +28,7 @@ cargo run --locked
 cd web && npm ci && npm run dev
 ```
 
-The data-plane and control-plane health endpoints are `http://127.0.0.1:3300/healthz` and `http://127.0.0.1:3301/healthz`. The administration development server prints the local address of the page. In development that server serves the page and proxies the administration API, health, and metrics paths to the control plane, so the page issues same-origin requests and needs no separate origin configuration; set `TOKENSTREAM_ADMIN_PROXY_TARGET` when the control plane is not on `http://127.0.0.1:3301`. Environment values override files and defaults. `TOKENSTREAM_DEVELOPMENT_MODE=false` is required when the control plane is not a plaintext loopback origin. Startup migrations finish before either listener binds, and a configured page directory is confirmed to hold a built entry document before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout.
+The data-plane and control-plane health endpoints are `http://127.0.0.1:3300/healthz` and `http://127.0.0.1:3301/healthz`. The administration development server prints the local address of the page. In development that server serves the page and proxies the administration API, health, and metrics paths to the control plane, so the page issues same-origin requests and needs no separate origin configuration; set `TOKENSTREAM_ADMIN_PROXY_TARGET` when the control plane is not on `http://127.0.0.1:3301`. Environment values override files and defaults. `TOKENSTREAM_DEVELOPMENT_MODE=false` is required when the control plane is not a plaintext loopback origin. Startup migrations finish before either listener binds, and the compiled administration page is confirmed to be present before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout.
 
 ## Settings
 
@@ -42,9 +42,9 @@ After a release build:
 ./target/release/tokenstream
 ```
 
-When `TOKENSTREAM_ADMIN_STATIC_ROOT` is unset, the process serves a compiled page from `admin/` next to the executable, or from `web/dist` in the working directory, if either contains an entry document. The control-plane listener serves that entry document and its `assets/` files and nothing else, with a strict content security policy, `nosniff`, `no-referrer`, and no-store on the entry document so a redeploy is picked up on the next navigation. Administration JSON responses, including errors and empty success bodies, also send `Cache-Control: no-store`; hashed page assets keep their own long-lived cache policy. When no page directory is found, only the administration API is served. In production, terminate TLS in front of the control plane and keep the page and the API on that one origin: the session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` in production. A development deployment over plaintext has no secure origin to hold the cookie on and drops only the `Secure` attribute; every other restriction stays. Sessions last 15 minutes unless `TOKENSTREAM_ADMIN_SESSION_TTL_MS` is set.
+The control-plane listener serves the administration page that was compiled into the binary: the entry document and its `assets/` files and nothing else, with a strict content security policy, `nosniff`, `no-referrer`, and no-store on the entry document so a replaced binary is picked up on the next navigation. Administration JSON responses, including errors and empty success bodies, also send `Cache-Control: no-store`; hashed page assets keep their own long-lived cache policy. In production, terminate TLS in front of the control plane and keep the page and the API on that one origin: the session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` in production. A development deployment over plaintext has no secure origin to hold the cookie on and drops only the `Secure` attribute; every other restriction stays. Sessions last 15 minutes unless `TOKENSTREAM_ADMIN_SESSION_TTL_MS` is set.
 
-GitHub Release archives place the compiled page next to the binary in an `admin/` directory, which the process serves automatically.
+GitHub Release archives contain the gateway binary alone; the compiled administration page is already inside it.
 
 ## Verification
 
@@ -73,4 +73,4 @@ A GitHub Release is created from the Release workflow. Run it manually, enter a 
 - macOS amd64 and arm64
 - Windows amd64
 
-Each archive contains the gateway binary and the compiled administration page under `admin/`. The workflow tags `v<version>` from the selected branch and attaches the archives plus SHA-256 checksums. A version that is already tagged is rejected.
+Each archive contains the gateway binary, with the administration page compiled into it. The workflow tags `v<version>` from the selected branch and attaches the archives plus SHA-256 checksums. A version that is already tagged is rejected.

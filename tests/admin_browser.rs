@@ -24,7 +24,6 @@ fn real_browser_accepts_hosted_and_proxied_administration_pages() {
     run(Command::new("npx")
         .current_dir("web")
         .args(["playwright", "install", "chromium"]));
-    run(Command::new("npm").args(["--prefix", "web", "run", "build"]));
     run(Command::new("node")
         .arg("web/e2e/run.mjs")
         .env("GATEWAY_BINARY", env!("CARGO_BIN_EXE_tokenstream"))

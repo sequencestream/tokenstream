@@ -24,9 +24,6 @@ def main() -> None:
     binary = Path("target") / target / "release" / binary_name
     if not binary.is_file():
         raise SystemExit(f"missing release binary at {binary}")
-    page = Path("web/dist")
-    if not (page / "index.html").is_file():
-        raise SystemExit("missing compiled administration page at web/dist/index.html")
 
     staging_root = Path("staging")
     bundle = staging_root / f"tokenstream-{version}-{asset}"
@@ -34,7 +31,6 @@ def main() -> None:
         shutil.rmtree(staging_root)
     bundle.mkdir(parents=True)
     shutil.copy2(binary, bundle / binary_name)
-    shutil.copytree(page, bundle / "admin")
 
     dist = Path("dist")
     dist.mkdir(exist_ok=True)

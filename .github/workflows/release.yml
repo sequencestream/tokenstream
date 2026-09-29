@@ -131,6 +131,8 @@ jobs:
           path: web/dist
 
       - name: Build gateway
+        env:
+          TOKENSTREAM_SKIP_FRONTEND_BUILD: "1"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package
@@ -185,7 +187,7 @@ jobs:
           set -eu
           notes="Tokenstream ${VERSION} binaries for Linux, macOS, and Windows.
 
-          Each archive contains the gateway binary and the compiled administration page under \`admin/\`. Point \`TOKENSTREAM_ADMIN_STATIC_ROOT\` at that directory.
+          Each archive contains a single gateway binary. The administration page is compiled into that binary.
 
           See the development guide for settings and launch."
           extra=()

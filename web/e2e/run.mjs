@@ -64,7 +64,7 @@ async function waitFor(predicate, description, timeoutMs = 20_000) {
   throw new Error(`${description}${lastError ? `: ${lastError}` : ''}`)
 }
 
-async function startGateway({ name, staticRoot, directory, sessionTtlMs }) {
+async function startGateway({ name, directory, sessionTtlMs }) {
   const dataPort = await freePort()
   const adminPort = await freePort()
   const env = {
@@ -91,7 +91,6 @@ async function startGateway({ name, staticRoot, directory, sessionTtlMs }) {
     TOKENSTREAM_LOG_BATCH_SIZE: '16',
     TOKENSTREAM_LOG_BATCH_INTERVAL_MS: '10',
   }
-  if (staticRoot) env.TOKENSTREAM_ADMIN_STATIC_ROOT = staticRoot
   const processHandle = spawnLogged(gatewayBinary, [], { env, cwd: repositoryRoot })
   const deadline = Date.now() + 20_000
   while (Date.now() < deadline) {
@@ -335,14 +334,12 @@ let browser
 try {
   main = await startGateway({
     name: 'admin-browser-main',
-    staticRoot: `${webRoot}/dist`,
     directory,
     sessionTtlMs: mainSessionTtlMs,
   })
   mainVite = await startVite(main.adminPort)
   expiry = await startGateway({
     name: 'admin-browser-expiry',
-    staticRoot: `${webRoot}/dist`,
     directory,
     sessionTtlMs: expirySessionTtlMs,
   })

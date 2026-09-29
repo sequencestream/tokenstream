@@ -55,7 +55,7 @@ pub struct AdminApi<R, C, V> {
     connection_settings: crate::ConnectionSettings,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
     session_ttl: Arc<Mutex<Duration>>,
-    assets: Option<AdminAssets>,
+    assets: AdminAssets,
     development_mode: Arc<Mutex<bool>>,
     metrics: Metrics,
     process: Option<Arc<Mutex<ProcessSettings>>>,
@@ -120,7 +120,7 @@ where
             connection_settings: crate::ConnectionSettings::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             session_ttl: Arc::new(Mutex::new(session_ttl)),
-            assets: None,
+            assets: AdminAssets::embedded(),
             development_mode: Arc::new(Mutex::new(false)),
             metrics: Metrics::default(),
             process: None,
@@ -171,17 +171,15 @@ where
             .lock()
             .expect("body timeout lock is not poisoned")
     }
-    pub fn with_assets(mut self, root: &std::path::Path) -> Self {
-        self.assets = Some(AdminAssets::new(root));
+
+    pub fn with_assets(mut self, assets: AdminAssets) -> Self {
+        self.assets = assets;
         self
     }
 
-    /// Confirms a configured administration page directory is usable.
+    /// Confirms the compiled administration page is present.
     pub fn verify_assets(&self) -> std::io::Result<()> {
-        match &self.assets {
-            Some(assets) => assets.verify(),
-            None => Ok(()),
-        }
+        self.assets.verify()
     }
 
     pub async fn handle<B>(&self, request: Request<B>, metrics: Metrics) -> Response<ApiBody>
@@ -301,14 +299,14 @@ where
         api_error(StatusCode::NOT_FOUND, "not_found", "Resource not found.")
     }
 
-    /// Serves a compiled page asset, when one is configured and the path names
-    /// one. The page and the API share this origin, so the page is reachable
-    /// before a session exists while every API path stays authenticated.
+    /// Serves a compiled page asset when the path names one. The page and the
+    /// API share this origin, so the page is reachable before a session exists
+    /// while every API path stays authenticated.
     fn serve_page(&self, path: &str) -> Option<Response<ApiBody>> {
         if path.starts_with("/admin/api/") || path == "/metrics" || path == "/healthz" {
             return None;
         }
-        let asset = self.assets.as_ref()?.resolve(path)?;
+        let asset = self.assets.resolve(path)?;
         let mut response = asset.into_response();
         response
             .headers_mut()

@@ -12,7 +12,7 @@ The data directory is `~/.tokenstream` unless overridden. SQLite defaults to a f
 
 Every accumulator this process owns is bounded and fail-closed ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)). Admission never queues. Data-plane and control-plane hashing budgets are independent under a process-wide ceiling. Authentication lookups may reserve pooled database connections. Idle HTTP sockets to an origin are capped and expire.
 
-Startup is all-or-nothing: invalid settings, a bad master key, a non-Argon2id administrator hash, failed migrations, or a configured page directory that does not contain an entry document mean neither listener binds. An absent page directory is probed next to the executable and in the compiled-page location used for local builds; when none of those exist, the administration API is served alone.
+Startup is all-or-nothing: invalid settings, a bad master key, a non-Argon2id administrator hash, failed migrations, or a missing compiled administration page mean neither listener binds.
 
 ## Core flows
 
@@ -25,7 +25,7 @@ sequenceDiagram
     participant L as LogWriter
 
     Op->>P: Start with environment, overlay, and defaults
-    alt Settings, secrets, migrations, or page directory invalid
+    alt Settings, secrets, migrations, or compiled page invalid
         P-->>Op: Exit before bind
     else Valid
         P->>P: Run migrations
@@ -50,7 +50,7 @@ sequenceDiagram
 
 On platforms that deliver them, SIGINT and SIGTERM are the same stop request. Orchestrators send SIGTERM; treating only interactive interrupt as stop skipped drain and flush.
 
-A configured page directory is served from the control-plane listener so the page and API share one origin ([ADR 0009](../adr/0009-same-origin-administration.md)). An absent directory serves the administration API alone.
+The compiled administration page is served from the control-plane listener so the page and API share one origin ([ADR 0009](../adr/0009-same-origin-administration.md)).
 
 ## Invariants
 
