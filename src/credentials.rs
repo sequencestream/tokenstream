@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use crate::crypto::{GatewaySecretVerifier, PasswordWork, PasswordWorkError};
 use crate::domain::{
     Account, AccountId, AccountRole, AccountStatus, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings,
-    GatewayCredential, MAX_ACCOUNT_NAME_LEN, ProviderId, SecretString,
+    CredentialAdmission, GatewayCredential, MAX_ACCOUNT_NAME_LEN, ProviderId, SecretString,
 };
 use crate::persistence::{
     AccountListRequest, AccountPage, AccountRepository, AccountUpdate, ApiKeyListRequest,
@@ -42,6 +42,8 @@ pub enum CredentialServiceError {
     InvalidProviders,
     /// The default provider is not a member of the allowed set.
     DefaultNotInProviderSet,
+    /// An admission bound is zero or beyond the accepted ceiling.
+    InvalidAdmissionBound,
     /// A named provider does not exist.
     ProviderNotFound,
     /// The expiration is not a valid instant.
@@ -76,6 +78,7 @@ impl fmt::Display for CredentialServiceError {
             Self::InvalidPassword => "password is invalid",
             Self::InvalidRoleOrStatus => "role or status is invalid",
             Self::InvalidProviders => "provider selection is invalid",
+            Self::InvalidAdmissionBound => "an admission bound must be greater than zero",
             Self::DefaultNotInProviderSet => {
                 "default provider must be one of the allowed providers"
             }
@@ -192,6 +195,7 @@ pub struct CreateApiKeyRequest {
     default_provider_id: Option<ProviderId>,
     expires_at: Option<DateTime<Utc>>,
     status: ApiKeyStatus,
+    admission: CredentialAdmission,
 }
 
 impl CreateApiKeyRequest {
@@ -210,7 +214,15 @@ impl CreateApiKeyRequest {
             default_provider_id,
             expires_at,
             status,
+            admission: CredentialAdmission::default(),
         }
+    }
+
+    /// Bounds this credential at admission, so one caller cannot consume
+    /// capacity that belongs to the callers around it.
+    pub fn with_admission(mut self, admission: CredentialAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 }
 
@@ -222,6 +234,7 @@ pub struct UpdateApiKeyRequest {
     expires_at: Option<Option<DateTime<Utc>>>,
     provider_ids: Option<Vec<ProviderId>>,
     default_provider_id: Option<Option<ProviderId>>,
+    admission: Option<CredentialAdmission>,
 }
 
 impl UpdateApiKeyRequest {
@@ -254,12 +267,21 @@ impl UpdateApiKeyRequest {
         self
     }
 
+    /// Replaces all three admission bounds. Naming the admission here is what
+    /// makes the edit non-empty, and it names every bound at once, so a single
+    /// edit can widen, narrow, or clear the credential's limits together.
+    pub fn with_admission(mut self, admission: CredentialAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.status.is_none()
             && self.expires_at.is_none()
             && self.provider_ids.is_none()
             && self.default_provider_id.is_none()
+            && self.admission.is_none()
     }
 
     fn into_update(self) -> ApiKeyUpdate {
@@ -278,6 +300,9 @@ impl UpdateApiKeyRequest {
         }
         if let Some(default_provider_id) = self.default_provider_id {
             update = update.with_default_provider_id(default_provider_id);
+        }
+        if let Some(admission) = self.admission {
+            update = update.with_admission(admission);
         }
         update
     }
@@ -564,7 +589,8 @@ where
                 expires_at,
                 provider_ids,
                 Utc::now(),
-            ),
+            )
+            .with_admission(request.admission),
         )
         .await
         .map_err(map_repository_error)?;

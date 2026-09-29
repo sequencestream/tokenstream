@@ -6,7 +6,9 @@ Validate and persist provider configuration, encrypt upstream keys, and supply t
 
 ## Design
 
-A provider is the unit of upstream identity: name, protocol type, endpoint, encrypted upstream key, and status. It issues no credentials and holds no credential material ([ADR 0013](../adr/0013-account-owned-data-plane-credentials.md)); a credential refers to a provider through its bindings, and the reference lives on the credential side. Persistence records that contain secrets stay internal; administration sees redacted representations ([ADR 0008](../adr/0008-secret-and-credential-model.md)).
+A provider is the unit of upstream identity: name, protocol type, endpoint, encrypted upstream key, and status. It issues no credentials and holds no credential material ([ADR 0013](../adr/0013-account-owned-data-plane-credentials.md)); a credential refers to a provider through its bindings, and the reference lives on the credential side.
+
+A provider also carries its own admission bounds: a maximum concurrent request count and an optional maximum request rate ([ADR 0015](../adr/0015-layered-transport-admission.md)). Both are optional and both are part of the provider's own configuration, not of any credential bound to it, so an operator can bound an upstream's share of the gateway without touching its callers. An absent bound is unbounded. A bound of zero is refused: it would forbid all traffic to that provider rather than bound it. Persistence records that contain secrets stay internal; administration sees redacted representations ([ADR 0008](../adr/0008-secret-and-credential-model.md)).
 
 There is no application-level credential cache ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md)). Each new request resolves its provider through the credential it presented. Control-plane writes are transactional and never mutate a snapshot already held by an active stream.
 
@@ -48,6 +50,8 @@ sequenceDiagram
 
 A provider edit never touches a credential. Rotating a gateway credential is a credential operation owned by the account that holds it, and is described in the [administration design](./administration.md).
 
+Admission bounds are edited like any other provider field. A change is visible to the next request that resolves this provider and cannot reach a stream that was already admitted, because the bound travels in the request snapshot. Lowering a bound below the traffic already in flight does not cancel anything: the excess simply fails to extend.
+
 Disable sets status to disabled and commits. A disabled provider is still selectable configuration — a credential bound to it keeps resolving to it, so the failure is `provider_disabled` at authentication time rather than a missing selection. Edit of endpoint or upstream key validates and persists atomically. Existing streams retain the prior snapshot in both cases.
 
 ## Invariants
@@ -64,4 +68,6 @@ Disable sets status to disabled and commits. A disabled provider is still select
 - Invalid protocol types, statuses, or endpoints fail before persistence.
 - Uniqueness violations fail the write.
 - Encryption runs on the control plane and never inside the data-plane request path.
+- A concurrency bound of zero, a rate bound of zero, or a value that is not a positive integer fails before persistence, and storage refuses it too.
 - The number of providers bound to one credential is bounded, so resolving a provider is not an unbounded scan.
+- Admission counters exist only for a provider that carries a bound, so an unbounded provider holds no per-provider counter state.

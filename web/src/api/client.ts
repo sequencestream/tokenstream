@@ -46,7 +46,17 @@ export interface ApiKey {
   expires_at: string | null
   default_provider_id: number | null
   provider_ids: number[]
+  /** Admission bounds. Null means unbounded. */
+  max_concurrent_requests: number | null
+  max_requests_per_second: number | null
+  max_websockets: number | null
   created_at: string
+}
+
+export interface ApiKeyAdmissionWrite {
+  max_concurrent_requests: number | null
+  max_requests_per_second: number | null
+  max_websockets: number | null
 }
 
 export interface ApiKeyWrite {
@@ -55,6 +65,9 @@ export interface ApiKeyWrite {
   provider_ids: number[]
   default_provider_id?: number | null
   status: ApiKeyStatus
+  max_concurrent_requests?: number | null
+  max_requests_per_second?: number | null
+  max_websockets?: number | null
 }
 
 export interface Provider {
@@ -64,7 +77,15 @@ export interface Provider {
   endpoint: string
   status: ProviderStatus
   has_upstream_api_key: boolean
+  /** Admission bounds. Null means unbounded. */
+  max_concurrent_requests: number | null
+  max_requests_per_second: number | null
   created_at: string
+}
+
+export interface ProviderAdmissionWrite {
+  max_concurrent_requests: number | null
+  max_requests_per_second: number | null
 }
 
 export interface RequestLog {
@@ -103,9 +124,15 @@ export interface ProviderWrite {
   endpoint: string
   upstream_api_key: string
   status: ProviderStatus
+  /** Admission bounds. Absent or null means unbounded. */
+  max_concurrent_requests?: number | null
+  max_requests_per_second?: number | null
 }
 
-export type ProviderUpdate = Partial<Omit<ProviderWrite, 'protocol_type'>>
+export type ProviderUpdate = Partial<Omit<ProviderWrite, 'protocol_type'>> & {
+  /** Bounds are set together or not at all, so one edit can change them all. */
+  admission?: ProviderAdmissionWrite
+}
 
 /** A one-time plaintext, present only at creation and at rotation. */
 export interface ApiKeyIssueResponse {
@@ -262,7 +289,12 @@ export class AdminApi {
   /** Changes a credential's name, status, providers, or default provider. */
   updateApiKey(
     id: number,
-    body: Partial<Pick<ApiKeyWrite, 'name' | 'status' | 'provider_ids' | 'default_provider_id'>>,
+    body: Partial<
+      Pick<ApiKeyWrite, 'name' | 'status' | 'provider_ids' | 'default_provider_id'> & {
+        /** Bounds are set together or not at all. */
+        admission?: ApiKeyAdmissionWrite
+      }
+    >,
   ): Promise<ApiKey> {
     return this.#request<ApiKey>(`${API_KEYS_PATH}/${id}`, {
       method: 'PATCH',

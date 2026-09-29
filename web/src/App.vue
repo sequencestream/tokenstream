@@ -4,6 +4,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { AdminApi, type ProviderStatus, type ProtocolType } from './api/client.ts'
 import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
 import { emptyApiKeyPage, loadApiKeys, type ApiKeyPage } from './keys/list.ts'
+import { boundDraft, boundSummary, emptyBoundDrafts, readBounds, type BoundDrafts } from './limits/bounds.ts'
 import { emptyLogFilters, logFiltersChanged, type LogFilterValues } from './logs/filters.ts'
 import { loadLogs, type LogPage } from './logs/list.ts'
 import { emptyProviderPage, loadProviders, type ProviderPage } from './providers/list.ts'
@@ -40,6 +41,7 @@ function emptyCreateForm() {
     endpoint: 'https://',
     upstream_api_key: '',
     status: 'enabled' as ProviderStatus,
+    bounds: { ...emptyBoundDrafts(), max_websockets: '' },
   }
 }
 
@@ -49,7 +51,15 @@ const editForm = reactive({
   endpoint: '',
   upstream_api_key: '',
   status: 'enabled' as ProviderStatus,
+  bounds: { ...emptyBoundDrafts(), max_websockets: '' },
 })
+
+const PROVIDER_BOUND_FIELDS = ['max_concurrent_requests', 'max_requests_per_second'] as const
+const CREDENTIAL_BOUND_FIELDS = [
+  'max_concurrent_requests',
+  'max_requests_per_second',
+  'max_websockets',
+] as const
 
 const accountForm = reactive({ name: '', role: 'user' as 'admin' | 'user' })
 const creatingAccount = ref(false)
@@ -58,6 +68,7 @@ const keyForm = reactive({
   name: '',
   provider_ids: [] as number[],
   default_provider_id: null as number | null,
+  bounds: emptyBoundDrafts(),
 })
 
 const logPage = ref<LogPage>({ items: [], cursor: null, exhausted: true })
@@ -197,8 +208,14 @@ function cancelCreate() {
 }
 
 async function createProvider() {
+  const bounds = readBounds(createForm.bounds, PROVIDER_BOUND_FIELDS)
+  if ('error' in bounds) {
+    errorMessage.value = bounds.error
+    return
+  }
   await runAction(async () => {
-    await api.createProvider({ ...createForm })
+    const { bounds: _drafts, ...fields } = createForm
+    await api.createProvider({ ...fields, ...bounds.values })
     Object.assign(createForm, emptyCreateForm())
     creatingProvider.value = false
     notice.value = 'Provider created. Issue a credential to call it.'
@@ -213,16 +230,27 @@ function beginEdit(providerId: number, source: typeof providers.value[number]) {
     endpoint: source.endpoint,
     upstream_api_key: '',
     status: source.status,
+    bounds: {
+      max_concurrent_requests: boundDraft(source.max_concurrent_requests),
+      max_requests_per_second: boundDraft(source.max_requests_per_second),
+      max_websockets: '',
+    },
   })
   clearFeedback()
 }
 
 async function saveProvider(id: number) {
+  const bounds = readBounds(editForm.bounds, PROVIDER_BOUND_FIELDS)
+  if ('error' in bounds) {
+    errorMessage.value = bounds.error
+    return
+  }
   await runAction(async () => {
     await api.updateProvider(id, {
       name: editForm.name,
       endpoint: editForm.endpoint,
       status: editForm.status,
+      admission: bounds.values,
       ...(editForm.upstream_api_key ? { upstream_api_key: editForm.upstream_api_key } : {}),
     })
     editingProviderId.value = null
@@ -304,9 +332,15 @@ function resetKeyForm() {
   keyForm.provider_ids = []
   keyForm.default_provider_id = null
   keyForm.account_id = ownAccountId.value || keyForm.account_id
+  Object.assign(keyForm.bounds, emptyBoundDrafts())
 }
 
 async function issueKey() {
+  const bounds = readBounds(keyForm.bounds, CREDENTIAL_BOUND_FIELDS)
+  if ('error' in bounds) {
+    errorMessage.value = bounds.error
+    return
+  }
   await runAction(async () => {
     const issued = await api.createApiKey({
       account_id: keyForm.account_id,
@@ -314,6 +348,7 @@ async function issueKey() {
       provider_ids: keyForm.provider_ids,
       default_provider_id: keyForm.default_provider_id,
       status: 'enabled',
+      ...bounds.values,
     })
     showSecret(issued.api_key_secret, `Credential for ${issued.api_key.name}`)
     resetKeyForm()
@@ -616,6 +651,19 @@ onMounted(restoreSession)
                 <option v-for="id in keyForm.provider_ids" :key="id" :value="id">{{ providerName(id) }}</option>
               </select>
             </label>
+            <fieldset class="wide bounds">
+              <legend>Admission bounds for this credential</legend>
+              <label>Max concurrent
+                <input v-model="keyForm.bounds.max_concurrent_requests" inputmode="numeric" placeholder="unbounded" aria-label="Max concurrent requests" />
+              </label>
+              <label>Requests per second
+                <input v-model="keyForm.bounds.max_requests_per_second" inputmode="numeric" placeholder="unbounded" aria-label="Max requests per second" />
+              </label>
+              <label>Max WebSockets
+                <input v-model="keyForm.bounds.max_websockets" inputmode="numeric" placeholder="unbounded" aria-label="Max WebSocket connections" />
+              </label>
+              <p class="section-note">Leave a field empty for no bound. A bound of 0 is refused.</p>
+            </fieldset>
             <div class="actions wide">
               <button class="button primary" :disabled="busy" :title="keyForm.provider_ids.length === 0 ? 'Bind at least one provider' : undefined">Create credential</button>
             </div>
@@ -632,6 +680,7 @@ onMounted(restoreSession)
                   <th v-if="isAdmin">Account</th>
                   <th>Status</th>
                   <th class="fill">Providers</th>
+                  <th>Bounds</th>
                   <th>Key ID</th>
                   <th>Expires</th>
                   <th>Created</th>
@@ -649,6 +698,7 @@ onMounted(restoreSession)
                       {{ providerName(id) }}<span v-if="id === key.default_provider_id"> (default)</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
                     </span>
                   </td>
+                  <td>{{ boundSummary([['conc', key.max_concurrent_requests], ['rate', key.max_requests_per_second], ['WS', key.max_websockets]]) }}</td>
                   <td><code>{{ key.key_id }}</code></td>
                   <td>{{ formatDate(key.expires_at) }}</td>
                   <td>{{ formatDate(key.created_at) }}</td>
@@ -679,6 +729,16 @@ onMounted(restoreSession)
             <label>Status<select v-model="createForm.status"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
             <label class="wide">Endpoint<input v-model="createForm.endpoint" type="url" required placeholder="https://api.example.com" /></label>
             <label class="wide">Upstream API key<input v-model="createForm.upstream_api_key" type="password" autocomplete="new-password" required /></label>
+            <fieldset class="wide bounds">
+              <legend>Admission bounds</legend>
+              <label>Max concurrent
+                <input v-model="createForm.bounds.max_concurrent_requests" inputmode="numeric" placeholder="unbounded" aria-label="Max concurrent requests" />
+              </label>
+              <label>Requests per second
+                <input v-model="createForm.bounds.max_requests_per_second" inputmode="numeric" placeholder="unbounded" aria-label="Max requests per second" />
+              </label>
+              <p class="section-note">Leave a field empty for no bound. A bound of 0 is refused.</p>
+            </fieldset>
             <div class="actions wide">
               <button class="button primary" :disabled="busy">Create provider</button>
               <button class="button ghost" type="button" @click="cancelCreate">Cancel</button>
@@ -697,6 +757,7 @@ onMounted(restoreSession)
                   <th>Status</th>
                   <th class="fill">Endpoint</th>
                   <th>Upstream key</th>
+                  <th>Bounds</th>
                   <th>Created</th>
                   <th>Actions</th>
                 </tr>
@@ -723,6 +784,22 @@ onMounted(restoreSession)
                         aria-label="Replace upstream API key"
                       />
                     </td>
+                    <td>
+                      <div class="row-bounds">
+                        <input
+                          v-model="editForm.bounds.max_concurrent_requests"
+                          inputmode="numeric"
+                          placeholder="unbounded"
+                          aria-label="Max concurrent requests"
+                        />
+                        <input
+                          v-model="editForm.bounds.max_requests_per_second"
+                          inputmode="numeric"
+                          placeholder="unbounded"
+                          aria-label="Max requests per second"
+                        />
+                      </div>
+                    </td>
                     <td>{{ formatDate(provider.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
@@ -738,6 +815,7 @@ onMounted(restoreSession)
                     <td><span class="badge" :class="provider.status">{{ provider.status }}</span></td>
                     <td class="fill">{{ provider.endpoint }}</td>
                     <td>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</td>
+                    <td>{{ boundSummary([['conc', provider.max_concurrent_requests], ['rate', provider.max_requests_per_second]]) }}</td>
                     <td>{{ formatDate(provider.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
@@ -1182,6 +1260,9 @@ input:focus, select:focus {
   border-radius: var(--radius-md);
 }
 .bindings legend { padding: 0 var(--space-1); color: var(--color-muted); font-size: var(--font-size-meta); }
+.bounds { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2) var(--space-3); }
+.bounds .section-note { grid-column: 1 / -1; margin: 0; }
+.row-bounds { display: grid; gap: var(--space-1); }
 .binding { display: inline-flex; align-items: center; gap: var(--space-1); margin: 0; }
 .binding input { width: auto; min-width: 0; }
 .badge {
@@ -1244,6 +1325,7 @@ td small { display: block; margin-top: var(--space-1); color: var(--color-muted)
   .page-heading { margin-bottom: var(--space-2); }
   .provider-form, .filters { grid-template-columns: 1fr; }
   .provider-form .wide, .filter-actions { grid-column: auto; }
+  .bounds { grid-template-columns: 1fr; }
   .credential-card { grid-template-columns: 1fr; }
   .credential-card code, .credential-card .actions { grid-column: auto; }
 }

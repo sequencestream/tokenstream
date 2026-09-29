@@ -8,11 +8,11 @@ use sqlx::FromRow;
 use url::Url;
 
 use crate::domain::{
-    Account, AccountCursor, AccountId, AccountRole, AccountStatus, ApiKey, ApiKeyBinding,
-    ApiKeyCursor, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings, EmptyOpaqueValueError, GatewayKeyId,
-    PasswordHash, PositiveValueError, ProtocolType, Provider, ProviderCursor, ProviderId,
-    ProviderStatus, RequestId, RequestLog, RequestLogCursor, RequestLogId, SecretCiphertext,
-    TransportType,
+    Account, AccountCursor, AccountId, AccountRole, AccountStatus, AdmissionBound, ApiKey,
+    ApiKeyBinding, ApiKeyCursor, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings, CredentialAdmission,
+    EmptyOpaqueValueError, GatewayKeyId, MAX_ADMISSION_BOUND, PasswordHash, PositiveValueError,
+    ProtocolType, Provider, ProviderAdmission, ProviderCursor, ProviderId, ProviderStatus,
+    RequestId, RequestLog, RequestLogCursor, RequestLogId, SecretCiphertext, TransportType,
 };
 
 pub mod postgres;
@@ -156,10 +156,12 @@ pub struct NewProvider {
     endpoint: Url,
     upstream_api_key_ciphertext: SecretCiphertext,
     status: ProviderStatus,
+    admission: ProviderAdmission,
     created_at: DateTime<Utc>,
 }
 
 impl NewProvider {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: String,
         protocol_type: ProtocolType,
@@ -174,8 +176,19 @@ impl NewProvider {
             endpoint,
             upstream_api_key_ciphertext,
             status,
+            admission: ProviderAdmission::default(),
             created_at,
         }
+    }
+
+    /// Attaches this provider's admission bounds, refusing a zero bound.
+    pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.admission = admission;
+        self
+    }
+
+    pub fn admission(&self) -> ProviderAdmission {
+        self.admission
     }
 }
 
@@ -313,6 +326,7 @@ pub struct NewApiKey {
     default_provider_id: Option<ProviderId>,
     expires_at: Option<DateTime<Utc>>,
     provider_ids: Vec<ProviderId>,
+    admission: CredentialAdmission,
     created_at: DateTime<Utc>,
 }
 
@@ -338,8 +352,15 @@ impl NewApiKey {
             default_provider_id,
             expires_at,
             provider_ids,
+            admission: CredentialAdmission::default(),
             created_at,
         }
+    }
+
+    /// Attaches this credential's admission bounds, refusing a zero bound.
+    pub fn with_admission(mut self, admission: CredentialAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn account_id(&self) -> AccountId {
@@ -365,6 +386,10 @@ impl NewApiKey {
     pub fn provider_ids(&self) -> &[ProviderId] {
         &self.provider_ids
     }
+
+    pub fn admission(&self) -> CredentialAdmission {
+        self.admission
+    }
 }
 
 /// A field-scoped credential change set.
@@ -378,6 +403,7 @@ pub struct ApiKeyUpdate {
     expires_at: Option<Option<DateTime<Utc>>>,
     provider_ids: Option<Vec<ProviderId>>,
     default_provider_id: Option<Option<ProviderId>>,
+    admission: Option<CredentialAdmission>,
 }
 
 impl ApiKeyUpdate {
@@ -410,12 +436,20 @@ impl ApiKeyUpdate {
         self
     }
 
+    /// Names all three admission bounds. An absent bound here is unbounded, so
+    /// an edit can widen, narrow, or clear a credential's limits at once.
+    pub fn with_admission(mut self, admission: CredentialAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.status.is_none()
             && self.expires_at.is_none()
             && self.provider_ids.is_none()
             && self.default_provider_id.is_none()
+            && self.admission.is_none()
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -436,6 +470,10 @@ impl ApiKeyUpdate {
 
     pub fn default_provider_id(&self) -> Option<Option<ProviderId>> {
         self.default_provider_id
+    }
+
+    pub fn admission(&self) -> Option<CredentialAdmission> {
+        self.admission
     }
 }
 
@@ -490,6 +528,7 @@ pub struct ProviderUpdate {
     endpoint: Option<Url>,
     upstream_api_key_ciphertext: Option<SecretCiphertext>,
     status: Option<ProviderStatus>,
+    admission: Option<ProviderAdmission>,
 }
 
 impl ProviderUpdate {
@@ -517,11 +556,23 @@ impl ProviderUpdate {
         self
     }
 
+    /// Names both admission bounds. An absent bound here is unbounded, so an
+    /// edit can widen, narrow, or clear a provider's limits in one statement.
+    pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.admission = Some(admission);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.endpoint.is_none()
             && self.upstream_api_key_ciphertext.is_none()
             && self.status.is_none()
+            && self.admission.is_none()
+    }
+
+    pub fn admission(&self) -> Option<ProviderAdmission> {
+        self.admission
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -1287,6 +1338,8 @@ struct ProviderRow {
     endpoint: String,
     upstream_api_key_ciphertext: String,
     status: String,
+    max_concurrent_requests: Option<i64>,
+    max_requests_per_second: Option<i64>,
     created_at: i64,
 }
 
@@ -1306,6 +1359,11 @@ impl ProviderRow {
             _ => return Err(RepositoryError::InvalidStoredData),
         };
         let created_at = time::from_epoch_micros(self.created_at)?;
+        let admission = ProviderAdmission::new(
+            admission_bound(self.max_concurrent_requests)?,
+            admission_bound(self.max_requests_per_second)?,
+        )
+        .map_err(|_| RepositoryError::InvalidStoredData)?;
 
         Ok(Provider::new(
             id,
@@ -1315,7 +1373,26 @@ impl ProviderRow {
             SecretCiphertext::new(self.upstream_api_key_ciphertext),
             status,
             created_at,
-        ))
+        )
+        .with_admission(admission))
+    }
+}
+
+/// Reads one stored admission bound.
+///
+/// Storage refuses a zero bound on both engines, so a stored zero would mean the
+/// table was written outside this process; it is rejected as invalid stored data
+/// rather than silently read as unbounded.
+fn admission_bound(value: Option<i64>) -> Result<Option<u32>, RepositoryError> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            let bound = u32::try_from(value).map_err(|_| RepositoryError::InvalidStoredData)?;
+            if bound == 0 || bound > MAX_ADMISSION_BOUND {
+                return Err(RepositoryError::InvalidStoredData);
+            }
+            Ok(Some(bound))
+        }
     }
 }
 
@@ -1365,6 +1442,9 @@ pub(crate) struct ApiKeyRow {
     pub(crate) status: String,
     pub(crate) default_provider_id: Option<i64>,
     pub(crate) expires_at: Option<i64>,
+    pub(crate) max_concurrent_requests: Option<i64>,
+    pub(crate) max_requests_per_second: Option<i64>,
+    pub(crate) max_websockets: Option<i64>,
     pub(crate) created_at: i64,
 }
 
@@ -1375,6 +1455,13 @@ impl ApiKeyRow {
             "disabled" => ApiKeyStatus::Disabled,
             _ => return Err(RepositoryError::InvalidStoredData),
         };
+        let admission = CredentialAdmission::new(
+            admission_bound(self.max_concurrent_requests)?,
+            admission_bound(self.max_requests_per_second)?,
+            admission_bound(self.max_websockets)?,
+        )
+        .map_err(|_| RepositoryError::InvalidStoredData)?;
+
         Ok(ApiKey::new(
             ApiKeyId::try_from(self.id).map_err(invalid_positive_value)?,
             AccountId::try_from(self.account_id).map_err(invalid_positive_value)?,
@@ -1388,7 +1475,8 @@ impl ApiKeyRow {
                 .map_err(invalid_positive_value)?,
             self.expires_at.map(time::from_epoch_micros).transpose()?,
             time::from_epoch_micros(self.created_at)?,
-        ))
+        )
+        .with_admission(admission))
     }
 }
 
@@ -1518,4 +1606,13 @@ fn status_value(status: ProviderStatus) -> &'static str {
         ProviderStatus::Enabled => "enabled",
         ProviderStatus::Disabled => "disabled",
     }
+}
+
+/// Renders one optional admission bound for storage.
+///
+/// An unbounded dimension is stored as `NULL` rather than as a sentinel large
+/// number, so "no limit" and "a very large limit" are never the same row and a
+/// later read cannot mistake one for the other.
+pub(crate) fn admission_count(bound: AdmissionBound) -> Option<i64> {
+    bound.get().map(i64::from)
 }

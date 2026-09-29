@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::net::SocketAddr;
@@ -132,6 +133,16 @@ struct SourceOptions<'a> {
 }
 
 impl Config {
+    /// Builds a configuration from an explicit settings map.
+    ///
+    /// Every setting has a compiled default, so a caller supplies only what it
+    /// wants to override. This is how a caller that owns its own settings —
+    /// an operator tool or a test harness — assembles a validated configuration
+    /// without touching the process environment or the data directory.
+    pub fn from_settings(settings: &HashMap<String, String>) -> Result<Self, ConfigError> {
+        Self::from_source(|name| Ok(settings.get(name).cloned()))
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         let mut env_get = |name: &str| match env::var_os(name) {
             Some(value) => value.into_string().map(Some).map_err(|_| ()),

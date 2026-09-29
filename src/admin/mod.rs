@@ -28,8 +28,9 @@ use crate::crypto::{
 };
 use crate::domain::{
     AccountAdminView, AccountCursor, AccountId, AccountRole, AccountStatus, ApiKeyAdminView,
-    ApiKeyCursor, ApiKeyId, ApiKeyStatus, ProtocolType, ProviderAdminView, ProviderCursor,
-    ProviderId, ProviderStatus, RequestLog, RequestLogCursor, SecretString, TransportType,
+    ApiKeyCursor, ApiKeyId, ApiKeyStatus, CredentialAdmission, InvalidAdmissionBound, ProtocolType,
+    ProviderAdminView, ProviderAdmission, ProviderCursor, ProviderId, ProviderStatus, RequestLog,
+    RequestLogCursor, SecretString, TransportType,
 };
 use crate::persistence::{
     AccountListRequest, AccountRepository, ApiKeyListRequest, Database, ProviderListRequest,
@@ -758,16 +759,27 @@ where
             },
             None => None,
         };
+        let admission = match CredentialAdmission::new(
+            input.max_concurrent_requests,
+            input.max_requests_per_second,
+            input.max_websockets,
+        ) {
+            Ok(admission) => admission,
+            Err(_) => return invalid_input("Invalid credential configuration."),
+        };
         match self
             .credentials
-            .create_api_key(CreateApiKeyRequest::new(
-                account_id,
-                input.name,
-                provider_ids,
-                default_provider_id,
-                input.expires_at,
-                status,
-            ))
+            .create_api_key(
+                CreateApiKeyRequest::new(
+                    account_id,
+                    input.name,
+                    provider_ids,
+                    default_provider_id,
+                    input.expires_at,
+                    status,
+                )
+                .with_admission(admission),
+            )
             .await
         {
             Ok(issued) => {
@@ -852,6 +864,15 @@ where
                 None => None,
             };
             change = change.with_default_provider_id(default);
+        }
+        if let Some(admission) = input.admission {
+            // An edit that names only bounds is a real edit, and an edit that
+            // names a zero bound is refused before anything is written.
+            let admission = match admission.admission() {
+                Ok(admission) => admission,
+                Err(_) => return invalid_input("Invalid credential configuration."),
+            };
+            change = change.with_admission(admission);
         }
         match self.credentials.update_api_key(id, &current, change).await {
             Ok(api_key) => json_response(
@@ -945,13 +966,21 @@ where
         let Some(status) = parse_status(&input.status) else {
             return invalid_input("Invalid provider status.");
         };
+        let admission = match ProviderAdmission::new(
+            input.max_concurrent_requests,
+            input.max_requests_per_second,
+        ) {
+            Ok(admission) => admission,
+            Err(_) => return invalid_input("Invalid provider configuration."),
+        };
         let request = CreateProviderRequest::new(
             input.name,
             protocol_type,
             input.endpoint,
             SecretString::new(input.upstream_api_key),
             status,
-        );
+        )
+        .with_admission(admission);
         match self.providers.create(request).await {
             Ok(provider) => json_response(StatusCode::CREATED, &ProviderAdminView::from(&provider)),
             Err(error) => self.provider_error(error),
@@ -991,6 +1020,15 @@ where
                 return invalid_input("Invalid provider status.");
             };
             change = change.with_status(status);
+        }
+        if let Some(admission) = input.admission {
+            // An edit that names only bounds is a real edit, and an edit that
+            // names a zero bound is refused before anything is written.
+            let admission = match admission.admission() {
+                Ok(admission) => admission,
+                Err(_) => return invalid_input("Invalid provider configuration."),
+            };
+            change = change.with_admission(admission);
         }
         match self.providers.update(id, change).await {
             Ok(provider) => json_response(StatusCode::OK, &ProviderAdminView::from(&provider)),
@@ -1225,7 +1263,8 @@ where
             ProviderServiceError::InvalidName
             | ProviderServiceError::InvalidEndpoint
             | ProviderServiceError::InsecureEndpoint
-            | ProviderServiceError::InvalidUpstreamApiKey => {
+            | ProviderServiceError::InvalidUpstreamApiKey
+            | ProviderServiceError::InvalidAdmissionBound => {
                 invalid_input("Invalid provider configuration.")
             }
             ProviderServiceError::Conflict => api_error(
@@ -1268,6 +1307,7 @@ where
             | CredentialServiceError::InvalidProviders
             | CredentialServiceError::DefaultNotInProviderSet
             | CredentialServiceError::InvalidExpiry
+            | CredentialServiceError::InvalidAdmissionBound
             | CredentialServiceError::NoFieldsToUpdate => {
                 invalid_input("Invalid account or credential configuration.")
             }
@@ -1353,6 +1393,11 @@ struct CreateApiKeyBody {
     default_provider_id: Option<i64>,
     expires_at: Option<DateTime<Utc>>,
     status: String,
+    /// Admission bounds. Absent on create means unbounded; an explicit null is
+    /// the same as absent, because "no bound" is what null already means.
+    max_concurrent_requests: Option<u32>,
+    max_requests_per_second: Option<u32>,
+    max_websockets: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1364,6 +1409,10 @@ struct UpdateApiKeyBody {
     expires_at: Option<Option<DateTime<Utc>>>,
     provider_ids: Option<Vec<i64>>,
     default_provider_id: Option<Option<i64>>,
+    /// Admission bounds. All three are set together or not at all: an absent
+    /// object leaves every bound unchanged, and a present one names all three,
+    /// so a single edit can widen, narrow, or clear them together.
+    admission: Option<CredentialAdmissionFields>,
 }
 
 #[derive(Deserialize)]
@@ -1374,6 +1423,10 @@ struct CreateProviderBody {
     endpoint: String,
     upstream_api_key: String,
     status: String,
+    /// Admission bounds. Absent on create means unbounded; an explicit null is
+    /// the same as absent, because "no bound" is what null already means.
+    max_concurrent_requests: Option<u32>,
+    max_requests_per_second: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1383,6 +1436,53 @@ struct UpdateProviderBody {
     endpoint: Option<String>,
     upstream_api_key: Option<String>,
     status: Option<String>,
+    /// Admission bounds. Both are set together or not at all: an absent object
+    /// leaves every bound unchanged, and a present one names both, so a single
+    /// edit can widen, narrow, or clear them together.
+    admission: Option<ProviderAdmissionFields>,
+}
+
+/// The admission bounds a request may name on a provider.
+///
+/// A bound is a positive count or absent. Zero is refused rather than clamped,
+/// because a bound of zero forbids all traffic instead of bounding it, and is
+/// never what an operator meant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderAdmissionFields {
+    max_concurrent_requests: Option<u32>,
+    max_requests_per_second: Option<u32>,
+}
+
+impl ProviderAdmissionFields {
+    /// Builds both bounds, refusing a zero or a value beyond the ceiling.
+    fn admission(&self) -> Result<ProviderAdmission, InvalidAdmissionBound> {
+        ProviderAdmission::new(self.max_concurrent_requests, self.max_requests_per_second)
+    }
+}
+
+/// The admission bounds a request may name on a credential.
+///
+/// A bound is a positive count or absent. Zero is refused rather than clamped,
+/// because a bound of zero forbids all traffic instead of bounding it, and is
+/// never what an operator meant.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialAdmissionFields {
+    max_concurrent_requests: Option<u32>,
+    max_requests_per_second: Option<u32>,
+    max_websockets: Option<u32>,
+}
+
+impl CredentialAdmissionFields {
+    /// Builds all three bounds, refusing a zero or a value beyond the ceiling.
+    fn admission(&self) -> Result<CredentialAdmission, InvalidAdmissionBound> {
+        CredentialAdmission::new(
+            self.max_concurrent_requests,
+            self.max_requests_per_second,
+            self.max_websockets,
+        )
+    }
 }
 
 #[derive(Serialize)]

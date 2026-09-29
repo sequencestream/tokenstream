@@ -59,6 +59,13 @@ MAX_SHORT_REQUEST_P99_S = 8.0
 DECLARED_ADMISSION = 4096
 NEAR_LIMIT_HTTP = 2
 NEAR_LIMIT_WEBSOCKET = 2
+# Layered admission bounds. The gateway gate is left wide open here, so every
+# refusal observed below can only have come from the provider or credential
+# layer that is full.
+LAYERED_GATE = 256
+LAYERED_PROVIDER_CONCURRENCY = 2
+LAYERED_CREDENTIAL_WEBSOCKETS = 2
+LAYERED_CREDENTIAL_RATE = 4
 
 observed_upstream = set()
 active_upstream = 0
@@ -385,6 +392,32 @@ def create_provider(admin_port, auth, name, endpoint):
     status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', body, auth)
     assert status == 201, (status, response)
     return issue_credential(admin_port, auth, name, json.loads(response)['id'])
+
+
+def create_limited_provider(admin_port, auth, name, endpoint, concurrency, rate):
+    """A provider that carries its own admission bounds."""
+    body = json.dumps({
+        'name': name, 'protocol_type': 'openai', 'endpoint': endpoint,
+        'upstream_api_key': 'upstream-secret', 'status': 'enabled',
+        'max_concurrent_requests': concurrency, 'max_requests_per_second': rate,
+    }).encode()
+    status, _, response = exchange(admin_port, 'POST', '/admin/api/providers', body, auth)
+    assert status == 201, (status, response)
+    return json.loads(response)['id']
+
+
+def create_limited_credential(admin_port, auth, name, provider_id, concurrency, rate, websockets):
+    """A credential that carries its own admission bounds."""
+    body = json.dumps({
+        'account_id': 1, 'name': name, 'provider_ids': [provider_id],
+        'default_provider_id': provider_id, 'status': 'enabled',
+        'max_concurrent_requests': concurrency,
+        'max_requests_per_second': rate,
+        'max_websockets': websockets,
+    }).encode()
+    status, _, response = exchange(admin_port, 'POST', '/admin/api/api-keys', body, auth)
+    assert status == 201, (status, response)
+    return json.loads(response)['api_key_secret']
 
 
 def issue_credential(admin_port, auth, name, provider_id):
@@ -750,6 +783,122 @@ def run():
                 small_ws.clear()
                 wait_for(lambda: exchange(small_data, 'POST', '/v1/responses', PAYLOAD, small_headers)[0] == 200,
                          'released permits were not reusable over real connections')
+
+                print('exercising layered admission under a wide-open global gate')
+                layered, layered_data, layered_admin, _ = start_gateway(
+                    directory, 'layered.db', capacity=LAYERED_GATE, log_queue=4096)
+                layered_opened = []
+                layered_ws = []
+                try:
+                    layered_auth = authenticate(layered_admin)
+                    # The provider bounds concurrency only, so a refusal here can
+                    # only be the provider layer shedding.
+                    provider_id = create_limited_provider(
+                        layered_admin, layered_auth, 'layered-provider',
+                        upstream_endpoint, LAYERED_PROVIDER_CONCURRENCY, None)
+                    provider_credential = create_limited_credential(
+                        layered_admin, layered_auth, 'key-provider', provider_id,
+                        None, None, None)
+                    provider_headers = {'authorization': 'Bearer ' + provider_credential}
+                    for _ in range(LAYERED_PROVIDER_CONCURRENCY):
+                        assert open_http_stream(
+                            layered_data, provider_credential, 'hold', layered_opened) == SSE[:3]
+                    before = accepted_upstream
+                    status, _, body = exchange(
+                        layered_data, 'POST', '/v1/responses', PAYLOAD, provider_headers)
+                    assert status == 503 and b'connection_limit_reached' in body, (status, body)
+                    assert accepted_upstream == before, 'a refused request reached the upstream'
+                    for item in layered_opened:
+                        item[0].close()
+                        item[1].close()
+                    layered_opened.clear()
+                    wait_for(lambda: exchange(layered_data, 'POST', '/v1/responses', PAYLOAD,
+                                              provider_headers)[0] == 200,
+                             'the provider layer did not release its slots')
+
+                    # The credential bounds long-lived connections and its request
+                    # rate. The global gate and the provider layer are both far
+                    # from full, so these refusals can only be the credential's.
+                    ws_provider_id = create_limited_provider(
+                        layered_admin, layered_auth, 'layered-ws',
+                        upstream_endpoint, None, None)
+                    ws_credential = create_limited_credential(
+                        layered_admin, layered_auth, 'key-ws', ws_provider_id,
+                        None, LAYERED_CREDENTIAL_RATE, LAYERED_CREDENTIAL_WEBSOCKETS)
+                    ws_headers = {'authorization': 'Bearer ' + ws_credential}
+                    for _ in range(LAYERED_CREDENTIAL_WEBSOCKETS):
+                        layered_ws.append(websocket_pair(layered_data, ws_credential))
+                    before = accepted_upstream
+                    # The long-lived bound is only reached by another socket, so
+                    # the refusal is read from an upgrade attempt rather than from
+                    # a plain request.
+                    refused_sock = socket.create_connection(
+                        ('127.0.0.1', layered_data), timeout=15)
+                    refused_sock.sendall(
+                        (f'GET /v1/responses HTTP/1.1\r\nHost: localhost\r\n'
+                         f'Authorization: Bearer {ws_credential}\r\n'
+                         'Connection: Upgrade\r\nUpgrade: websocket\r\n'
+                         'Sec-WebSocket-Version: 13\r\n'
+                         'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n').encode())
+                    refused_stream = refused_sock.makefile('rb')
+                    refusal = refused_stream.read(4096)
+                    assert b'503' in refusal and b'connection_limit_reached' in refusal, refusal
+                    assert accepted_upstream == before, 'a refused connection reached the upstream'
+                    refused_sock.close()
+                    refused_stream.close()
+
+                    # A plain request does not consume the long-lived bound: the
+                    # sockets above are still holding every one of its slots.
+                    assert exchange(layered_data, 'POST', '/v1/responses', PAYLOAD,
+                                    ws_headers)[0] == 200
+                    for sock, stream in layered_ws:
+                        sock.close()
+                        stream.close()
+                    layered_ws.clear()
+                    wait_for(lambda: exchange(layered_data, 'POST', '/v1/responses', PAYLOAD,
+                                              ws_headers)[0] == 200,
+                             'the credential layers did not release their slots')
+
+                    # The rate bound is the only one still in play here, and it
+                    # is a per-second allowance, so the requests have to arrive
+                    # together rather than one after another.
+                    rate_provider_id = create_limited_provider(
+                        layered_admin, layered_auth, 'layered-rate',
+                        upstream_endpoint, None, None)
+                    rate_credential = create_limited_credential(
+                        layered_admin, layered_auth, 'key-rate', rate_provider_id,
+                        None, LAYERED_CREDENTIAL_RATE, None)
+                    rate_headers = {'authorization': 'Bearer ' + rate_credential}
+
+                    def burst_once():
+                        return exchange(layered_data, 'POST', '/v1/responses',
+                                        PAYLOAD, rate_headers)[0]
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=32) as burst_pool:
+                        statuses = list(burst_pool.map(
+                            lambda _: burst_once(), range(LAYERED_CREDENTIAL_RATE * 6)))
+                    refused = sum(1 for value in statuses if value == 503)
+                    assert refused > 0, \
+                        f'the credential rate bound never refused anything: {statuses}'
+                    print(f'  the provider, connection, and rate bounds each shed load')
+                    stop(layered)
+                finally:
+                    for item in layered_opened:
+                        try:
+                            item[0].close()
+                            item[1].close()
+                        except OSError:
+                            pass
+                    for sock, stream in layered_ws:
+                        try:
+                            sock.close()
+                            stream.close()
+                        except OSError:
+                            pass
+                    if layered.poll() is None:
+                        layered.kill()
+                        layered.wait(timeout=10)
+                print('passed layered admission under a wide-open global gate')
 
                 print('exercising a logging storage fault while the proxy keeps serving')
                 dropped_before = metric_value(metrics(small_admin, small_auth),

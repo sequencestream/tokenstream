@@ -18,8 +18,8 @@ use super::{
     DatabaseBounds, NewAccount, NewApiKey, NewProvider, ProviderListRequest, ProviderPage,
     ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted,
     RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted,
-    account_status_value, api_key_status_value, protocol_value, role_value, status_value, timed,
-    transport_value,
+    account_status_value, admission_count, api_key_status_value, protocol_value, role_value,
+    status_value, timed, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -200,7 +200,7 @@ impl ProviderRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    status, created_at
+                    status, max_concurrent_requests, max_requests_per_second, created_at
              FROM provider
              WHERE id = $1",
             )
@@ -221,7 +221,7 @@ impl ProviderRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    status, created_at
+                    status, max_concurrent_requests, max_requests_per_second, created_at
              FROM provider
              WHERE id > $1
              ORDER BY id ASC
@@ -243,20 +243,28 @@ impl ProviderRepository for PostgresDatabase {
     }
 
     async fn create(&self, provider: NewProvider) -> Result<Provider, RepositoryError> {
+        // Read the bounds before the record is partially moved into the binds.
+        let max_concurrent_requests =
+            admission_count(provider.admission().max_concurrent_requests());
+        let max_requests_per_second =
+            admission_count(provider.admission().max_requests_per_second());
         timed(
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "INSERT INTO provider (
-                 name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at
-             ) VALUES ($1, $2, $3, $4, $5, $6)
+                 name, protocol_type, endpoint, upstream_api_key_ciphertext, status,
+                 max_concurrent_requests, max_requests_per_second, created_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                       status, created_at",
+                       status, max_concurrent_requests, max_requests_per_second, created_at",
             )
             .bind(provider.name)
             .bind(protocol_value(provider.protocol_type))
             .bind(provider.endpoint.as_str())
             .bind(provider.upstream_api_key_ciphertext.expose())
             .bind(status_value(provider.status))
+            .bind(max_concurrent_requests)
+            .bind(max_requests_per_second)
             .bind(to_epoch_micros(provider.created_at))
             .fetch_one(&self.shared),
         )
@@ -304,11 +312,19 @@ impl ProviderRepository for PostgresDatabase {
                     .push("status = ")
                     .push_bind_unseparated(status_value(status));
             }
+            if let Some(admission) = update.admission() {
+                assignments
+                    .push("max_concurrent_requests = ")
+                    .push_bind_unseparated(admission_count(admission.max_concurrent_requests()));
+                assignments
+                    .push("max_requests_per_second = ")
+                    .push_bind_unseparated(admission_count(admission.max_requests_per_second()));
+            }
         }
         builder.push(" WHERE id = ").push_bind(id.get());
         builder.push(
             " RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                      status, created_at",
+                      status, max_concurrent_requests, max_requests_per_second, created_at",
         );
         timed(
             self.admin_timeout,
@@ -647,7 +663,8 @@ impl ApiKeyRepository for PostgresDatabase {
             self.auth_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
                 "SELECT id, account_id, name, key_id, secret_hash, status,
-                        default_provider_id, expires_at, created_at
+                        default_provider_id, expires_at,
+                        max_concurrent_requests, max_requests_per_second, max_websockets, created_at
                  FROM api_key
                  WHERE key_id = $1",
             )
@@ -673,7 +690,8 @@ impl ApiKeyRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
                 "SELECT id, account_id, name, key_id, secret_hash, status,
-                        default_provider_id, expires_at, created_at
+                        default_provider_id, expires_at,
+                        max_concurrent_requests, max_requests_per_second, max_websockets, created_at
                  FROM api_key
                  WHERE id = $1",
             )
@@ -697,7 +715,8 @@ impl ApiKeyRepository for PostgresDatabase {
             i64::try_from(request.limit() + 1).expect("bounded credential page size fits in i64");
         let mut builder = QueryBuilder::<Postgres>::new(
             "SELECT id, account_id, name, key_id, secret_hash, status,
-                    default_provider_id, expires_at, created_at
+                    default_provider_id, expires_at,
+                    max_concurrent_requests, max_requests_per_second, max_websockets, created_at
              FROM api_key
              WHERE id > $1",
         );
@@ -736,10 +755,13 @@ impl ApiKeyRepository for PostgresDatabase {
             sqlx::query_as::<_, ApiKeyRow>(
                 "INSERT INTO api_key (
                      account_id, name, key_id, secret_hash, status,
-                     default_provider_id, expires_at, created_at
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                     default_provider_id, expires_at,
+                     max_concurrent_requests, max_requests_per_second, max_websockets, created_at
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                  RETURNING id, account_id, name, key_id, secret_hash, status,
-                           default_provider_id, expires_at, created_at",
+                           default_provider_id, expires_at,
+                           max_concurrent_requests, max_requests_per_second, max_websockets,
+                           created_at",
             )
             .bind(api_key.account_id.get())
             .bind(api_key.name.as_str())
@@ -748,6 +770,13 @@ impl ApiKeyRepository for PostgresDatabase {
             .bind(api_key_status_value(api_key.status))
             .bind(api_key.default_provider_id.map(ProviderId::get))
             .bind(api_key.expires_at.map(to_epoch_micros))
+            .bind(admission_count(
+                api_key.admission().max_concurrent_requests(),
+            ))
+            .bind(admission_count(
+                api_key.admission().max_requests_per_second(),
+            ))
+            .bind(admission_count(api_key.admission().max_websockets()))
             .bind(to_epoch_micros(api_key.created_at))
             .fetch_one(&mut *transaction),
         )
@@ -811,10 +840,23 @@ impl ApiKeyRepository for PostgresDatabase {
             if update.default_provider_id() == Some(None) {
                 assignments.push("default_provider_id = NULL");
             }
+            if let Some(admission) = update.admission() {
+                assignments
+                    .push("max_concurrent_requests = ")
+                    .push_bind_unseparated(admission_count(admission.max_concurrent_requests()));
+                assignments
+                    .push("max_requests_per_second = ")
+                    .push_bind_unseparated(admission_count(admission.max_requests_per_second()));
+                assignments
+                    .push("max_websockets = ")
+                    .push_bind_unseparated(admission_count(admission.max_websockets()));
+            }
         }
         builder.push(" WHERE id = ").push_bind(id.get()).push(
             " RETURNING id, account_id, name, key_id, secret_hash, status,
-                          default_provider_id, expires_at, created_at",
+                          default_provider_id, expires_at,
+                          max_concurrent_requests, max_requests_per_second, max_websockets,
+                          created_at",
         );
         let updated = timed(
             self.admin_timeout,
@@ -844,7 +886,9 @@ impl ApiKeyRepository for PostgresDatabase {
                  SET key_id = $1, secret_hash = $2
                  WHERE id = $3
                  RETURNING id, account_id, name, key_id, secret_hash, status,
-                           default_provider_id, expires_at, created_at",
+                           default_provider_id, expires_at,
+                           max_concurrent_requests, max_requests_per_second, max_websockets,
+                           created_at",
             )
             .bind(key_id.as_str())
             .bind(hash.expose())
@@ -953,7 +997,8 @@ async fn adopt_legacy_keys(
         let created = sqlx::query(
             "INSERT INTO api_key (
                  account_id, name, key_id, secret_hash, status,
-                 default_provider_id, expires_at, created_at
+                 default_provider_id, expires_at,
+                 max_concurrent_requests, max_requests_per_second, max_websockets, created_at
              ) VALUES ($1, $2, $3, $4, 'enabled', $5, NULL, $6)
              RETURNING id",
         )

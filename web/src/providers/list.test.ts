@@ -12,6 +12,8 @@ function provider(id: number): Provider {
     endpoint: 'https://api.example.com',
     status: 'enabled',
     has_upstream_api_key: true,
+    max_concurrent_requests: null,
+    max_requests_per_second: null,
     created_at: '2026-09-01T00:00:00Z',
   }
 }

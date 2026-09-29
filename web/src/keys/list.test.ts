@@ -14,6 +14,9 @@ function key(id: number, accountId = 1): ApiKey {
     expires_at: null,
     default_provider_id: 3,
     provider_ids: [3, 4],
+    max_concurrent_requests: null,
+    max_requests_per_second: null,
+    max_websockets: null,
     created_at: '2026-09-01T00:00:00Z',
   }
 }

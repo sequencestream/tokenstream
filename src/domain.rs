@@ -164,6 +164,168 @@ pub enum TransportType {
     WebSocket,
 }
 
+/// An admission bound that cannot be used as a limit.
+///
+/// Zero is rejected rather than clamped or honoured: a limit of zero forbids all
+/// traffic through that provider or credential, which is indistinguishable from
+/// a configuration mistake and is never what an operator meant to express.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidAdmissionBound;
+
+impl fmt::Display for InvalidAdmissionBound {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an admission bound must be greater than zero")
+    }
+}
+
+impl Error for InvalidAdmissionBound {}
+
+/// The widest admission bound storage accepts.
+///
+/// A bound is a configuration value an operator types, not a capacity the
+/// process could ever hold, so the ceiling exists to reject an obviously wrong
+/// entry rather than to reserve for it.
+pub const MAX_ADMISSION_BOUND: u32 = 1_000_000_000;
+
+/// An optional admission bound for one provider or credential.
+///
+/// An absent bound is unbounded, and only the layers that are set apply. The
+/// bound travels in the request snapshot so a later edit cannot reach a request
+/// or connection that was already admitted under a different one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionBound(Option<u32>);
+
+impl AdmissionBound {
+    /// Builds a bound, refusing zero.
+    pub fn new(value: Option<u32>) -> Result<Self, InvalidAdmissionBound> {
+        match value {
+            Some(0) => Err(InvalidAdmissionBound),
+            value => Ok(Self(value)),
+        }
+    }
+
+    /// The bound as a positive count, or `None` when the dimension is unbounded.
+    pub fn get(self) -> Option<u32> {
+        self.0
+    }
+
+    /// Whether this dimension carries no bound at all.
+    pub fn is_unbounded(self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl Serialize for AdmissionBound {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            Some(value) => serializer.serialize_u32(value),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+/// Validates one operator-supplied admission bound.
+///
+/// The zero case is refused rather than honoured: a limit of zero would forbid
+/// every request through that provider or credential, which is an accident
+/// rather than a policy. The ceiling rejects an entry no deployment could
+/// actually reach, so a typo is caught at the edge instead of becoming a bound
+/// that silently never fires.
+pub fn validate_admission_bound(value: Option<i64>) -> Result<Option<u32>, InvalidAdmissionBound> {
+    match value {
+        None => Ok(None),
+        Some(value) => {
+            if value <= 0 || value > i64::from(MAX_ADMISSION_BOUND) {
+                return Err(InvalidAdmissionBound);
+            }
+            Ok(Some(value as u32))
+        }
+    }
+}
+
+/// The admission bounds a provider carries.
+///
+/// A provider is bounded so one upstream cannot consume capacity that belongs to
+/// another. Both dimensions are optional; a provider that carries neither is
+/// bounded only by the process-wide gate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ProviderAdmission {
+    max_concurrent_requests: AdmissionBound,
+    max_requests_per_second: AdmissionBound,
+}
+
+impl ProviderAdmission {
+    /// Builds both bounds, refusing a zero in either.
+    pub fn new(
+        max_concurrent_requests: Option<u32>,
+        max_requests_per_second: Option<u32>,
+    ) -> Result<Self, InvalidAdmissionBound> {
+        Ok(Self {
+            max_concurrent_requests: AdmissionBound::new(max_concurrent_requests)?,
+            max_requests_per_second: AdmissionBound::new(max_requests_per_second)?,
+        })
+    }
+
+    pub fn max_concurrent_requests(self) -> AdmissionBound {
+        self.max_concurrent_requests
+    }
+
+    pub fn max_requests_per_second(self) -> AdmissionBound {
+        self.max_requests_per_second
+    }
+
+    /// Whether this provider carries no bound, and so needs no counter state.
+    pub fn is_unbounded(self) -> bool {
+        self.max_concurrent_requests.is_unbounded() && self.max_requests_per_second.is_unbounded()
+    }
+}
+
+/// The admission bounds a credential carries.
+///
+/// The credential is the unit admission counts, because it is the unit that
+/// already identifies a caller. A regular user may set and clear these on its
+/// own credential.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct CredentialAdmission {
+    max_concurrent_requests: AdmissionBound,
+    max_requests_per_second: AdmissionBound,
+    max_websockets: AdmissionBound,
+}
+
+impl CredentialAdmission {
+    /// Builds all three bounds, refusing a zero in any of them.
+    pub fn new(
+        max_concurrent_requests: Option<u32>,
+        max_requests_per_second: Option<u32>,
+        max_websockets: Option<u32>,
+    ) -> Result<Self, InvalidAdmissionBound> {
+        Ok(Self {
+            max_concurrent_requests: AdmissionBound::new(max_concurrent_requests)?,
+            max_requests_per_second: AdmissionBound::new(max_requests_per_second)?,
+            max_websockets: AdmissionBound::new(max_websockets)?,
+        })
+    }
+
+    pub fn max_concurrent_requests(self) -> AdmissionBound {
+        self.max_concurrent_requests
+    }
+
+    pub fn max_requests_per_second(self) -> AdmissionBound {
+        self.max_requests_per_second
+    }
+
+    pub fn max_websockets(self) -> AdmissionBound {
+        self.max_websockets
+    }
+
+    /// Whether this credential carries no bound, and so needs no counter state.
+    pub fn is_unbounded(self) -> bool {
+        self.max_concurrent_requests.is_unbounded()
+            && self.max_requests_per_second.is_unbounded()
+            && self.max_websockets.is_unbounded()
+    }
+}
+
 /// The fixed set of control-plane roles.
 ///
 /// This is deliberately a closed set rather than a table of permissions: the
@@ -283,6 +445,7 @@ pub struct ApiKey {
     status: ApiKeyStatus,
     default_provider_id: Option<ProviderId>,
     expires_at: Option<DateTime<Utc>>,
+    admission: CredentialAdmission,
     created_at: DateTime<Utc>,
 }
 
@@ -308,8 +471,15 @@ impl ApiKey {
             status,
             default_provider_id,
             expires_at,
+            admission: CredentialAdmission::default(),
             created_at,
         }
+    }
+
+    /// Rebuilds a stored credential with the admission bounds storage returned.
+    pub fn with_admission(mut self, admission: CredentialAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn id(&self) -> ApiKeyId {
@@ -343,6 +513,11 @@ impl ApiKey {
 
     pub fn expires_at(&self) -> Option<DateTime<Utc>> {
         self.expires_at
+    }
+
+    /// The admission bounds this credential carries.
+    pub fn admission(&self) -> CredentialAdmission {
+        self.admission
     }
 
     pub fn created_at(&self) -> DateTime<Utc> {
@@ -403,6 +578,7 @@ pub struct Provider {
     endpoint: Url,
     upstream_api_key_ciphertext: SecretCiphertext,
     status: ProviderStatus,
+    admission: ProviderAdmission,
     created_at: DateTime<Utc>,
 }
 
@@ -424,8 +600,15 @@ impl Provider {
             endpoint,
             upstream_api_key_ciphertext,
             status,
+            admission: ProviderAdmission::default(),
             created_at,
         }
+    }
+
+    /// Rebuilds a stored provider with the admission bounds storage returned.
+    pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 
     pub fn id(&self) -> ProviderId {
@@ -452,6 +635,11 @@ impl Provider {
         self.status
     }
 
+    /// The admission bounds this provider carries.
+    pub fn admission(&self) -> ProviderAdmission {
+        self.admission
+    }
+
     pub fn created_at(&self) -> DateTime<Utc> {
         self.created_at
     }
@@ -471,6 +659,8 @@ pub struct ProviderSnapshot {
     protocol_type: ProtocolType,
     endpoint: Url,
     upstream_api_key: SecretString,
+    provider_admission: ProviderAdmission,
+    credential_admission: CredentialAdmission,
 }
 
 impl ProviderSnapshot {
@@ -489,7 +679,35 @@ impl ProviderSnapshot {
             protocol_type,
             endpoint,
             upstream_api_key,
+            provider_admission: ProviderAdmission::default(),
+            credential_admission: CredentialAdmission::default(),
         }
+    }
+
+    /// Attaches the admission bounds frozen from the credential and the
+    /// selected provider.
+    ///
+    /// Both are resolved once, when the snapshot is created, so a later edit to
+    /// either limit cannot reach a request or connection that is already
+    /// admitted.
+    pub fn with_admission(
+        mut self,
+        provider_admission: ProviderAdmission,
+        credential_admission: CredentialAdmission,
+    ) -> Self {
+        self.provider_admission = provider_admission;
+        self.credential_admission = credential_admission;
+        self
+    }
+
+    /// The admission bounds of the provider this request resolved to.
+    pub fn provider_admission(&self) -> ProviderAdmission {
+        self.provider_admission
+    }
+
+    /// The admission bounds of the credential this request presented.
+    pub fn credential_admission(&self) -> CredentialAdmission {
+        self.credential_admission
     }
 
     /// The account that owns the credential this request presented.
@@ -770,6 +988,9 @@ pub struct ProviderAdminView {
     pub endpoint: String,
     pub status: ProviderStatus,
     pub has_upstream_api_key: bool,
+    /// This provider's own admission bounds. Absent means unbounded.
+    pub max_concurrent_requests: Option<u32>,
+    pub max_requests_per_second: Option<u32>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -782,6 +1003,8 @@ impl From<&Provider> for ProviderAdminView {
             endpoint: provider.endpoint.to_string(),
             status: provider.status,
             has_upstream_api_key: true,
+            max_concurrent_requests: provider.admission().max_concurrent_requests().get(),
+            max_requests_per_second: provider.admission().max_requests_per_second().get(),
             created_at: provider.created_at,
         }
     }
@@ -829,11 +1052,16 @@ pub struct ApiKeyAdminView {
     pub expires_at: Option<DateTime<Utc>>,
     pub default_provider_id: Option<i64>,
     pub provider_ids: Vec<i64>,
+    /// This credential's own admission bounds. Absent means unbounded.
+    pub max_concurrent_requests: Option<u32>,
+    pub max_requests_per_second: Option<u32>,
+    pub max_websockets: Option<u32>,
     pub created_at: DateTime<Utc>,
 }
 
 impl ApiKeyAdminView {
     pub fn new(api_key: &ApiKey, bindings: &[ApiKeyBinding]) -> Self {
+        let admission = api_key.admission();
         Self {
             id: api_key.id.get(),
             account_id: api_key.account_id.get(),
@@ -843,6 +1071,9 @@ impl ApiKeyAdminView {
             expires_at: api_key.expires_at,
             default_provider_id: api_key.default_provider_id.map(ProviderId::get),
             provider_ids: bindings.iter().map(|b| b.provider_id.get()).collect(),
+            max_concurrent_requests: admission.max_concurrent_requests().get(),
+            max_requests_per_second: admission.max_requests_per_second().get(),
+            max_websockets: admission.max_websockets().get(),
             created_at: api_key.created_at,
         }
     }

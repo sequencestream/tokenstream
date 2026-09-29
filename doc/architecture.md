@@ -25,7 +25,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 
 - **Proxy**: Never read, inject, or validate application fields. HTTP request and response bodies are streamed with bounded buffers and backpressure, never fully buffered. WebSocket application messages are relayed without deserialization, under configured message and connection bounds. There is no retry, no reconnect, no protocol conversion, and no load balancing. Client cancellation cancels the associated upstream request.
 - **Logging**: Logging is best-effort, metadata-only, and must never block proxy traffic. A full log queue drops events and increments a dropped-event metric. Request and response payloads are never stored. Metrics carry no key IDs, URLs with query strings, or other high-cardinality secrets.
-- **Bounds**: A global semaphore bounds admitted proxy connections. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, log queue capacity, and idle HTTP connections retained per upstream origin are all bounded. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
+- **Bounds**: A global semaphore bounds admitted proxy connections. Admission is layered: a global gate, then optional per-provider and per-credential layers that count concurrent requests and request rate, plus a per-credential bound on long-lived WebSocket connections ([ADR 0015](./adr/0015-layered-transport-admission.md)). Every layer decides only from connection-level facts and never reads a payload; every acquisition is non-blocking, so an exhausted layer rejects immediately instead of queueing. No component may accumulate without a bound: WebSocket message sizes and outbound queues, HTTP body buffering, database pool size, log queue capacity, and idle HTTP connections retained per upstream origin are all bounded. Idle connections to an origin expire after an explicit deadline, so a changing endpoint cannot retain sockets indefinitely. Authentication hashing has independent data-plane and control-plane compute budgets inside a process-wide ceiling, and authentication lookups may reserve pooled database connections. Lookup exhaustion and database execution deadlines fail closed with a sanitized gateway error. Upstream connect, response-header, idle, shutdown, and database operation durations are explicit timeouts.
 
 ## 4. Security Invariants
 
@@ -119,16 +119,17 @@ Further boundaries:
 6. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
 7. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
 8. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
+9. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
 
 ### Excluded
 
 1. Application-layer protocol conversion, including conversion between WebSocket and SSE.
 2. Cluster deployment, weighted traffic routing, and priority routing.
-3. Circuit breaking, rate limiting, retries, request/response caching, load balancing, proactive upstream termination, and disconnect-loss mitigation. Provider credentials are looked up directly for each new request or connection; there is no application-level credential cache.
+3. Application-layer scheduling: circuit breaking and half-open probing, retries, request/response caching, weighted, priority, or latency-based upstream selection, load balancing, proactive upstream termination, and disconnect-loss mitigation. Provider credentials are looked up directly for each new request or connection; there is no application-level credential cache. Admission counting belongs to the transport layer, not here ([ADR 0015](./adr/0015-layered-transport-admission.md)).
 4. Token parsing, usage billing, cost estimation, and reconciliation.
 5. A general role and permission system. Roles are a fixed set, and adding one is an architectural change.
 6. User-defined model names, choosing an upstream by a request body field, and multi-provider failover or retries.
-7. Per-user rate limiting, quotas, and per-user connection bounds. These belong to a later admission layer and are not an authentication concern.
+7. Aggregate allowances wider than one credential, monthly token quotas, and any accounting-based allowance. A credential carries the per-caller admission bounds; an account-wide aggregate belongs to the billing stage, which has no measurement to divide ([ADR 0015](./adr/0015-layered-transport-admission.md)).
 
 ## 9. Data Model
 
@@ -142,13 +143,25 @@ Exactly one account is the bootstrap administrator. It is created from the confi
 
 An API credential belongs to exactly one account and is what a data-plane caller presents. It contains its identity, owning account, display name, gateway-key lookup identifier, gateway-secret hash, enabled status, optional expiration, an optional default provider binding, an ordered set of allowed providers, and creation time. Status is either enabled or disabled.
 
+A credential also carries its own admission bounds: a maximum concurrent request count, an optional maximum request rate, and a maximum number of long-lived WebSocket connections. Each is optional, and an absent bound is unbounded rather than zero.
+
 A credential never carries a protocol of its own. The protocol belongs to the provider it resolves to, and the required downstream credential header is chosen from that provider.
 
 ### Provider and request snapshot
 
 A provider record contains its identity, name, protocol type, endpoint, encrypted upstream credential, enabled status, and creation time. Protocol type is either OpenAI or Anthropic. Status is either enabled or disabled. A provider issues no credentials; it is purely an upstream configuration.
 
-After credential verification and upstream-key decryption, the gateway creates an immutable, request-local snapshot containing the account identity, the credential identity, and exactly one provider with its protocol type, endpoint, and decrypted upstream credential. A request or WebSocket connection retains its snapshot until completion, so later account, credential, role, or binding changes never alter admitted work.
+A provider also carries its own admission bounds: a maximum concurrent request count and an optional maximum request rate. Each is optional, and an absent bound is unbounded rather than zero. A bound of zero is refused at every layer, because it would forbid all traffic instead of bounding it.
+
+After credential verification and upstream-key decryption, the gateway creates an immutable, request-local snapshot containing the account identity, the credential identity, exactly one provider with its protocol type, endpoint and decrypted upstream credential, and the admission bounds of both the credential and the selected provider. A request or WebSocket connection retains its snapshot until completion, so later account, credential, role, binding, or limit changes never alter admitted work.
+
+### Admission layers
+
+A request passes a global admission gate, then the selected provider's concurrency layer, then the credential's concurrency and rate layers. A WebSocket connection is additionally counted against the credential's long-lived connection bound for the whole connection. Every acquisition is non-blocking: an exhausted layer rejects the request immediately with a sanitized gateway error rather than waiting for capacity, and the rejection happens before any upstream is contacted. Rejected requests release everything already acquired at an earlier layer.
+
+A concurrency layer is held for the whole HTTP/SSE exchange or the whole WebSocket connection and is released on every exit path, including cancellation. A rate layer admits a burst up to one interval's worth of requests and refuses a sustained rate above the bound. Counter state exists only for a provider or credential that carries a bound, so an unbounded dimension holds no per-entity state.
+
+Layers are evaluated after authentication and route resolution, so a rejection costs one credential lookup and no upstream contact.
 
 ### Gateway credential
 
@@ -159,6 +172,7 @@ The external credential representation is `<key-id>.<secret>`. `key-id` is a ran
 A request-log record contains its identity, unique request ID, account ID, credential ID, provider ID, protocol type, transport type, normalized path without a query string, optional upstream status, start time, optional end time, and an optional sanitized error summary.
 
 An absent end time means that no completion event was persisted; it does not prove that a connection is still active. An absent status means that an upstream HTTP response or WebSocket handshake was not received. Transport type is either HTTP or WebSocket.
+
 
 ### Persistence
 
@@ -209,7 +223,7 @@ Account creation returns a generated password only when the request supplied non
 | `GET /admin/api/api-keys?after_id=&limit=&account_id=` | List redacted credential summaries by increasing ID |
 | `POST /admin/api/api-keys` | Create a credential for an account and return its plaintext once |
 | `GET /admin/api/api-keys/{id}` | Read one redacted credential with its bindings |
-| `PATCH /admin/api/api-keys/{id}` | Change name, bindings, default provider, expiration, or status |
+| `PATCH /admin/api/api-keys/{id}` | Change name, bindings, default provider, expiration, status, or admission bounds |
 | `DELETE /admin/api/api-keys/{id}` | Delete an unreferenced credential; otherwise return `409` |
 | `POST /admin/api/api-keys/{id}:rotate` | Replace the secret and return the new credential once |
 
@@ -256,7 +270,7 @@ The create and rotate responses include a one-time field, and later reads omit i
 | `GET /admin/api/providers?after_id=&limit=` | List redacted provider summaries by increasing ID |
 | `POST /admin/api/providers` | Create a provider |
 | `GET /admin/api/providers/{id}` | Read redacted provider configuration |
-| `PATCH /admin/api/providers/{id}` | Change name, endpoint, upstream key, or status |
+| `PATCH /admin/api/providers/{id}` | Change name, endpoint, upstream key, status, or admission bounds |
 | `DELETE /admin/api/providers/{id}` | Delete an unreferenced provider; otherwise return `409` |
 
 Provider writes are administrator only.
@@ -347,6 +361,7 @@ Transparency and safety are proven by tests, not assumed:
 - HTTP/SSE and WebSocket contract tests demonstrate byte-preserving relay across arbitrary chunk fragmentation, unknown application fields, backpressure, cancellation, and abrupt disconnects.
 - Security tests assert redaction, fail-closed behavior, and the absence of secrets from logs and API responses.
 - Load tests demonstrate stable memory under the documented concurrency profile for mixed short requests and long-lived streams and enforce every queue, buffer, hashing, idle-connection, and semaphore bound.
+- Admission tests demonstrate that an over-limit provider or credential is rejected immediately without queueing and without contacting an upstream, that the limit applies to long-lived connections for their whole lifetime, and that editing a limit never reaches work already admitted.
 - A version-controlled manifest of pinned client and SDK versions, run against a controllable mock upstream, is the release compatibility gate; external live services are never the CI correctness dependency.
 - Administration page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are accepted through real browser interaction; a successful page build is never the release substitute for that interaction.
 
@@ -354,10 +369,10 @@ A change is complete only when these layers pass:
 
 1. **Unit tests:** credential parsing, hash verification, encryption round trips and tamper rejection, URI joining, route matrix, hop-by-hop header removal, redaction, cursor encoding, and state transitions.
 2. **Repository tests:** migrations and identical behavioral tests against SQLite and PostgreSQL, including uniqueness and delete restrictions.
-3. **HTTP contract tests:** byte-preserving request and response streams, unknown JSON fields, arbitrary chunk fragmentation, SSE splits, backpressure, cancellation, upstream errors, query preservation, and credential replacement.
+3. **HTTP contract tests:** byte-preserving request and response streams, unknown JSON fields, arbitrary chunk fragmentation, SSE splits, backpressure, cancellation, upstream errors, query preservation, credential replacement, and layered admission rejection before upstream contact.
 4. **WebSocket contract tests:** successful and rejected handshakes, text/binary/fragmented messages, ping/pong, simultaneous traffic, close codes, abrupt disconnects, message bounds, and close propagation.
 5. **Security tests:** no secrets or bodies in logs or API responses, disabled and rotated keys fail, cross-provider routes are rejected before upstream contact, and error sanitization survives hostile upstream text.
-6. **Load tests:** documented default-hashing and declared-admission profiles for mixed short HTTP requests and long-lived HTTP/SSE and WebSocket sessions reach stable memory use, record success and rejection rates, latency percentiles, resident memory, file descriptors, and dropped logs, and respect every queue, buffer, semaphore, hashing, and idle-connection bound. Raised hashing budgets must not substitute for default-configuration results.
+6. **Load tests:** documented default-hashing and declared-admission profiles for mixed short HTTP requests and long-lived HTTP/SSE and WebSocket sessions reach stable memory use, record success and rejection rates, latency percentiles, resident memory, file descriptors, and dropped logs, and respect every queue, buffer, semaphore, hashing, and idle-connection bound. A profile with per-provider and per-credential bounds configured demonstrates that shedding happens at the layer that is full. Raised hashing budgets must not substitute for default-configuration results.
 7. **Compatibility gate:** run the version-controlled manifest of exact Codex CLI, OpenAI SDK, and Anthropic SDK versions against a controllable mock upstream. Live-provider smoke tests are optional and never the CI correctness dependency.
 8. **Administration page checks:** the page's own logic is exercised directly, covering that a cursor is only ever paired with the conditions that produced it. Page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are additionally accepted through real browser interaction against a running control plane, both with the page served by that plane and with the development server proxying the API. Those interactions are a release check: type checking or a successful build never substitutes for them.
 

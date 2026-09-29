@@ -22,6 +22,7 @@ A new architectural fork gets an ADR before the architecture document changes. A
 | [0012](./0012-account-sessions-and-two-roles.md) | Accepted | Account sessions and two fixed roles in the control plane |
 | [0013](./0013-account-owned-data-plane-credentials.md) | Accepted | Data-plane credentials identify an account, not a provider |
 | [0014](./0014-migrating-provider-issued-credentials.md) | Accepted | Converting provider-issued credentials to account-owned credentials |
+| [0015](./0015-layered-transport-admission.md) | Accepted | Layered transport admission, separate from application scheduling |
 
 ## Template
 

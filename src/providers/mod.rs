@@ -13,7 +13,9 @@ use chrono::Utc;
 use url::Url;
 
 use crate::crypto::SecretCipher;
-use crate::domain::{ProtocolType, Provider, ProviderId, ProviderStatus, SecretString};
+use crate::domain::{
+    ProtocolType, Provider, ProviderAdmission, ProviderId, ProviderStatus, SecretString,
+};
 use crate::persistence::{
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderUpdate,
     RepositoryError,
@@ -35,6 +37,7 @@ pub struct CreateProviderRequest {
     endpoint: String,
     upstream_api_key: SecretString,
     status: ProviderStatus,
+    admission: ProviderAdmission,
 }
 
 impl CreateProviderRequest {
@@ -51,7 +54,15 @@ impl CreateProviderRequest {
             endpoint,
             upstream_api_key,
             status,
+            admission: ProviderAdmission::default(),
         }
+    }
+
+    /// Bounds this provider at admission, so one upstream cannot consume
+    /// capacity that belongs to the providers around it.
+    pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.admission = admission;
+        self
     }
 }
 
@@ -80,6 +91,7 @@ pub struct UpdateProviderRequest {
     endpoint: Option<String>,
     upstream_api_key: Option<SecretString>,
     status: Option<ProviderStatus>,
+    admission: Option<ProviderAdmission>,
 }
 
 impl UpdateProviderRequest {
@@ -105,6 +117,14 @@ impl UpdateProviderRequest {
 
     pub fn with_status(mut self, status: ProviderStatus) -> Self {
         self.status = Some(status);
+        self
+    }
+
+    /// Replaces both admission bounds. Naming the admission here is what makes
+    /// the edit non-empty, and it names every bound at once, so a single edit
+    /// can widen, narrow, or clear the provider's limits together.
+    pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
+        self.admission = Some(admission);
         self
     }
 }
@@ -138,6 +158,8 @@ pub enum ProviderServiceError {
     InsecureEndpoint,
     /// The upstream API key is empty, too long, or contains control characters.
     InvalidUpstreamApiKey,
+    /// An admission bound is zero or beyond the accepted ceiling.
+    InvalidAdmissionBound,
     /// Compute or database capacity for this change is exhausted.
     Busy,
     /// Upstream credential encryption failed.
@@ -163,6 +185,7 @@ impl fmt::Display for ProviderServiceError {
             Self::InvalidEndpoint => "provider endpoint is invalid",
             Self::InsecureEndpoint => "provider endpoint must use HTTPS",
             Self::InvalidUpstreamApiKey => "upstream API key is invalid",
+            Self::InvalidAdmissionBound => "an admission bound must be greater than zero",
             Self::Busy => "provider service has no spare capacity",
             Self::Cipher => "upstream credential encryption failed",
             Self::Conflict => "provider conflicts with existing data",
@@ -305,7 +328,8 @@ where
             upstream_api_key_ciphertext,
             request.status,
             Utc::now(),
-        );
+        )
+        .with_admission(request.admission);
         self.repository
             .create(new_provider)
             .await
@@ -345,6 +369,9 @@ where
         }
         if let Some(status) = request.status {
             update = update.with_status(status);
+        }
+        if let Some(admission) = request.admission {
+            update = update.with_admission(admission);
         }
         if update.is_empty() {
             return Err(ProviderServiceError::NoFieldsToUpdate);

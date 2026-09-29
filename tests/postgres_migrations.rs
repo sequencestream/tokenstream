@@ -74,7 +74,7 @@ async fn postgres_schema_matches_sqlite_constraints() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT c.relname AS name
@@ -225,4 +225,73 @@ async fn postgres_schema_matches_sqlite_constraints() {
         .expect("delete unreferenced provider");
     let next_id = insert_provider(database.pool(), &unique_value("next")).await;
     assert!(next_id > deleted_id);
+}
+
+#[tokio::test]
+async fn postgres_admission_bounds_default_to_unbounded_and_refuse_zero() {
+    let url = require_postgres_url("the PostgreSQL migration layer");
+    let database = PostgresDatabase::connect(&url, 2)
+        .await
+        .expect("connect to PostgreSQL");
+    database.migrate().await.expect("migrations");
+
+    // A row written before layered admission existed carries no bound at all,
+    // which is unbounded rather than zero.
+    let provider_id = insert_provider(database.pool(), &unique_value("unbounded")).await;
+    let stored: (Option<i32>, Option<i32>) = sqlx::query_as(
+        "SELECT max_concurrent_requests, max_requests_per_second
+         FROM provider WHERE id = $1",
+    )
+    .bind(provider_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read provider bounds");
+    assert_eq!(stored, (None, None), "an existing row is unbounded");
+
+    let (account_id, _) = insert_principal(database.pool(), &unique_value("unbounded-key")).await;
+    let bounds: (Option<i32>, Option<i32>, Option<i32>) = sqlx::query_as(
+        "SELECT max_concurrent_requests, max_requests_per_second, max_websockets
+         FROM api_key WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read credential bounds");
+    assert_eq!(bounds, (None, None, None));
+
+    // A positive bound is stored; zero is refused by the table itself, because
+    // a bound of zero would forbid all traffic rather than bound it.
+    sqlx::query(
+        "UPDATE provider SET max_concurrent_requests = $1, max_requests_per_second = $2
+         WHERE id = $3",
+    )
+    .bind(4_i32)
+    .bind(20_i32)
+    .bind(provider_id)
+    .execute(database.pool())
+    .await
+    .expect("store positive bounds");
+    for (statement, target) in [
+        (
+            "UPDATE provider SET max_concurrent_requests = 0 WHERE id = $1",
+            provider_id,
+        ),
+        (
+            "UPDATE provider SET max_requests_per_second = 0 WHERE id = $1",
+            provider_id,
+        ),
+        (
+            "UPDATE api_key SET max_websockets = 0 WHERE account_id = $1",
+            account_id,
+        ),
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(target)
+                .execute(database.pool())
+                .await
+                .is_err(),
+            "expected {statement} to be refused"
+        );
+    }
 }

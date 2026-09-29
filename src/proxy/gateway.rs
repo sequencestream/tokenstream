@@ -2,6 +2,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -12,12 +13,13 @@ use hyper::{Request, Response};
 use crate::auth::GatewayAuthenticator;
 use crate::config::Config;
 use crate::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
-use crate::domain::{RequestId, TransportType};
+use crate::domain::{ProviderSnapshot, RequestId, TransportType};
 use crate::logging::{LogSink, RequestLogLifecycle, observe_response};
 use crate::persistence::Database;
 use crate::proxy::admission::{AdmissionPermit, ProxyLimits};
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use crate::proxy::http::HttpProxy;
+use crate::proxy::layered::{LayerRejection, LayeredAdmission, LayeredSlots};
 use crate::proxy::websocket::{RelayOutcome, WebSocketProxy};
 use crate::routing::resolve_route;
 use crate::telemetry::Metrics;
@@ -39,6 +41,7 @@ pub struct Gateway {
     http: HttpProxy<Incoming>,
     websocket: WebSocketProxy,
     logs: LogSink,
+    admission: LayeredAdmission,
     settings: crate::ConnectionSettings,
 }
 
@@ -103,7 +106,13 @@ impl Gateway {
                 metrics,
             ),
             logs,
+            admission: LayeredAdmission::new(),
         }
+    }
+
+    /// The layered admission registry, shared by every clone of this gateway.
+    pub fn admission(&self) -> LayeredAdmission {
+        self.admission.clone()
     }
 
     async fn forward(
@@ -121,6 +130,14 @@ impl Gateway {
             request.headers(),
         )?;
         let query = request.uri().query().map(str::to_owned);
+
+        // Layered admission runs once the snapshot is frozen and the route is
+        // valid, and before any upstream is contacted. A rejection here costs
+        // one credential lookup and no network, and it releases everything an
+        // outer layer already took.
+        let slots = self.admit_layers(&snapshot, route.transport())?;
+        let slots = Arc::new(slots);
+
         if route.transport() == TransportType::Http {
             let response = self
                 .http
@@ -139,6 +156,7 @@ impl Gateway {
                     boxed(PermittedBody {
                         inner: body,
                         _permit: permit,
+                        _slots: Arc::clone(&slots),
                     })
                 }),
                 None,
@@ -164,6 +182,7 @@ impl Gateway {
                     boxed(PermittedBody {
                         inner,
                         _permit: permit,
+                        _slots: Arc::clone(&slots),
                     })
                 }),
                 None,
@@ -171,6 +190,7 @@ impl Gateway {
             Some(relay) => {
                 let session: Session = Box::pin(async move {
                     let _permit = permit;
+                    let _slots = slots;
                     let outcome = relay.await;
                     let error = match outcome {
                         RelayOutcome::Closed => None,
@@ -181,6 +201,58 @@ impl Gateway {
                     lifecycle.complete(Some(status), error);
                 });
                 Ok((response.map(boxed), Some(session)))
+            }
+        }
+    }
+
+    /// Runs the provider and credential admission layers for one request.
+    ///
+    /// Layers are evaluated outside in: provider concurrency, then credential
+    /// concurrency, then the long-lived connection bound a WebSocket is subject
+    /// to, then the two rate allowances. Every acquisition either succeeds
+    /// immediately or refuses, and a refusal drops the slots already taken, so a
+    /// rejected request never holds capacity it cannot use.
+    ///
+    /// A rate allowance is consumed once per request on every transport, so an
+    /// HTTP exchange and a WebSocket handshake are counted alike. The
+    /// long-lived connection bound is not: it exists only to bound sockets a
+    /// client keeps open, so an HTTP exchange never consumes it.
+    fn admit_layers(
+        &self,
+        snapshot: &ProviderSnapshot,
+        transport: TransportType,
+    ) -> Result<LayeredSlots, GatewayError> {
+        let provider = self
+            .admission
+            .provider_layers(snapshot.id(), snapshot.provider_admission());
+        let credential = self
+            .admission
+            .credential_layers(snapshot.api_key_id(), snapshot.credential_admission());
+
+        let acquired = (|| -> Result<LayeredSlots, LayerRejection> {
+            let provider_concurrency = provider.acquire_concurrency()?;
+            let credential_concurrency = credential.acquire_concurrency()?;
+            let credential_websockets = if transport == TransportType::WebSocket {
+                credential.acquire_websocket()?
+            } else {
+                None
+            };
+            provider.acquire_rate()?;
+            credential.acquire_rate()?;
+            Ok(LayeredSlots::new(
+                provider_concurrency,
+                credential_concurrency,
+                credential_websockets,
+            ))
+        })();
+
+        match acquired {
+            Ok(slots) => Ok(slots),
+            Err(rejection) => {
+                // A refusal at any layer drops the slots taken before it, and
+                // releases a registry entry whose bound is now lifted.
+                credential.finish();
+                Err(rejection.error())
             }
         }
     }
@@ -239,6 +311,9 @@ pub fn error_response(error: GatewayError, id: &RequestId) -> Response<DataBody>
 struct PermittedBody<B> {
     inner: B,
     _permit: AdmissionPermit,
+    /// Held for the whole exchange alongside the global permit, so a layered
+    /// slot is released exactly when the response body is dropped.
+    _slots: Arc<LayeredSlots>,
 }
 impl<B: Body<Data = Bytes> + Unpin> Body for PermittedBody<B> {
     type Data = Bytes;

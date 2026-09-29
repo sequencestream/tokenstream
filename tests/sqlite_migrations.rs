@@ -86,7 +86,7 @@ async fn migrations_are_versioned_and_repeatable() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
@@ -216,4 +216,72 @@ async fn referenced_providers_cannot_be_deleted_and_ids_are_not_reused() {
         .expect("delete unreferenced provider");
     let next_id = insert_provider(database.pool(), "next").await;
     assert!(next_id > deleted_id);
+}
+
+#[tokio::test]
+async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = database(&directory.path().join("bounds.db"), 1).await;
+    database.migrate().await.expect("migrations");
+
+    // A row written before layered admission existed carries no bound at all,
+    // which is unbounded rather than zero.
+    let provider_id = insert_provider(database.pool(), "unbounded").await;
+    let stored: (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT max_concurrent_requests, max_requests_per_second
+         FROM provider WHERE id = ?",
+    )
+    .bind(provider_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read provider bounds");
+    assert_eq!(stored, (None, None), "an existing row is unbounded");
+
+    let (account_id, _, _) = insert_principal(database.pool()).await;
+    let credential_bounds: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT max_concurrent_requests, max_requests_per_second, max_websockets
+         FROM api_key WHERE account_id = ?",
+    )
+    .bind(account_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("read credential bounds");
+    assert_eq!(credential_bounds, (None, None, None));
+
+    // A positive bound is stored; zero is refused by the table itself, because
+    // a bound of zero would forbid all traffic rather than bound it.
+    sqlx::query(
+        "UPDATE provider SET max_concurrent_requests = ?, max_requests_per_second = ?
+         WHERE id = ?",
+    )
+    .bind(4_i64)
+    .bind(20_i64)
+    .bind(provider_id)
+    .execute(database.pool())
+    .await
+    .expect("store positive bounds");
+    assert!(
+        sqlx::query("UPDATE provider SET max_concurrent_requests = 0 WHERE id = ?")
+            .bind(provider_id)
+            .execute(database.pool())
+            .await
+            .is_err(),
+        "a zero provider bound is refused"
+    );
+    assert!(
+        sqlx::query("UPDATE provider SET max_requests_per_second = 0 WHERE id = ?")
+            .bind(provider_id)
+            .execute(database.pool())
+            .await
+            .is_err(),
+        "a zero provider rate is refused"
+    );
+    assert!(
+        sqlx::query("UPDATE api_key SET max_websockets = 0 WHERE account_id = ?")
+            .bind(account_id)
+            .execute(database.pool())
+            .await
+            .is_err(),
+        "a zero WebSocket bound is refused"
+    );
 }

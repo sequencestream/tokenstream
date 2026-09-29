@@ -233,14 +233,20 @@ where
             .decrypt(provider.upstream_api_key_ciphertext())
             .map_err(|_| GatewayAuthError::Unavailable)?;
 
-        Ok(Arc::new(ProviderSnapshot::new(
-            account.id(),
-            api_key.id(),
-            provider.id(),
-            provider.protocol_type(),
-            provider.endpoint().clone(),
-            upstream_api_key,
-        )))
+        // The admission bounds of both the credential and the selected provider
+        // are frozen here, with the rest of the snapshot. A later limit edit
+        // applies to new work and cannot reach what is already admitted.
+        Ok(Arc::new(
+            ProviderSnapshot::new(
+                account.id(),
+                api_key.id(),
+                provider.id(),
+                provider.protocol_type(),
+                provider.endpoint().clone(),
+                upstream_api_key,
+            )
+            .with_admission(provider.admission(), api_key.admission()),
+        ))
     }
 
     /// Resolves the single provider this request reaches.

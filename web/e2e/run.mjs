@@ -202,10 +202,16 @@ async function createProvider(page, name) {
 }
 
 /** Issues a credential bound to one provider, returning its one-time plaintext. */
+/** The admission bounds the suite issues every credential with. */
+const CREDENTIAL_BOUNDS = { maxConcurrent: 4, maxRate: 20, maxWebsockets: 2 }
+
 async function issueCredential(page, providerName, keyName) {
   await page.getByRole('button', { name: 'Credentials' }).click()
   await page.getByPlaceholder('ci').fill(keyName)
   await page.locator('.binding').filter({ hasText: providerName }).locator('input').check()
+  await page.getByLabel('Max concurrent requests').fill(String(CREDENTIAL_BOUNDS.maxConcurrent))
+  await page.getByLabel('Max requests per second').fill(String(CREDENTIAL_BOUNDS.maxRate))
+  await page.getByLabel('Max WebSocket connections').fill(String(CREDENTIAL_BOUNDS.maxWebsockets))
   await page.getByRole('button', { name: 'Create credential' }).click()
   await page.locator('.credential-card code').waitFor()
   const secret = (await page.locator('.credential-card code').innerText()).trim()
@@ -297,6 +303,25 @@ async function runSuite(browser, origin, label) {
       local: false,
       session: false,
     })
+
+    // A bound the operator set is shown on the row, so the page never hides the
+    // limit that is shaping the credential's own traffic.
+    const boundSummary = `conc ${CREDENTIAL_BOUNDS.maxConcurrent}, rate ${CREDENTIAL_BOUNDS.maxRate}, WS ${CREDENTIAL_BOUNDS.maxWebsockets}`
+    await page
+      .getByRole('row')
+      .filter({ has: page.getByRole('cell', { name: keyName, exact: true }) })
+      .getByRole('cell', { name: boundSummary })
+      .waitFor()
+
+    // A bound of zero would forbid all traffic rather than bound it, so the page
+    // refuses it and issues nothing instead of sending a form the server rejects.
+    await page.getByRole('button', { name: 'Credentials' }).click()
+    await page.getByPlaceholder('ci').fill(`${keyName}-rejected`)
+    await page.locator('.binding').filter({ hasText: providerName }).locator('input').check()
+    await page.getByLabel('Max concurrent requests').fill('0')
+    await page.getByRole('button', { name: 'Create credential' }).click()
+    await page.getByText('A bound must be at least 1.').waitFor()
+    assert.equal(await page.getByRole('row').filter({ hasText: `${keyName}-rejected` }).count(), 0)
 
     await page.reload({ waitUntil: 'networkidle' })
     await page.getByRole('heading', { name: 'Credentials' }).waitFor()
