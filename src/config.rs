@@ -99,21 +99,98 @@ pub struct Config {
     admin_session_ttl: Duration,
     development_mode: bool,
     admin_static_root: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+}
+
+struct SourceOptions<'a> {
+    data_dir: Option<&'a Path>,
+    file_master: Option<&'a str>,
+    file_hash: Option<&'a str>,
+    discover_page: bool,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_source(|name| match env::var_os(name) {
+        let mut env_get = |name: &str| match env::var_os(name) {
             Some(value) => value.into_string().map(Some).map_err(|_| ()),
             None => Ok(None),
-        })
+        };
+        let data_dir = crate::local_state::resolve_data_dir(&mut env_get)?;
+        crate::local_state::ensure_data_dir(&data_dir)?;
+        let overlay = crate::local_state::load_overlay(&data_dir)?;
+        let file_master = crate::local_state::load_master_key_file(&data_dir)?;
+        let file_hash = crate::local_state::load_admin_hash_file(&data_dir)?;
+        let mut persist_master = None;
+        let mut persist_hash = None;
+        let mut config = Self::from_source_with(
+            |name| match env::var_os(name) {
+                Some(value) => value.into_string().map(Some).map_err(|_| ()),
+                None => Ok(overlay.get(name).cloned()),
+            },
+            SourceOptions {
+                data_dir: Some(&data_dir),
+                file_master: file_master.as_deref(),
+                file_hash: file_hash.as_deref(),
+                discover_page: true,
+            },
+            &mut persist_master,
+            &mut persist_hash,
+        )?;
+        if let Some(hex) = persist_master {
+            crate::local_state::save_master_key_file(&data_dir, &hex)?;
+        }
+        if let Some(hash) = persist_hash {
+            crate::local_state::save_admin_hash_file(&data_dir, &hash)?;
+        }
+        config.data_dir = Some(data_dir);
+        Ok(config)
+    }
+
+    pub fn from_map(
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, ConfigError> {
+        Self::from_source(|name| Ok(values.get(name).cloned()))
+    }
+
+    pub fn with_data_dir(mut self, data_dir: Option<PathBuf>) -> Self {
+        self.data_dir = data_dir;
+        self
     }
 
     fn from_source(
-        mut get: impl FnMut(&str) -> Result<Option<String>, ()>,
+        get: impl FnMut(&str) -> Result<Option<String>, ()>,
     ) -> Result<Self, ConfigError> {
-        let data_listen_addr = parse_required(&mut get, "TOKENSTREAM_DATA_LISTEN_ADDR")?;
-        let admin_listen_addr = parse_required(&mut get, "TOKENSTREAM_ADMIN_LISTEN_ADDR")?;
+        let mut persist_master = None;
+        let mut persist_hash = None;
+        Self::from_source_with(
+            get,
+            SourceOptions {
+                data_dir: None,
+                file_master: None,
+                file_hash: None,
+                discover_page: false,
+            },
+            &mut persist_master,
+            &mut persist_hash,
+        )
+    }
+
+    fn from_source_with(
+        mut get: impl FnMut(&str) -> Result<Option<String>, ()>,
+        options: SourceOptions<'_>,
+        persist_master: &mut Option<String>,
+        persist_hash: &mut Option<String>,
+    ) -> Result<Self, ConfigError> {
+        let data_listen_addr: std::net::SocketAddr = parse_optional_value(
+            &mut get,
+            "TOKENSTREAM_DATA_LISTEN_ADDR",
+            crate::local_state::DEFAULT_DATA_LISTEN_ADDR,
+        )?;
+        let admin_listen_addr: std::net::SocketAddr = parse_optional_value(
+            &mut get,
+            "TOKENSTREAM_ADMIN_LISTEN_ADDR",
+            crate::local_state::DEFAULT_ADMIN_LISTEN_ADDR,
+        )?;
         if data_listen_addr == admin_listen_addr {
             return Err(ConfigError::Invalid {
                 name: "TOKENSTREAM_ADMIN_LISTEN_ADDR",
@@ -121,30 +198,69 @@ impl Config {
             });
         }
 
-        let database_url_value = required(&mut get, "TOKENSTREAM_DATABASE_URL")?;
+        let database_url_value = match optional(&mut get, "TOKENSTREAM_DATABASE_URL")? {
+            Some(value) => value,
+            None => match options.data_dir {
+                Some(data_dir) => crate::local_state::default_sqlite_url(data_dir),
+                None => "sqlite::memory:".to_owned(),
+            },
+        };
         validate_database_url(&database_url_value)?;
         let database_url = DatabaseUrl(database_url_value);
 
-        let master_key_value = required(&mut get, "TOKENSTREAM_MASTER_KEY")?;
+        let master_key_value = match optional(&mut get, "TOKENSTREAM_MASTER_KEY")? {
+            Some(value) => value,
+            None => {
+                if let Some(file_value) = options.file_master {
+                    file_value.to_owned()
+                } else {
+                    let generated = crate::local_state::generate_master_key()?;
+                    let hex = crate::local_state::encode_master_key(&generated);
+                    *persist_master = Some(hex.clone());
+                    hex
+                }
+            }
+        };
         let master_key = MasterKey(decode_master_key(&master_key_value)?);
 
-        let admin_hash_value = required(&mut get, "TOKENSTREAM_ADMIN_PASSWORD_HASH")?;
+        let env_password = optional(&mut get, "TOKENSTREAM_ADMIN_PASSWORD")?;
+        let admin_hash_value = match optional(&mut get, "TOKENSTREAM_ADMIN_PASSWORD_HASH")? {
+            Some(value) => value,
+            None => {
+                if let Some(password) = env_password {
+                    let hash = crate::local_state::hash_admin_password(&password)?;
+                    *persist_hash = Some(hash.clone());
+                    hash
+                } else if let Some(file_value) = options.file_hash {
+                    file_value.to_owned()
+                } else {
+                    let hash = crate::local_state::hash_admin_password(
+                        crate::local_state::DEFAULT_ADMIN_PASSWORD,
+                    )?;
+                    *persist_hash = Some(hash.clone());
+                    hash
+                }
+            }
+        };
         validate_admin_password_hash(&admin_hash_value)?;
         let admin_password_hash = AdminPasswordHash(admin_hash_value);
 
-        let upstream_connect_timeout = parse_duration(
+        let upstream_connect_timeout = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS",
+            5000,
             MAX_UPSTREAM_TIMEOUT_MS,
         )?;
-        let upstream_header_timeout = parse_duration(
+        let upstream_header_timeout = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_UPSTREAM_HEADER_TIMEOUT_MS",
+            30_000,
             MAX_UPSTREAM_TIMEOUT_MS,
         )?;
-        let stream_idle_timeout = parse_duration(
+        let stream_idle_timeout = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS",
+            60_000,
             MAX_IDLE_TIMEOUT_MS,
         )?;
         let upstream_idle_per_host =
@@ -155,25 +271,29 @@ impl Config {
             30_000,
             MAX_UPSTREAM_TIMEOUT_MS,
         )?;
-        let shutdown_drain_timeout = parse_duration(
+        let shutdown_drain_timeout = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_SHUTDOWN_DRAIN_TIMEOUT_MS",
+            30_000,
             MAX_SHUTDOWN_TIMEOUT_MS,
         )?;
-        let log_flush_timeout = parse_duration(
+        let log_flush_timeout = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_LOG_FLUSH_TIMEOUT_MS",
+            5000,
             MAX_SHUTDOWN_TIMEOUT_MS,
         )?;
-        let database_max_connections = parse_bounded(
+        let database_max_connections = parse_optional(
             &mut get,
             "TOKENSTREAM_DATABASE_MAX_CONNECTIONS",
+            16,
             1,
             MAX_DATABASE_CONNECTIONS,
         )?;
-        let max_proxy_connections = parse_bounded(
+        let max_proxy_connections = parse_optional(
             &mut get,
             "TOKENSTREAM_MAX_PROXY_CONNECTIONS",
+            4096,
             1,
             MAX_PROXY_CONNECTIONS,
         )?;
@@ -246,21 +366,24 @@ impl Config {
             15 * 60 * 1000,
             MAX_IDLE_TIMEOUT_MS,
         )?;
-        let http_buffer_bytes = parse_bounded(
+        let http_buffer_bytes = parse_optional(
             &mut get,
             "TOKENSTREAM_HTTP_BUFFER_BYTES",
+            65_536,
             MIN_HTTP_BUFFER_BYTES,
             MAX_HTTP_BUFFER_BYTES,
         )?;
-        let websocket_max_frame_bytes = parse_bounded(
+        let websocket_max_frame_bytes = parse_optional(
             &mut get,
             "TOKENSTREAM_WEBSOCKET_MAX_FRAME_BYTES",
+            1_048_576,
             1,
             MAX_WEBSOCKET_BYTES,
         )?;
-        let websocket_max_message_bytes = parse_bounded(
+        let websocket_max_message_bytes = parse_optional(
             &mut get,
             "TOKENSTREAM_WEBSOCKET_MAX_MESSAGE_BYTES",
+            8_388_608,
             1,
             MAX_WEBSOCKET_BYTES,
         )?;
@@ -270,21 +393,24 @@ impl Config {
                 requirement: "must not exceed TOKENSTREAM_WEBSOCKET_MAX_MESSAGE_BYTES",
             });
         }
-        let websocket_queue_capacity = parse_bounded(
+        let websocket_queue_capacity = parse_optional(
             &mut get,
             "TOKENSTREAM_WEBSOCKET_QUEUE_CAPACITY",
+            32,
             1,
             MAX_QUEUE_CAPACITY,
         )?;
-        let log_queue_capacity = parse_bounded(
+        let log_queue_capacity = parse_optional(
             &mut get,
             "TOKENSTREAM_LOG_QUEUE_CAPACITY",
+            8192,
             1,
             MAX_QUEUE_CAPACITY,
         )?;
-        let log_batch_size = parse_bounded(
+        let log_batch_size = parse_optional(
             &mut get,
             "TOKENSTREAM_LOG_BATCH_SIZE",
+            128,
             1,
             MAX_QUEUE_CAPACITY,
         )?;
@@ -294,15 +420,22 @@ impl Config {
                 requirement: "must not exceed TOKENSTREAM_LOG_QUEUE_CAPACITY",
             });
         }
-        let log_batch_interval = parse_duration(
+        let log_batch_interval = parse_optional_duration(
             &mut get,
             "TOKENSTREAM_LOG_BATCH_INTERVAL_MS",
+            100,
             MAX_LOG_BATCH_INTERVAL_MS,
         )?;
 
-        let development_mode = parse_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE")?;
-        let admin_static_root =
+        let loopback_listeners =
+            data_listen_addr.ip().is_loopback() && admin_listen_addr.ip().is_loopback();
+        let development_mode =
+            parse_optional_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE", loopback_listeners)?;
+        let mut admin_static_root =
             parse_optional_text(&mut get, "TOKENSTREAM_ADMIN_STATIC_ROOT")?.map(PathBuf::from);
+        if admin_static_root.is_none() && options.discover_page {
+            admin_static_root = crate::local_state::discover_admin_static_root();
+        }
 
         Ok(Self {
             data_listen_addr,
@@ -340,6 +473,7 @@ impl Config {
             admin_session_ttl,
             development_mode,
             admin_static_root,
+            data_dir: options.data_dir.map(Path::to_path_buf),
         })
     }
 
@@ -481,6 +615,172 @@ impl Config {
     pub fn admin_static_root(&self) -> Option<&Path> {
         self.admin_static_root.as_deref()
     }
+
+    pub fn data_dir(&self) -> Option<&Path> {
+        self.data_dir.as_deref()
+    }
+
+    pub fn master_key_hex(&self) -> String {
+        crate::local_state::encode_master_key(self.master_key.expose())
+    }
+
+    pub fn uses_default_admin_password(&self) -> bool {
+        crate::local_state::password_matches(
+            crate::local_state::DEFAULT_ADMIN_PASSWORD,
+            self.admin_password_hash.expose(),
+        )
+    }
+
+    pub fn to_env_map(&self) -> std::collections::HashMap<String, String> {
+        let mut values = std::collections::HashMap::from([
+            (
+                "TOKENSTREAM_DATA_LISTEN_ADDR".to_owned(),
+                self.data_listen_addr.to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_LISTEN_ADDR".to_owned(),
+                self.admin_listen_addr.to_string(),
+            ),
+            (
+                "TOKENSTREAM_DATABASE_URL".to_owned(),
+                self.database_url.expose().to_owned(),
+            ),
+            ("TOKENSTREAM_MASTER_KEY".to_owned(), self.master_key_hex()),
+            (
+                "TOKENSTREAM_ADMIN_PASSWORD_HASH".to_owned(),
+                self.admin_password_hash.expose().to_owned(),
+            ),
+            (
+                "TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS".to_owned(),
+                self.upstream_connect_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_UPSTREAM_HEADER_TIMEOUT_MS".to_owned(),
+                self.upstream_header_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS".to_owned(),
+                self.stream_idle_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_UPSTREAM_IDLE_PER_HOST".to_owned(),
+                self.upstream_idle_per_host.to_string(),
+            ),
+            (
+                "TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS".to_owned(),
+                self.upstream_pool_idle_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_SHUTDOWN_DRAIN_TIMEOUT_MS".to_owned(),
+                self.shutdown_drain_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_LOG_FLUSH_TIMEOUT_MS".to_owned(),
+                self.log_flush_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_DATABASE_MAX_CONNECTIONS".to_owned(),
+                self.database_max_connections.to_string(),
+            ),
+            (
+                "TOKENSTREAM_MAX_PROXY_CONNECTIONS".to_owned(),
+                self.max_proxy_connections.to_string(),
+            ),
+            (
+                "TOKENSTREAM_PASSWORD_MAX_CONCURRENCY".to_owned(),
+                self.password_max_concurrency.to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_PASSWORD_CONCURRENCY".to_owned(),
+                self.admin_password_concurrency.to_string(),
+            ),
+            (
+                "TOKENSTREAM_AUTH_DATABASE_CONNECTIONS".to_owned(),
+                self.auth_database_connections.to_string(),
+            ),
+            (
+                "TOKENSTREAM_AUTH_DB_TIMEOUT_MS".to_owned(),
+                self.auth_db_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_DB_TIMEOUT_MS".to_owned(),
+                self.admin_db_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_LOG_DB_TIMEOUT_MS".to_owned(),
+                self.log_db_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_DATA_MAX_CONNECTIONS".to_owned(),
+                self.data_max_connections.to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_MAX_CONNECTIONS".to_owned(),
+                self.admin_max_connections.to_string(),
+            ),
+            (
+                "TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS".to_owned(),
+                self.downstream_header_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS".to_owned(),
+                self.admin_body_timeout.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_ADMIN_SESSION_TTL_MS".to_owned(),
+                self.admin_session_ttl.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_HTTP_BUFFER_BYTES".to_owned(),
+                self.http_buffer_bytes.to_string(),
+            ),
+            (
+                "TOKENSTREAM_WEBSOCKET_MAX_FRAME_BYTES".to_owned(),
+                self.websocket_max_frame_bytes.to_string(),
+            ),
+            (
+                "TOKENSTREAM_WEBSOCKET_MAX_MESSAGE_BYTES".to_owned(),
+                self.websocket_max_message_bytes.to_string(),
+            ),
+            (
+                "TOKENSTREAM_WEBSOCKET_QUEUE_CAPACITY".to_owned(),
+                self.websocket_queue_capacity.to_string(),
+            ),
+            (
+                "TOKENSTREAM_LOG_QUEUE_CAPACITY".to_owned(),
+                self.log_queue_capacity.to_string(),
+            ),
+            (
+                "TOKENSTREAM_LOG_BATCH_SIZE".to_owned(),
+                self.log_batch_size.to_string(),
+            ),
+            (
+                "TOKENSTREAM_LOG_BATCH_INTERVAL_MS".to_owned(),
+                self.log_batch_interval.as_millis().to_string(),
+            ),
+            (
+                "TOKENSTREAM_DEVELOPMENT_MODE".to_owned(),
+                if self.development_mode {
+                    "true".to_owned()
+                } else {
+                    "false".to_owned()
+                },
+            ),
+        ]);
+        if let Some(root) = &self.admin_static_root {
+            values.insert(
+                "TOKENSTREAM_ADMIN_STATIC_ROOT".to_owned(),
+                root.display().to_string(),
+            );
+        }
+        if let Some(data_dir) = &self.data_dir {
+            values.insert(
+                "TOKENSTREAM_DATA_DIR".to_owned(),
+                data_dir.display().to_string(),
+            );
+        }
+        values
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -507,6 +807,53 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+fn optional(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    match get(name) {
+        Ok(Some(value)) if value.is_empty() => Err(ConfigError::Invalid {
+            name,
+            requirement: "must be non-empty when present",
+        }),
+        Ok(value) => Ok(value),
+        Err(()) => Err(ConfigError::Invalid {
+            name,
+            requirement: "must contain valid Unicode",
+        }),
+    }
+}
+
+fn parse_optional_value<T: std::str::FromStr>(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+    default: &str,
+) -> Result<T, ConfigError> {
+    let raw = optional(get, name)?.unwrap_or_else(|| default.to_owned());
+    raw.parse().map_err(|_| ConfigError::Invalid {
+        name,
+        requirement: "has an invalid format",
+    })
+}
+
+fn parse_optional_flag(
+    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
+    name: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match optional(get, name)? {
+        None => Ok(default),
+        Some(value) => match value.as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(ConfigError::Invalid {
+                name,
+                requirement: "must be either true or false",
+            }),
+        },
+    }
+}
+
 fn required(
     get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
     name: &'static str,
@@ -519,38 +866,6 @@ fn required(
             requirement: "must contain valid Unicode",
         }),
     }
-}
-
-fn parse_required<T: std::str::FromStr>(
-    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
-    name: &'static str,
-) -> Result<T, ConfigError> {
-    required(get, name)?
-        .parse()
-        .map_err(|_| ConfigError::Invalid {
-            name,
-            requirement: "has an invalid format",
-        })
-}
-
-fn parse_duration(
-    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
-    name: &'static str,
-    maximum: u64,
-) -> Result<Duration, ConfigError> {
-    let milliseconds = required(get, name)?
-        .parse::<u64>()
-        .map_err(|_| ConfigError::Invalid {
-            name,
-            requirement: "must be an integer number of milliseconds",
-        })?;
-    if !(MIN_TIMEOUT_MS..=maximum).contains(&milliseconds) {
-        return Err(ConfigError::Invalid {
-            name,
-            requirement: "is outside the supported timeout range",
-        });
-    }
-    Ok(Duration::from_millis(milliseconds))
 }
 
 fn parse_bounded(
@@ -639,20 +954,6 @@ fn parse_optional_text(
     }
 }
 
-fn parse_flag(
-    get: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
-    name: &'static str,
-) -> Result<bool, ConfigError> {
-    match required(get, name)?.as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(ConfigError::Invalid {
-            name,
-            requirement: "must be either true or false",
-        }),
-    }
-}
-
 fn validate_database_url(value: &str) -> Result<(), ConfigError> {
     const NAME: &str = "TOKENSTREAM_DATABASE_URL";
     if value == "sqlite::memory:" {
@@ -707,6 +1008,10 @@ fn decode_master_key(value: &str) -> Result<[u8; 32], ConfigError> {
         key[index] = (high << 4) | low;
     }
     Ok(key)
+}
+
+pub(crate) fn decode_master_key_for_admin(value: &str) -> Result<[u8; 32], ConfigError> {
+    decode_master_key(value)
 }
 
 fn hex_digit(value: u8) -> u8 {
@@ -840,12 +1145,22 @@ mod tests {
     }
 
     #[test]
-    fn every_setting_is_required() {
-        for name in valid_values().keys() {
-            let mut values = valid_values();
-            values.remove(name);
-            assert_eq!(load(&values).unwrap_err(), ConfigError::Missing { name });
-        }
+    fn absent_settings_use_compiled_defaults() {
+        let config = load(&HashMap::new()).expect("defaulted configuration");
+        assert_eq!(config.data_listen_addr().port(), 3300);
+        assert_eq!(config.admin_listen_addr().port(), 3301);
+        assert_eq!(config.database_url().expose(), "sqlite::memory:");
+        assert_eq!(config.master_key().expose().len(), 32);
+        assert!(
+            config
+                .admin_password_hash()
+                .expose()
+                .starts_with("$argon2id$")
+        );
+        assert_eq!(config.upstream_connect_timeout().as_millis(), 5000);
+        assert_eq!(config.http_buffer_bytes(), 65536);
+        assert!(config.development_mode());
+        assert!(config.uses_default_admin_password());
     }
 
     #[test]

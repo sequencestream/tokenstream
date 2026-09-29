@@ -9,6 +9,7 @@
 export const SESSION_PATH = '/admin/api/session'
 export const PROVIDERS_PATH = '/admin/api/providers'
 export const REQUEST_LOGS_PATH = '/admin/api/request-logs'
+export const SETTINGS_PATH = '/admin/api/settings'
 
 export type ProtocolType = 'openai' | 'anthropic'
 export type ProviderStatus = 'enabled' | 'disabled'
@@ -65,6 +66,22 @@ export interface CredentialResponse {
   provider: Provider
   gateway_api_key: string
 }
+
+export interface Setting {
+  name: string
+  label: string
+  value: string | null
+  configured: boolean
+  secret: boolean
+  restart_required: boolean
+  pending_restart: boolean
+}
+
+export interface SettingsPage {
+  items: Setting[]
+}
+
+export type SettingsPatch = Record<string, string>
 
 /** Signals that the session ended, so the page returns to its sign-in view. */
 export class SessionExpiredError extends Error {
@@ -160,6 +177,19 @@ export class AdminApi {
   rotateCredential(id: number): Promise<CredentialResponse> {
     return this.#request<CredentialResponse>(`${PROVIDERS_PATH}/${id}/gateway-key:rotate`, {
       method: 'POST',
+    })
+  }
+
+  /** Reads the process settings table. Secret values are omitted. */
+  settings(): Promise<SettingsPage> {
+    return this.#request<SettingsPage>(SETTINGS_PATH)
+  }
+
+  /** Persists setting changes. Secret fields are write-only. */
+  updateSettings(body: SettingsPatch): Promise<SettingsPage> {
+    return this.#request<SettingsPage>(SETTINGS_PATH, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
     })
   }
 }

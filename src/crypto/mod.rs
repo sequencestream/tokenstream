@@ -14,7 +14,7 @@ pub use password_work::{PasswordWork, PasswordWorkError};
 use std::error::Error;
 use std::fmt;
 
-pub use aes_gcm::{AesGcmCipher, KEY_VERSION};
+pub use aes_gcm::{AesGcmCipher, KEY_VERSION, SharedCipher};
 pub use gateway_secret::Argon2GatewaySecretVerifier;
 
 use crate::domain::{GatewayCredential, PasswordHash, SecretCiphertext, SecretString};
@@ -26,6 +26,11 @@ pub trait SecretCipher: Send + Sync {
 
     /// Opens a ciphertext envelope previously produced by [`SecretCipher::encrypt`].
     fn decrypt(&self, ciphertext: &SecretCiphertext) -> Result<SecretString, CipherError>;
+
+    /// Replaces the in-memory master key after stored secrets have been re-encrypted.
+    fn install_master_key(&self, key: &[u8; 32]) {
+        let _ = key;
+    }
 }
 
 /// A cipher failure that carries no plaintext, key material, or ciphertext.

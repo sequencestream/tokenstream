@@ -280,6 +280,56 @@ where
             .map_err(map_repository_error)
     }
 
+    pub fn cipher(&self) -> &C {
+        &self.cipher
+    }
+
+    /// Decrypts every stored upstream key with the current cipher and seals it with `next`.
+    pub async fn reencrypt_upstream_keys<N: SecretCipher>(
+        &self,
+        next: &N,
+    ) -> Result<(), ProviderServiceError> {
+        let mut after_id = None;
+        loop {
+            let page = self
+                .repository
+                .list(
+                    ProviderListRequest::new(after_id, crate::persistence::MAX_PROVIDER_PAGE_SIZE)
+                        .expect("page size is in range"),
+                )
+                .await
+                .map_err(map_repository_error)?;
+            let has_more = page.has_more();
+            let next_cursor = page.next_after_id();
+            let items = page.into_items();
+            if items.is_empty() {
+                break;
+            }
+            for provider in items {
+                let plaintext = self
+                    .cipher
+                    .decrypt(provider.upstream_api_key_ciphertext())
+                    .map_err(|_| ProviderServiceError::Cipher)?;
+                let ciphertext = next
+                    .encrypt(&plaintext)
+                    .map_err(|_| ProviderServiceError::Cipher)?;
+                self.repository
+                    .update(
+                        provider.id(),
+                        crate::persistence::ProviderUpdate::new()
+                            .with_upstream_api_key_ciphertext(ciphertext),
+                    )
+                    .await
+                    .map_err(map_repository_error)?;
+            }
+            if !has_more {
+                break;
+            }
+            after_id = next_cursor;
+        }
+        Ok(())
+    }
+
     /// Builds a service over the given storage and cryptographic collaborators.
     ///
     /// `allow_insecure_endpoints` admits plain-HTTP endpoints and must only be

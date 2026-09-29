@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => {
   const controlPlane =
     process.env.TOKENSTREAM_ADMIN_PROXY_TARGET ||
     env.TOKENSTREAM_ADMIN_PROXY_TARGET ||
-    'http://127.0.0.1:3001'
+    'http://127.0.0.1:3301'
   const proxied = ['/admin/api', '/healthz', '/metrics']
 
   return {

@@ -1,6 +1,6 @@
 use tokenstream::admin::AdminApi;
 use tokenstream::config::Config;
-use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
+use tokenstream::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::proxy::gateway::Gateway;
 use tokenstream::telemetry::Metrics;
@@ -20,6 +20,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!(
         "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
     );
+    if let Some(data_dir) = config.data_dir() {
+        eprintln!("Data directory {}", data_dir.display());
+    }
+    if config.uses_default_admin_password() {
+        eprintln!(
+            "Default administrator password is {}; change it from the administration page.",
+            tokenstream::local_state::DEFAULT_ADMIN_PASSWORD
+        );
+    }
     if let Some(root) = config.admin_static_root() {
         eprintln!("Administration page served from {}", root.display());
     }
@@ -49,9 +58,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tokenstream::crypto::PasswordWork::new(config.data_password_concurrency());
     let admin_password_work =
         tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
+    let cipher = SharedCipher::new(config.master_key().expose());
     let mut admin_api = AdminApi::new(
         database.clone(),
-        AesGcmCipher::new(config.master_key().expose()),
+        cipher.clone(),
         Argon2GatewaySecretVerifier::new(),
         config.development_mode(),
         config.admin_password_hash().expose().to_owned(),
@@ -64,12 +74,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // A configured page directory is confirmed before either listener binds, so
     // a deployment never comes up claiming to serve a page it cannot serve.
     admin_api.verify_assets()?;
-    let gateway = Gateway::with_password_work(
+    let gateway = Gateway::with_shared_cipher(
         &config,
         database.clone(),
         log_sink.clone(),
         metrics.clone(),
         data_password_work,
+        cipher,
     );
     tokenstream::run_with_control_and_logging(
         config.data_listen_addr(),

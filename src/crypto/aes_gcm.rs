@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use std::sync::{Arc, RwLock};
+
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, KeyInit, Nonce};
 use base64::Engine as _;
@@ -76,6 +78,54 @@ impl SecretCipher for AesGcmCipher {
             .map_err(|_| CipherError::Decryption);
         plaintext.zeroize();
         secret
+    }
+}
+
+/// A process-wide cipher whose key can be replaced after stored secrets are re-encrypted.
+#[derive(Clone)]
+pub struct SharedCipher {
+    inner: Arc<RwLock<AesGcmCipher>>,
+}
+
+impl SharedCipher {
+    /// Builds a shared cipher over a 32-byte master key.
+    pub fn new(master_key: &[u8; 32]) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(AesGcmCipher::new(master_key))),
+        }
+    }
+
+    /// Replaces the in-memory key. Stored ciphertexts must already use this key.
+    pub fn install(&self, master_key: &[u8; 32]) {
+        *self.inner.write().expect("cipher lock is not poisoned") = AesGcmCipher::new(master_key);
+    }
+}
+
+impl SecretCipher for SharedCipher {
+    fn encrypt(&self, plaintext: &SecretString) -> Result<SecretCiphertext, CipherError> {
+        self.inner
+            .read()
+            .expect("cipher lock is not poisoned")
+            .encrypt(plaintext)
+    }
+
+    fn decrypt(&self, ciphertext: &SecretCiphertext) -> Result<SecretString, CipherError> {
+        self.inner
+            .read()
+            .expect("cipher lock is not poisoned")
+            .decrypt(ciphertext)
+    }
+
+    fn install_master_key(&self, key: &[u8; 32]) {
+        self.install(key);
+    }
+}
+
+impl fmt::Debug for SharedCipher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SharedCipher")
+            .finish_non_exhaustive()
     }
 }
 

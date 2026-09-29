@@ -5,6 +5,7 @@ import { AdminApi, type ProviderStatus, type ProtocolType } from './api/client.t
 import { emptyLogFilters, logFiltersChanged, type LogFilterValues } from './logs/filters.ts'
 import { loadLogs, type LogPage } from './logs/list.ts'
 import { emptyProviderPage, loadProviders, type ProviderPage } from './providers/list.ts'
+import { loadSettings } from './settings/list.ts'
 import { useAdminSession } from './session/useAdminSession.ts'
 
 const api = new AdminApi()
@@ -14,7 +15,10 @@ const password = ref('')
 const busy = ref(false)
 const notice = ref('')
 const errorMessage = ref('')
-const activeView = ref<'providers' | 'logs'>('providers')
+const activeView = ref<'providers' | 'logs' | 'settings'>('providers')
+
+const settingsPage = ref({ items: [] as import('./api/client.ts').Setting[] })
+const settingDrafts = ref<Record<string, string>>({})
 
 const providerPage = ref<ProviderPage>({ ...emptyProviderPage })
 const editingProviderId = ref<number | null>(null)
@@ -79,12 +83,15 @@ async function runAction(action: () => Promise<void>) {
 async function restoreSession() {
   if (await session.restore()) {
     await runAction(async () => {
-      const [nextProviders, nextLogs] = await Promise.all([
+      const [nextProviders, nextLogs, nextSettings] = await Promise.all([
         loadProviders(api, providerPage.value, true),
         loadLogs(api, logPage.value, appliedLogFilters, true),
+        loadSettings(api),
       ])
       providerPage.value = nextProviders
       logPage.value = nextLogs
+      settingsPage.value = nextSettings
+      resetSettingDrafts()
     })
   }
 }
@@ -93,12 +100,15 @@ async function signIn() {
   await runAction(async () => {
     await session.signIn(password.value)
     password.value = ''
-    const [nextProviders, nextLogs] = await Promise.all([
+    const [nextProviders, nextLogs, nextSettings] = await Promise.all([
       loadProviders(api, providerPage.value, true),
       loadLogs(api, logPage.value, appliedLogFilters, true),
+      loadSettings(api),
     ])
     providerPage.value = nextProviders
     logPage.value = nextLogs
+    settingsPage.value = nextSettings
+    resetSettingDrafts()
   })
 }
 
@@ -230,6 +240,38 @@ function resetLogFilters() {
   void applyLogFilters()
 }
 
+function resetSettingDrafts() {
+  const drafts: Record<string, string> = {}
+  for (const item of settingsPage.value.items) {
+    drafts[item.name] = item.secret ? '' : (item.value ?? '')
+  }
+  settingDrafts.value = drafts
+}
+
+async function saveSettings() {
+  await runAction(async () => {
+    const patch: Record<string, string> = {}
+    for (const item of settingsPage.value.items) {
+      const draft = settingDrafts.value[item.name] ?? ''
+      if (item.secret) {
+        if (draft) patch[item.name] = draft
+        continue
+      }
+      if (draft !== (item.value ?? '')) patch[item.name] = draft
+    }
+    if (Object.keys(patch).length === 0) {
+      notice.value = 'No settings were changed.'
+      return
+    }
+    settingsPage.value = await api.updateSettings(patch)
+    resetSettingDrafts()
+    const pending = settingsPage.value.items.some((item) => item.pending_restart)
+    notice.value = pending
+      ? 'Settings saved. Some values apply after the process restarts.'
+      : 'Settings saved.'
+  })
+}
+
 function formatDate(value: string | null) {
   if (!value) return '—'
   return new Intl.DateTimeFormat(undefined, {
@@ -278,11 +320,12 @@ onMounted(restoreSession)
       <section class="page-heading">
         <div>
           <p class="eyebrow">Administration</p>
-          <h1>{{ activeView === 'providers' ? 'Providers' : 'Request logs' }}</h1>
+          <h1>{{ activeView === 'providers' ? 'Providers' : activeView === 'logs' ? 'Request logs' : 'Settings' }}</h1>
         </div>
         <nav class="tabs" aria-label="Administration views">
           <button :class="{ active: activeView === 'providers' }" @click="activeView = 'providers'">Providers</button>
           <button :class="{ active: activeView === 'logs' }" @click="activeView = 'logs'">Request logs</button>
+          <button :class="{ active: activeView === 'settings' }" @click="activeView = 'settings'">Settings</button>
         </nav>
       </section>
 
@@ -365,7 +408,7 @@ onMounted(restoreSession)
         </section>
       </template>
 
-      <template v-else>
+      <template v-else-if="activeView === 'logs'">
         <section class="card filters-card">
           <form class="filters" @submit.prevent="applyLogFilters">
             <label>Provider<select v-model="logFilters.provider_id"><option value="">All providers</option><option v-for="provider in providers" :key="provider.id" :value="String(provider.id)">{{ provider.name }}</option></select></label>
@@ -398,6 +441,53 @@ onMounted(restoreSession)
           </div>
           <div v-if="logPage.items.length === 0" class="empty-state">No request metadata matches these filters.</div>
           <button v-if="!logPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreLogs">Load more</button>
+        </section>
+      </template>
+
+      <template v-else>
+        <section class="card table-card">
+          <div class="section-title settings-heading">
+            <div>
+              <p class="eyebrow">Process</p>
+              <h2>Settings</h2>
+            </div>
+            <span class="section-note">Secrets are write-only. Bind-time values apply after restart.</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Setting</th>
+                  <th>Value</th>
+                  <th>Applies</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in settingsPage.items" :key="item.name">
+                  <td>
+                    <strong>{{ item.label }}</strong>
+                    <small>{{ item.name }}</small>
+                  </td>
+                  <td>
+                    <input
+                      v-model="settingDrafts[item.name]"
+                      :type="item.secret ? 'password' : 'text'"
+                      :placeholder="item.secret ? 'unchanged' : ''"
+                      :autocomplete="item.secret ? 'new-password' : 'off'"
+                    />
+                  </td>
+                  <td>
+                    <span v-if="item.pending_restart" class="badge incomplete">Restart pending</span>
+                    <span v-else-if="item.restart_required" class="badge neutral">Next start</span>
+                    <span v-else class="badge enabled">Live</span>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="actions settings-actions">
+            <button class="button primary" :disabled="busy" @click="saveSettings">Save settings</button>
+          </div>
         </section>
       </template>
     </main>
@@ -490,6 +580,10 @@ td small { display: block; margin-top: .35rem; color: #9a3d33; }
 .empty-state { padding: 3rem 1rem; color: #738078; text-align: center; }
 .load-more { display: block; margin: 1rem auto; }
 .filters-pending { margin-top: 1rem; color: #6a756e; font-size: .82rem; }
+.settings-heading { padding: 1.5rem 1.5rem 0; }
+.settings-actions { padding: 1rem 1.5rem 1.5rem; }
+td input { min-width: 16rem; }
+td small { display: block; margin-top: .35rem; color: #7a857d; font-weight: 500; letter-spacing: 0; text-transform: none; }
 
 @media (max-width: 780px) {
   .login-layout { grid-template-columns: 1fr; align-content: center; gap: 2rem; padding: 3rem 0; }
@@ -590,6 +684,10 @@ td small { display: block; margin-top: .35rem; color: #9a3d33; }
 .empty-state { padding: 3rem 1rem; color: #738078; text-align: center; }
 .load-more { display: block; margin: 1rem auto; }
 .filters-pending { margin-top: 1rem; color: #6a756e; font-size: .82rem; }
+.settings-heading { padding: 1.5rem 1.5rem 0; }
+.settings-actions { padding: 1rem 1.5rem 1.5rem; }
+td input { min-width: 16rem; }
+td small { display: block; margin-top: .35rem; color: #7a857d; font-weight: 500; letter-spacing: 0; text-transform: none; }
 
 @media (max-width: 780px) {
   .login-layout { grid-template-columns: 1fr; align-content: center; gap: 2rem; padding: 3rem 0; }

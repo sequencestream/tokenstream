@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::ControlPlaneService;
 use crate::admin::assets::{AdminAssets, PAGE_CONTENT_SECURITY_POLICY};
+use crate::config::Config;
 use crate::crypto::{
     AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, PasswordWorkError,
-    SecretCipher,
+    SecretCipher, SharedCipher,
 };
 use crate::domain::{
     ProtocolType, ProviderAdminView, ProviderCursor, ProviderId, ProviderStatus, RequestLog,
@@ -48,15 +49,22 @@ type ApiBody = Full<Bytes>;
 pub struct AdminApi<R, C, V> {
     repository: R,
     providers: Arc<ProviderService<R, C, V>>,
-    password_hash: Arc<str>,
+    password_hash: Arc<Mutex<Arc<str>>>,
     password_work: crate::crypto::PasswordWork,
-    body_timeout: Duration,
+    body_timeout: Arc<Mutex<Duration>>,
     connection_settings: crate::ConnectionSettings,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
-    session_ttl: Duration,
+    session_ttl: Arc<Mutex<Duration>>,
     assets: Option<AdminAssets>,
-    development_mode: bool,
+    development_mode: Arc<Mutex<bool>>,
     metrics: Metrics,
+    process: Option<Arc<Mutex<ProcessSettings>>>,
+}
+
+struct ProcessSettings {
+    startup: Config,
+    desired: Config,
+    overlay: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -86,7 +94,7 @@ where
             password_hash,
             DEFAULT_SESSION_TTL,
         );
-        api.development_mode = allow_insecure_endpoints;
+        api.development_mode = Arc::new(Mutex::new(allow_insecure_endpoints));
         api
     }
 
@@ -106,15 +114,16 @@ where
                 allow_insecure_endpoints,
             )),
             repository,
-            password_hash: password_hash.into(),
+            password_hash: Arc::new(Mutex::new(password_hash.into())),
             password_work: crate::crypto::PasswordWork::default(),
-            body_timeout: Duration::from_secs(30),
+            body_timeout: Arc::new(Mutex::new(Duration::from_secs(30))),
             connection_settings: crate::ConnectionSettings::default(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            session_ttl,
+            session_ttl: Arc::new(Mutex::new(session_ttl)),
             assets: None,
-            development_mode: false,
+            development_mode: Arc::new(Mutex::new(false)),
             metrics: Metrics::default(),
+            process: None,
         }
     }
 
@@ -127,10 +136,19 @@ where
         Arc::get_mut(&mut self.providers)
             .expect("unshared provider service")
             .set_password_work(work);
-        self.body_timeout = config.admin_body_timeout();
+        self.body_timeout = Arc::new(Mutex::new(config.admin_body_timeout()));
         self.connection_settings = crate::ConnectionSettings::control(config);
-        self.development_mode = config.development_mode();
-        self.session_ttl = config.admin_session_ttl();
+        self.development_mode = Arc::new(Mutex::new(config.development_mode()));
+        self.session_ttl = Arc::new(Mutex::new(config.admin_session_ttl()));
+        let overlay = config
+            .data_dir()
+            .and_then(|dir| crate::local_state::load_overlay(dir).ok())
+            .unwrap_or_default();
+        self.process = Some(Arc::new(Mutex::new(ProcessSettings {
+            startup: config.clone(),
+            desired: config.clone(),
+            overlay,
+        })));
         self
     }
 
@@ -147,7 +165,12 @@ where
         self
     }
 
-    /// Serves the compiled administration page from a configured directory.
+    fn current_body_timeout(&self) -> Duration {
+        *self
+            .body_timeout
+            .lock()
+            .expect("body timeout lock is not poisoned")
+    }
     pub fn with_assets(mut self, root: &std::path::Path) -> Self {
         self.assets = Some(AdminAssets::new(root));
         self
@@ -249,6 +272,13 @@ where
                 method_not_allowed()
             };
         }
+        if path == "/admin/api/settings" {
+            return match method {
+                Method::GET => self.list_settings(),
+                Method::PATCH => self.patch_settings(request).await,
+                _ => method_not_allowed(),
+            };
+        }
         if let Some((id, rotate)) = provider_item_path(&path) {
             let Ok(id) = ProviderId::try_from(id) else {
                 return invalid_input("Provider ID must be a positive integer.");
@@ -291,11 +321,16 @@ where
         B: Body<Data = Bytes> + Send + 'static,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
-        let Ok(input) = read_json::<_, SignInRequest>(request.into_body(), self.body_timeout).await
+        let Ok(input) =
+            read_json::<_, SignInRequest>(request.into_body(), self.current_body_timeout()).await
         else {
             return invalid_input("A valid JSON password is required.");
         };
-        let hash = self.password_hash.clone();
+        let hash = self
+            .password_hash
+            .lock()
+            .expect("password hash lock is not poisoned")
+            .clone();
         let password = SecretString::new(input.password);
         let verified = match self
             .password_work
@@ -333,15 +368,19 @@ where
                 "No administration session capacity is available.",
             );
         }
+        let session_ttl = *self
+            .session_ttl
+            .lock()
+            .expect("session ttl lock is not poisoned");
         sessions.insert(
             session_token.clone(),
             Session {
                 csrf_token: csrf_token.clone(),
-                expires_at: now + self.session_ttl,
+                expires_at: now + session_ttl,
             },
         );
         drop(sessions);
-        let max_age = self.session_ttl.as_secs();
+        let max_age = session_ttl.as_secs();
         let mut response = json_response(
             StatusCode::OK,
             &SessionView {
@@ -368,7 +407,11 @@ where
     /// keep the cookie on; it drops only that flag and retains `HttpOnly` and
     /// `SameSite=Strict`, which is what allows the same page to run locally.
     fn session_cookie(&self, prefix: &str) -> String {
-        let secure = if self.development_mode {
+        let secure = if *self
+            .development_mode
+            .lock()
+            .expect("development mode lock is not poisoned")
+        {
             ""
         } else {
             " Secure;"
@@ -411,7 +454,8 @@ where
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let Ok(input) =
-            read_json::<_, CreateProviderBody>(request.into_body(), self.body_timeout).await
+            read_json::<_, CreateProviderBody>(request.into_body(), self.current_body_timeout())
+                .await
         else {
             return invalid_input("Invalid provider configuration.");
         };
@@ -456,7 +500,8 @@ where
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         let Ok(input) =
-            read_json::<_, UpdateProviderBody>(request.into_body(), self.body_timeout).await
+            read_json::<_, UpdateProviderBody>(request.into_body(), self.current_body_timeout())
+                .await
         else {
             return invalid_input("Invalid provider configuration.");
         };
@@ -503,6 +548,148 @@ where
             }
             Err(error) => self.provider_error(error),
         }
+    }
+
+    fn list_settings(&self) -> Response<ApiBody> {
+        let Some(process) = &self.process else {
+            return json_response(StatusCode::OK, &SettingsListView { items: Vec::new() });
+        };
+        let process = process.lock().expect("settings lock is not poisoned");
+        let items = crate::local_state::setting_catalog()
+            .iter()
+            .map(|spec| setting_view(spec, &process.startup, &process.desired))
+            .collect();
+        json_response(StatusCode::OK, &SettingsListView { items })
+    }
+
+    async fn patch_settings<B>(&self, request: Request<B>) -> Response<ApiBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let Some(process) = &self.process else {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "Process settings are not available.",
+            );
+        };
+        let Ok(input) = read_json::<_, HashMap<String, String>>(
+            request.into_body(),
+            self.current_body_timeout(),
+        )
+        .await
+        else {
+            return invalid_input("Invalid settings.");
+        };
+        if input.is_empty() {
+            return invalid_input("No setting was supplied.");
+        }
+        for name in input.keys() {
+            if crate::local_state::spec_for(name).is_none() {
+                return invalid_input("Unknown setting.");
+            }
+        }
+
+        let (mut values, data_dir) = {
+            let process = process.lock().expect("settings lock is not poisoned");
+            (
+                process.desired.to_env_map(),
+                process.desired.data_dir().map(ToOwned::to_owned),
+            )
+        };
+        let mut new_password_hash = None;
+        let mut new_master = None;
+        for (name, value) in &input {
+            let spec = crate::local_state::spec_for(name).expect("catalog name");
+            if spec.secret && value.is_empty() {
+                continue;
+            }
+            match name.as_str() {
+                "TOKENSTREAM_ADMIN_PASSWORD" => {
+                    let hash = match crate::local_state::hash_admin_password(value) {
+                        Ok(hash) => hash,
+                        Err(_) => return invalid_input("Invalid administrator password."),
+                    };
+                    values.insert("TOKENSTREAM_ADMIN_PASSWORD_HASH".to_owned(), hash.clone());
+                    new_password_hash = Some(hash);
+                }
+                "TOKENSTREAM_MASTER_KEY" => {
+                    new_master = Some(value.clone());
+                    values.insert(name.clone(), value.clone());
+                }
+                _ => {
+                    values.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        let desired = match Config::from_map(&values) {
+            Ok(config) => config.with_data_dir(data_dir.clone()),
+            Err(_) => return invalid_input("Invalid setting value."),
+        };
+
+        if let Some(hash) = new_password_hash {
+            if let Some(data_dir) = data_dir.as_deref()
+                && crate::local_state::save_admin_hash_file(data_dir, &hash).is_err()
+            {
+                return internal_error();
+            }
+            *self
+                .password_hash
+                .lock()
+                .expect("password hash lock is not poisoned") = Arc::from(hash);
+        }
+
+        if let Some(hex) = new_master {
+            let key = match crate::config::decode_master_key_for_admin(&hex) {
+                Ok(key) => key,
+                Err(_) => return invalid_input("Invalid master key."),
+            };
+            let next = AesGcmCipher::new(&key);
+            if self.providers.reencrypt_upstream_keys(&next).await.is_err() {
+                return internal_error();
+            }
+            self.providers.cipher().install_master_key(&key);
+            if let Some(data_dir) = data_dir.as_deref()
+                && crate::local_state::save_master_key_file(data_dir, &hex).is_err()
+            {
+                return internal_error();
+            }
+        }
+
+        {
+            let mut process = process.lock().expect("settings lock is not poisoned");
+            for (name, value) in &input {
+                let spec = crate::local_state::spec_for(name).expect("catalog name");
+                if spec.secret {
+                    continue;
+                }
+                process.overlay.insert(name.clone(), value.clone());
+            }
+            let overlay_dir = desired
+                .data_dir()
+                .map(ToOwned::to_owned)
+                .or_else(|| process.desired.data_dir().map(ToOwned::to_owned));
+            if let Some(data_dir) = overlay_dir.as_deref()
+                && crate::local_state::save_overlay(data_dir, &process.overlay).is_err()
+            {
+                return internal_error();
+            }
+            *self
+                .body_timeout
+                .lock()
+                .expect("body timeout lock is not poisoned") = desired.admin_body_timeout();
+            *self
+                .session_ttl
+                .lock()
+                .expect("session ttl lock is not poisoned") = desired.admin_session_ttl();
+            *self
+                .development_mode
+                .lock()
+                .expect("development mode lock is not poisoned") = desired.development_mode();
+            process.desired = desired;
+        }
+        self.list_settings()
     }
 
     async fn list_request_logs(&self, query: Option<&str>) -> Response<ApiBody> {
@@ -568,7 +755,7 @@ where
     }
 }
 
-impl ControlPlaneService for AdminApi<Database, AesGcmCipher, Argon2GatewaySecretVerifier> {
+impl ControlPlaneService for AdminApi<Database, SharedCipher, Argon2GatewaySecretVerifier> {
     fn connection_settings(&self) -> crate::ConnectionSettings {
         self.connection_settings
     }
@@ -618,6 +805,53 @@ struct ProviderListView {
 struct CredentialView {
     provider: ProviderAdminView,
     gateway_api_key: String,
+}
+
+#[derive(Serialize)]
+struct SettingsListView {
+    items: Vec<SettingItemView>,
+}
+
+#[derive(Serialize)]
+struct SettingItemView {
+    name: &'static str,
+    label: &'static str,
+    value: Option<String>,
+    configured: bool,
+    secret: bool,
+    restart_required: bool,
+    pending_restart: bool,
+}
+
+fn setting_view(
+    spec: &crate::local_state::SettingSpec,
+    startup: &Config,
+    desired: &Config,
+) -> SettingItemView {
+    if spec.secret {
+        return SettingItemView {
+            name: spec.name,
+            label: spec.label,
+            value: None,
+            configured: true,
+            secret: true,
+            restart_required: spec.restart_required,
+            pending_restart: false,
+        };
+    }
+    let desired_map = desired.to_env_map();
+    let startup_map = startup.to_env_map();
+    let value = desired_map.get(spec.name).cloned();
+    let pending_restart = spec.restart_required && startup_map.get(spec.name) != value.as_ref();
+    SettingItemView {
+        name: spec.name,
+        label: spec.label,
+        value,
+        configured: true,
+        secret: false,
+        restart_required: spec.restart_required,
+        pending_restart,
+    }
 }
 
 #[derive(Serialize)]

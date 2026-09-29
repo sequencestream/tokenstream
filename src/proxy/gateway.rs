@@ -11,7 +11,7 @@ use hyper::{Request, Response};
 
 use crate::auth::GatewayAuthenticator;
 use crate::config::Config;
-use crate::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
+use crate::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
 use crate::domain::{RequestId, TransportType};
 use crate::logging::{LogSink, RequestLogLifecycle, observe_response};
 use crate::persistence::Database;
@@ -35,7 +35,7 @@ where
 }
 
 pub struct Gateway {
-    authenticator: GatewayAuthenticator<Database, AesGcmCipher, Argon2GatewaySecretVerifier>,
+    authenticator: GatewayAuthenticator<Database, SharedCipher, Argon2GatewaySecretVerifier>,
     http: HttpProxy<Incoming>,
     websocket: WebSocketProxy,
     logs: LogSink,
@@ -60,11 +60,29 @@ impl Gateway {
         metrics: Metrics,
         work: crate::crypto::PasswordWork,
     ) -> Self {
+        Self::with_shared_cipher(
+            config,
+            database,
+            logs,
+            metrics,
+            work,
+            SharedCipher::new(config.master_key().expose()),
+        )
+    }
+
+    pub fn with_shared_cipher(
+        config: &Config,
+        database: Database,
+        logs: LogSink,
+        metrics: Metrics,
+        work: crate::crypto::PasswordWork,
+        cipher: SharedCipher,
+    ) -> Self {
         Self {
             settings: crate::ConnectionSettings::data(config),
             authenticator: GatewayAuthenticator::new(
                 database,
-                AesGcmCipher::new(config.master_key().expose()),
+                cipher,
                 Argon2GatewaySecretVerifier::new(),
             )
             .with_password_work(work),

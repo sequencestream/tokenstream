@@ -411,3 +411,87 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     );
     assert_eq!(conflict["error"]["code"], "provider_in_use");
 }
+
+#[tokio::test]
+async fn settings_table_lists_and_updates_live_password() {
+    let (api, _, directory) = api(Duration::from_secs(60)).await;
+    let state = directory.path().join("state");
+    std::fs::create_dir_all(&state).expect("state directory");
+    let mut values = std::collections::HashMap::new();
+    values.insert("TOKENSTREAM_DEVELOPMENT_MODE".into(), "false".into());
+    let config = tokenstream::config::Config::from_map(&values)
+        .expect("defaults")
+        .with_data_dir(Some(state));
+    let api = api.with_runtime(&config, tokenstream::crypto::PasswordWork::default());
+    let (cookie, csrf) = sign_in(&api).await;
+    let (status, headers, listed) = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/settings",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    let items = listed["items"].as_array().expect("settings");
+    assert!(
+        items
+            .iter()
+            .any(|item| item["name"] == "TOKENSTREAM_DATA_LISTEN_ADDR")
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item["name"] == "TOKENSTREAM_MASTER_KEY" && item["value"].is_null())
+    );
+
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::PATCH,
+            "/admin/api/settings",
+            json!({
+                "TOKENSTREAM_ADMIN_PASSWORD": "new-admin-password",
+                "TOKENSTREAM_ADMIN_SESSION_TTL_MS": "120000"
+            }),
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/session",
+            json!({"password": PASSWORD}),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/session",
+            json!({"password": "new-admin-password"}),
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["csrf_token"].as_str().is_some());
+}

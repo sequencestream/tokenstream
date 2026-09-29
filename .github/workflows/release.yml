@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish, for example 0.1.0
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub Release as a pre-release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.normalize.outputs.version }}
+      tag: ${{ steps.normalize.outputs.tag }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Normalize version
+        id: normalize
+        env:
+          RAW_VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          version="${RAW_VERSION#v}"
+          if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([+.-][0-9A-Za-z][0-9A-Za-z.-]*)*$'; then
+            echo "Version must look like 0.1.0" >&2
+            exit 1
+          fi
+          tag="v${version}"
+          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  frontend:
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build administration page
+        run: |
+          npm --prefix web ci
+          npm --prefix web run build
+
+      - name: Upload administration page
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-page
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    needs: [version, ci, frontend]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset: linux-amd64
+            archive: tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: linux-arm64
+            archive: tar.gz
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+            archive: tar.gz
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            asset: macos-amd64
+            archive: tar.gz
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: windows-amd64
+            archive: zip
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      - name: Download administration page
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-page
+          path: web/dist
+
+      - name: Build gateway
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+          ARCHIVE: ${{ matrix.archive }}
+        run: |
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/package-release.py
+          else
+            python scripts/package-release.py
+          fi
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenstream-${{ needs.version.outputs.version }}-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Download archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tokenstream-${{ needs.version.outputs.version }}-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -eu
+          sha256sum tokenstream-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eu
+          notes="Tokenstream ${VERSION} binaries for Linux, macOS, and Windows.
+
+          Each archive contains the gateway binary and the compiled administration page under \`admin/\`. Point \`TOKENSTREAM_ADMIN_STATIC_ROOT\` at that directory.
+
+          See the development guide for settings and launch."
+          extra=()
+          if [ "$PRERELEASE" = "true" ]; then
+            extra+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --title "tokenstream ${VERSION}" \
+            --notes "$notes" \
+            --generate-notes \
+            "${extra[@]}" \
+            dist/*
