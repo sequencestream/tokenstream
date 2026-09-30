@@ -80,6 +80,8 @@ pub enum GatewayAuthError {
     InvalidCredential,
     /// The resolved provider is disabled.
     ProviderDisabled,
+    /// The resolved provider is isolated or in a maintenance window.
+    ProviderUnhealthy,
     /// The account that owns the credential is disabled.
     AccountDisabled,
     /// The credential carries an expiration that has already passed.
@@ -102,6 +104,7 @@ impl fmt::Display for GatewayAuthError {
             Self::UnknownCredential => "gateway credential is not recognized",
             Self::InvalidCredential => "gateway credential is invalid",
             Self::ProviderDisabled => "provider is disabled",
+            Self::ProviderUnhealthy => "provider is not available",
             Self::AccountDisabled => "account is disabled",
             Self::KeyExpired => "gateway credential has expired",
             Self::NoProviderSelected => "no provider is selected for this credential",
@@ -210,6 +213,13 @@ where
             return Err(GatewayAuthError::ProviderDisabled);
         }
 
+        // An unhealthy provider refuses new work here, before any upstream is
+        // contacted and before admission consumes a slot. It never reroutes:
+        // the request fails, and it is never sent to a different provider.
+        if provider.health().refuses_new_requests() {
+            return Err(GatewayAuthError::ProviderUnhealthy);
+        }
+
         let verifier = self.verifier.clone();
         let secret = credential.secret().clone();
         let hash = api_key.secret_hash().clone();
@@ -245,7 +255,8 @@ where
                 provider.endpoint().clone(),
                 upstream_api_key,
             )
-            .with_admission(provider.admission(), api_key.admission()),
+            .with_admission(provider.admission(), api_key.admission())
+            .with_health(provider.health()),
         ))
     }
 

@@ -74,7 +74,7 @@ async fn postgres_schema_matches_sqlite_constraints() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT c.relname AS name
@@ -292,6 +292,32 @@ async fn postgres_admission_bounds_default_to_unbounded_and_refuse_zero() {
                 .await
                 .is_err(),
             "expected {statement} to be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn postgres_provider_health_is_complete_bounded_and_closed() {
+    let url = require_postgres_url("the PostgreSQL provider health migration layer");
+    let database = PostgresDatabase::connect(&url, 2)
+        .await
+        .expect("connect to PostgreSQL");
+    database.migrate().await.expect("migrations");
+    let provider_id = insert_provider(database.pool(), &unique_value("health-provider")).await;
+
+    for statement in [
+        "UPDATE provider SET health = 'unknown' WHERE id = $1",
+        "UPDATE provider SET probe_path = '/ready' WHERE id = $1",
+        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 86400001, probe_timeout_ms = 1000, probe_failure_threshold = 2 WHERE id = $1",
+        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 1000, probe_timeout_ms = 1000, probe_failure_threshold = 1001 WHERE id = $1",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(provider_id)
+                .execute(database.pool())
+                .await
+                .is_err(),
+            "schema accepted invalid health statement: {statement}"
         );
     }
 }

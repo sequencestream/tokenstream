@@ -15,6 +15,7 @@ export const SETTINGS_PATH = '/admin/api/settings'
 
 export type ProtocolType = 'openai' | 'anthropic'
 export type ProviderStatus = 'enabled' | 'disabled'
+export type ProviderHealthState = 'healthy' | 'isolated' | 'maintenance'
 export type TransportType = 'http' | 'websocket'
 export type AccountRole = 'admin' | 'user'
 export type AccountStatus = 'enabled' | 'disabled'
@@ -80,7 +81,23 @@ export interface Provider {
   /** Admission bounds. Null means unbounded. */
   max_concurrent_requests: number | null
   max_requests_per_second: number | null
+  health: ProviderHealthState
+  health_probe: ProviderHealthProbe | null
   created_at: string
+}
+
+export interface ProviderHealthProbe {
+  probe_path: string
+  failure_threshold: number
+  probe_interval_ms: number
+  probe_timeout_ms: number
+}
+
+export interface ProviderHealthWrite {
+  probe_path: string | null
+  failure_threshold: number | null
+  probe_interval_ms: number | null
+  probe_timeout_ms: number | null
 }
 
 export interface ProviderAdmissionWrite {
@@ -127,6 +144,7 @@ export interface ProviderWrite {
   /** Admission bounds. Absent or null means unbounded. */
   max_concurrent_requests?: number | null
   max_requests_per_second?: number | null
+  health?: ProviderHealthWrite
 }
 
 export type ProviderUpdate = Partial<Omit<ProviderWrite, 'protocol_type'>> & {
@@ -244,6 +262,13 @@ export class AdminApi {
     return this.#request<Provider>(`${PROVIDERS_PATH}/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
+    })
+  }
+
+  /** Opens or closes the provider's manual maintenance window. */
+  setProviderMaintenance(id: number, maintenance: boolean): Promise<Provider> {
+    return this.#request<Provider>(`${PROVIDERS_PATH}/${id}/maintenance`, {
+      method: maintenance ? 'PUT' : 'DELETE',
     })
   }
 

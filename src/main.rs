@@ -112,7 +112,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_password_work,
         cipher,
     );
-    tokenstream::run_with_control_and_logging(
+    // The prober is constructed from the same repository and the same upstream
+    // connect deadline as the data plane, so a probe costs the same bounded
+    // connect a request would and never opens a connection policy of its own.
+    let health = tokenstream::providers::health::HealthProber::new(
+        database.clone(),
+        config.upstream_connect_timeout(),
+        metrics.clone(),
+    );
+    tokenstream::run_with_health(
         config.data_listen_addr(),
         config.admin_listen_addr(),
         tokenstream::RegisteredMigrations,
@@ -125,6 +133,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         events,
         log_worker,
         config.log_flush_timeout(),
+        health,
     )
     .await?;
     Ok(())

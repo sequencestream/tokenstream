@@ -86,7 +86,7 @@ async fn migrations_are_versioned_and_repeatable() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
@@ -284,4 +284,28 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
             .is_err(),
         "a zero WebSocket bound is refused"
     );
+}
+
+#[tokio::test]
+async fn provider_health_is_complete_bounded_and_closed() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = database(&directory.path().join("health-constraints.db"), 1).await;
+    database.migrate().await.expect("migrations");
+    let provider_id = insert_provider(database.pool(), "health-provider").await;
+
+    for statement in [
+        "UPDATE provider SET health = 'unknown' WHERE id = ?",
+        "UPDATE provider SET probe_path = '/ready' WHERE id = ?",
+        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 86400001, probe_timeout_ms = 1000, probe_failure_threshold = 2 WHERE id = ?",
+        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 1000, probe_timeout_ms = 1000, probe_failure_threshold = 1001 WHERE id = ?",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .bind(provider_id)
+                .execute(database.pool())
+                .await
+                .is_err(),
+            "schema accepted invalid health statement: {statement}"
+        );
+    }
 }

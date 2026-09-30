@@ -51,6 +51,8 @@ pub enum GatewayError {
     KeyExpired,
     /// The credential selected no provider and carries no default binding.
     NoProviderSelected,
+    /// The resolved provider is isolated or in a maintenance window.
+    ProviderUnhealthy,
     /// The provider cannot serve the requested method, path, or transport.
     UnsupportedRoute,
     /// The request carried an upgrade that is not the one supported upgrade.
@@ -73,6 +75,7 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => "invalid_gateway_credential",
             Self::ProviderDisabled => "provider_disabled",
+            Self::ProviderUnhealthy => "provider_unhealthy",
             Self::AccountDisabled => "account_disabled",
             Self::KeyExpired => "key_expired",
             Self::NoProviderSelected => "no_provider_selected",
@@ -91,6 +94,7 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => StatusCode::UNAUTHORIZED,
             Self::ProviderDisabled => StatusCode::FORBIDDEN,
+            Self::ProviderUnhealthy => StatusCode::SERVICE_UNAVAILABLE,
             Self::AccountDisabled => StatusCode::FORBIDDEN,
             Self::KeyExpired => StatusCode::UNAUTHORIZED,
             Self::NoProviderSelected => StatusCode::BAD_REQUEST,
@@ -116,6 +120,7 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => ProxyFailureCategory::InvalidGatewayCredential,
             Self::ProviderDisabled => ProxyFailureCategory::ProviderDisabled,
+            Self::ProviderUnhealthy => ProxyFailureCategory::ProviderUnhealthy,
             Self::AccountDisabled => ProxyFailureCategory::AccountDisabled,
             Self::KeyExpired => ProxyFailureCategory::KeyExpired,
             Self::NoProviderSelected => ProxyFailureCategory::NoProviderSelected,
@@ -136,6 +141,7 @@ impl GatewayError {
         match self {
             Self::InvalidGatewayCredential => "The gateway credential is invalid.",
             Self::ProviderDisabled => "The provider is disabled.",
+            Self::ProviderUnhealthy => "The provider is not currently available.",
             Self::AccountDisabled => "The account is disabled.",
             Self::KeyExpired => "The gateway credential has expired.",
             Self::NoProviderSelected => "No provider is selected for this credential.",
@@ -198,6 +204,7 @@ impl From<GatewayAuthError> for GatewayError {
             | GatewayAuthError::UnknownCredential
             | GatewayAuthError::InvalidCredential => Self::InvalidGatewayCredential,
             GatewayAuthError::ProviderDisabled => Self::ProviderDisabled,
+            GatewayAuthError::ProviderUnhealthy => Self::ProviderUnhealthy,
             GatewayAuthError::AccountDisabled => Self::AccountDisabled,
             GatewayAuthError::KeyExpired => Self::KeyExpired,
             GatewayAuthError::NoProviderSelected => Self::NoProviderSelected,
@@ -250,6 +257,7 @@ mod tests {
         let expected = [
             (GatewayError::InvalidGatewayCredential, 401),
             (GatewayError::ProviderDisabled, 403),
+            (GatewayError::ProviderUnhealthy, 503),
             (GatewayError::AccountDisabled, 403),
             (GatewayError::KeyExpired, 401),
             (GatewayError::NoProviderSelected, 400),
@@ -280,6 +288,10 @@ mod tests {
         for error in [
             GatewayError::InvalidGatewayCredential,
             GatewayError::ProviderDisabled,
+            GatewayError::ProviderUnhealthy,
+            GatewayError::AccountDisabled,
+            GatewayError::KeyExpired,
+            GatewayError::NoProviderSelected,
             GatewayError::UnsupportedRoute,
             GatewayError::InvalidUpgrade,
             GatewayError::UpstreamConnectFailed,
@@ -318,6 +330,10 @@ mod tests {
         assert_eq!(
             GatewayError::from(GatewayAuthError::ProviderDisabled),
             GatewayError::ProviderDisabled
+        );
+        assert_eq!(
+            GatewayError::from(GatewayAuthError::ProviderUnhealthy),
+            GatewayError::ProviderUnhealthy
         );
         assert_eq!(
             GatewayError::from(GatewayAuthError::Busy),

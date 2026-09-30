@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -243,6 +244,179 @@ pub fn validate_admission_bound(value: Option<i64>) -> Result<Option<u32>, Inval
     }
 }
 
+/// The widest consecutive-failure threshold storage accepts.
+///
+/// A threshold is a count of probe results, not a capacity the process could ever
+/// hold, so the ceiling rejects an obviously wrong entry rather than reserving
+/// for it. A high threshold is also self-defeating: it means an upstream has to
+/// fail this many times in a row before anyone is told.
+pub const MAX_HEALTH_THRESHOLD: u32 = 1_000;
+
+/// The widest probe interval storage accepts.
+///
+/// The ceiling is a day. An operator who wants to know less often than daily has
+/// disabled the information rather than delayed it.
+pub const MAX_PROBE_INTERVAL_MS: u64 = 86_400_000;
+
+/// A probe configuration that cannot be used.
+///
+/// Zero is refused for the same reason an admission bound of zero is: it would
+/// isolate a provider immediately, or probe it without pause, rather than
+/// describe when to do either.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidHealthSetting;
+
+impl fmt::Display for InvalidHealthSetting {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the health configuration is invalid")
+    }
+}
+
+impl Error for InvalidHealthSetting {}
+
+/// The probe configuration a request may name on a provider.
+///
+/// A provider is probed only when it names a probe path, and the path is resolved
+/// against the provider's own endpoint origin rather than being a second stored
+/// URL. That is what makes a probe incapable of leaving the origin the operator
+/// already trusted, and it is why a probe target can be validated without knowing
+/// anything about the upstream's protocol.
+///
+/// Every value is validated rather than clamped: a silent clamp is a configuration
+/// the operator did not write.
+pub fn validate_provider_probe(
+    probe_path: Option<&str>,
+    failure_threshold: Option<i64>,
+    probe_interval_ms: Option<i64>,
+    probe_timeout_ms: Option<i64>,
+) -> Result<Option<ProviderProbePath>, InvalidHealthSetting> {
+    let Some(raw) = probe_path else {
+        // A configuration carrying settings but no path describes a provider that
+        // is never probed, and completing it with a default target would assert a
+        // reachability contract the operator never agreed to.
+        if failure_threshold.is_some() || probe_interval_ms.is_some() || probe_timeout_ms.is_some()
+        {
+            return Err(InvalidHealthSetting);
+        }
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    // A probe path must be a rooted, dot-free, normalized path. Rejecting `..`
+    // keeps a probe inside the origin it was aimed at rather than letting an
+    // operator's own configuration walk the request somewhere they did not name.
+    if !trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || trimmed.chars().any(char::is_control)
+        || trimmed
+            .trim_start_matches('/')
+            .split('/')
+            .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+    {
+        return Err(InvalidHealthSetting);
+    }
+    let threshold = validate_probe_count(failure_threshold, MAX_HEALTH_THRESHOLD)?;
+    let interval = validate_probe_millis(probe_interval_ms, MAX_PROBE_INTERVAL_MS)?;
+    let timeout = validate_probe_millis(probe_timeout_ms, MAX_PROBE_INTERVAL_MS)?;
+    // A probe with a path but an unbounded number, an interval, or a timeout is
+    // a half-written configuration, and each missing piece would leave the probe
+    // undecidable: an absent threshold isolates immediately, an absent interval
+    // never probes.
+    let (Some(threshold), Some(interval), Some(timeout)) = (threshold, interval, timeout) else {
+        return Err(InvalidHealthSetting);
+    };
+    Ok(Some(ProviderProbePath {
+        path: trimmed.to_owned(),
+        interval: Duration::from_millis(interval),
+        timeout: Duration::from_millis(timeout),
+        failure_threshold: threshold,
+    }))
+}
+
+/// The validated, origin-relative description of a provider's probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderProbePath {
+    path: String,
+    interval: Duration,
+    timeout: Duration,
+    failure_threshold: u32,
+}
+
+impl ProviderProbePath {
+    /// The origin-relative path the probe is aimed at.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The interval between two probes of this provider.
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    /// The deadline one probe attempt is bounded by.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Consecutive failures needed before the provider is isolated.
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold
+    }
+
+    /// Resolves this probe against a provider endpoint, producing the target a
+    /// probe issues against.
+    ///
+    /// The path is joined onto the endpoint's own base, so a probe is always
+    /// aimed inside the origin the operator already trusts and can never walk
+    /// somewhere they did not name. The endpoint's query and fragment are
+    /// dropped: a probe asks whether the origin serves, not for a particular
+    /// resource, and a stored query string would be one more secret-shaped value
+    /// to persist per provider.
+    pub fn resolve(&self, endpoint: &Url) -> Result<ProviderProbe, InvalidHealthSetting> {
+        let base = endpoint.path().trim_end_matches('/');
+        let target = format!(
+            "{}{base}{}",
+            endpoint.origin().ascii_serialization(),
+            self.path
+        );
+        let target = Url::parse(&target).map_err(|_| InvalidHealthSetting)?;
+        ProviderProbe::new(
+            self.path.clone(),
+            target,
+            self.interval,
+            self.timeout,
+            self.failure_threshold,
+        )
+        .map_err(|_| InvalidHealthSetting)
+    }
+}
+
+/// Validates one operator-supplied positive count within a ceiling.
+fn validate_probe_count(
+    value: Option<i64>,
+    ceiling: u32,
+) -> Result<Option<u32>, InvalidHealthSetting> {
+    match value {
+        None => Ok(None),
+        Some(value) if value <= 0 || value > i64::from(ceiling) => Err(InvalidHealthSetting),
+        Some(value) => Ok(Some(value as u32)),
+    }
+}
+
+/// Validates one operator-supplied positive duration in milliseconds.
+fn validate_probe_millis(
+    value: Option<i64>,
+    ceiling: u64,
+) -> Result<Option<u64>, InvalidHealthSetting> {
+    match value {
+        None => Ok(None),
+        Some(value) if value <= 0 || value > ceiling as i64 => Err(InvalidHealthSetting),
+        Some(value) => Ok(Some(value as u64)),
+    }
+}
+
 /// The admission bounds a provider carries.
 ///
 /// A provider is bounded so one upstream cannot consume capacity that belongs to
@@ -323,6 +497,110 @@ impl CredentialAdmission {
         self.max_concurrent_requests.is_unbounded()
             && self.max_requests_per_second.is_unbounded()
             && self.max_websockets.is_unbounded()
+    }
+}
+
+/// The health state a provider is in, as observed by probes or set by an operator.
+///
+/// This is deliberately separate from the enabled state. An operator's decision and a probe's
+/// observation are different facts: collapsing them would let a probe undo a human decision, and
+/// would leave an operator unable to record that a provider is expected to be down. Only this
+/// state may refuse traffic, and it may only refuse — it never reroutes a request.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealthState {
+    /// Probes are succeeding, or none is configured. New requests are admitted.
+    #[default]
+    Healthy,
+    /// Consecutive probe failures reached the threshold. New requests are refused.
+    Isolated,
+    /// An operator opened a maintenance window. Not probed; new requests are refused.
+    Maintenance,
+}
+
+impl ProviderHealthState {
+    /// Whether a new request must be refused before any upstream is contacted.
+    ///
+    /// An already-admitted exchange is unaffected: it owns a frozen snapshot and is never cut off.
+    pub fn refuses_new_requests(self) -> bool {
+        matches!(self, Self::Isolated | Self::Maintenance)
+    }
+}
+
+/// The probe configuration a provider carries.
+///
+/// Health is opt-in per provider rather than a default, because a default probe asserts a
+/// reachability contract the gateway does not have and cannot verify. A provider that carries no
+/// probe target is never probed and therefore never isolated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderProbe {
+    path: String,
+    target: Url,
+    interval: Duration,
+    timeout: Duration,
+    failure_threshold: u32,
+}
+
+/// A probe configuration that cannot be used.
+///
+/// The same discipline as an admission bound: a value that would make probing meaningless is
+/// refused at the edge rather than clamped, because a silent clamp is a configuration the operator
+/// did not write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidProbeConfig;
+
+impl fmt::Display for InvalidProbeConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the probe configuration is invalid")
+    }
+}
+
+impl Error for InvalidProbeConfig {}
+
+impl ProviderProbe {
+    /// Builds a probe configuration, refusing a zero threshold or a zero interval or timeout.
+    pub fn new(
+        path: String,
+        target: Url,
+        interval: Duration,
+        timeout: Duration,
+        failure_threshold: u32,
+    ) -> Result<Self, InvalidProbeConfig> {
+        if failure_threshold == 0 {
+            return Err(InvalidProbeConfig);
+        }
+        if interval.is_zero() || timeout.is_zero() {
+            return Err(InvalidProbeConfig);
+        }
+        Ok(Self {
+            path,
+            target,
+            interval,
+            timeout,
+            failure_threshold,
+        })
+    }
+
+    pub fn target(&self) -> &Url {
+        &self.target
+    }
+
+    /// The origin-relative path the operator configured.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Consecutive failures needed before the provider is isolated.
+    pub fn failure_threshold(&self) -> u32 {
+        self.failure_threshold
     }
 }
 
@@ -578,7 +856,9 @@ pub struct Provider {
     endpoint: Url,
     upstream_api_key_ciphertext: SecretCiphertext,
     status: ProviderStatus,
+    health: ProviderHealthState,
     admission: ProviderAdmission,
+    probe: Option<ProviderProbe>,
     created_at: DateTime<Utc>,
 }
 
@@ -600,7 +880,9 @@ impl Provider {
             endpoint,
             upstream_api_key_ciphertext,
             status,
+            health: ProviderHealthState::default(),
             admission: ProviderAdmission::default(),
+            probe: None,
             created_at,
         }
     }
@@ -635,6 +917,28 @@ impl Provider {
         self.status
     }
 
+    /// The observed health state of this provider.
+    pub fn health(&self) -> ProviderHealthState {
+        self.health
+    }
+
+    /// Rebuilds a stored provider with the health state storage returned.
+    pub fn with_health(mut self, health: ProviderHealthState) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// Rebuilds a stored provider with the probe configuration storage returned.
+    pub fn with_probe(mut self, probe: Option<ProviderProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    /// The probe configuration, absent when this provider is never probed.
+    pub fn probe(&self) -> Option<&ProviderProbe> {
+        self.probe.as_ref()
+    }
+
     /// The admission bounds this provider carries.
     pub fn admission(&self) -> ProviderAdmission {
         self.admission
@@ -661,6 +965,7 @@ pub struct ProviderSnapshot {
     upstream_api_key: SecretString,
     provider_admission: ProviderAdmission,
     credential_admission: CredentialAdmission,
+    health: ProviderHealthState,
 }
 
 impl ProviderSnapshot {
@@ -681,7 +986,23 @@ impl ProviderSnapshot {
             upstream_api_key,
             provider_admission: ProviderAdmission::default(),
             credential_admission: CredentialAdmission::default(),
+            health: ProviderHealthState::default(),
         }
+    }
+
+    /// Freezes the provider's health state alongside the rest of the snapshot.
+    ///
+    /// The state is read once, when the request is admitted, so a provider that
+    /// becomes unhealthy afterwards cannot cut off a stream that is already
+    /// running. Only new requests consult the current state.
+    pub fn with_health(mut self, health: ProviderHealthState) -> Self {
+        self.health = health;
+        self
+    }
+
+    /// The health state frozen when this request was admitted.
+    pub fn health(&self) -> ProviderHealthState {
+        self.health
     }
 
     /// Attaches the admission bounds frozen from the credential and the
@@ -987,11 +1308,31 @@ pub struct ProviderAdminView {
     pub protocol_type: ProtocolType,
     pub endpoint: String,
     pub status: ProviderStatus,
+    /// The observed health state. Kept beside the enabled status rather than
+    /// merged into it: one is an operator's decision and the other is an
+    /// observation, and an operator needs to see which is which.
+    pub health: ProviderHealthState,
     pub has_upstream_api_key: bool,
     /// This provider's own admission bounds. Absent means unbounded.
     pub max_concurrent_requests: Option<u32>,
     pub max_requests_per_second: Option<u32>,
+    /// The health probe. Every field is absent together, so an absent object
+    /// means this provider is never probed.
+    pub health_probe: Option<ProviderProbeView>,
     pub created_at: DateTime<Utc>,
+}
+
+/// The probe a provider is checked with, as the administration view shows it.
+///
+/// The target is reported as the path the operator configured, not as the URL it
+/// resolves to, because the path is what they wrote and the origin is already
+/// shown beside it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProviderProbeView {
+    pub probe_path: String,
+    pub failure_threshold: u32,
+    pub probe_interval_ms: u64,
+    pub probe_timeout_ms: u64,
 }
 
 impl From<&Provider> for ProviderAdminView {
@@ -1002,9 +1343,16 @@ impl From<&Provider> for ProviderAdminView {
             protocol_type: provider.protocol_type,
             endpoint: provider.endpoint.to_string(),
             status: provider.status,
+            health: provider.health(),
             has_upstream_api_key: true,
             max_concurrent_requests: provider.admission().max_concurrent_requests().get(),
             max_requests_per_second: provider.admission().max_requests_per_second().get(),
+            health_probe: provider.probe().map(|probe| ProviderProbeView {
+                probe_path: probe.path().to_owned(),
+                failure_threshold: probe.failure_threshold(),
+                probe_interval_ms: probe.interval().as_millis().min(u128::from(u64::MAX)) as u64,
+                probe_timeout_ms: probe.timeout().as_millis().min(u128::from(u64::MAX)) as u64,
+            }),
             created_at: provider.created_at,
         }
     }

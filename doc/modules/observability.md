@@ -45,6 +45,9 @@ added series, not a changed meaning, which is what fixing the label set now buys
 | Lifecycle events attempted | subscriber | Non-blocking hand-offs the proxy attempted |
 | Lifecycle events dropped | subscriber | Copies a subscriber lost to a full, closed, or abandoned queue |
 | Admission refusals | layer, reason | Requests a gate refused before they became work |
+| Health refusals | — | Requests an isolated provider refused before they became work |
+| Provider health probes | outcome | Probes the gateway issued against its own configured probe paths |
+| Providers by health state | state | Providers currently healthy, isolated, or in maintenance |
 
 Pass and fail totals are derived from the completed-exchange counter rather than recorded separately,
 because two counters for one fact can disagree, and a disagreement between a total and its parts is
@@ -60,6 +63,18 @@ allowance, and a credential long-lived-connection bound. The layer is what an op
 "the credential rate bound refused four hundred requests" and "the provider concurrency bound refused
 four hundred requests" are the same visible symptom and two different fixes.
 
+Upstream health adds three series and no dimension ([ADR 0018](../adr/0018-probe-derived-provider-isolation.md)).
+A probe outcome is a closed set of three: the upstream answered below 500, answered at or above 500, or
+the probe never reached a response at all. The distinction between the last two is worth keeping
+because they are different faults — an upstream that is answering with errors is reachable and an
+upstream that is not answering is not — but neither is a provider dimension, and both are counted rather
+than labelled per provider. The count of providers by state is what makes isolation visible to an
+alert; which provider is isolated is read from the administration view, not from a metric.
+
+A provider that is not configured for probing contributes no observations or state count. The closed
+series still render at zero, so the exposition has the same fixed shape before and after probing is
+enabled.
+
 ## Where each fact is recorded
 
 Each fact is recorded at the single point where it is decided, and nowhere else.
@@ -68,7 +83,14 @@ A request that a gate refuses produces a refusal and only a refusal. It produces
 because it never became work the proxy runs, and no result fact, because there is no exchange to
 classify. This is what stops a shed request from being counted twice — once as a refusal and once as the
 failure of an exchange that never started — and it is why a process shedding load under pressure is
-visible rather than merely quiet.
+visible rather than merely quiet. A request refused because its provider is isolated is refused at the
+same point and for the same reason: it never became an exchange, so counting it as a failure of work
+that never ran would overstate the error rate of a gateway that is behaving correctly.
+
+A probe result is recorded by the probe itself, at the point the probe's own response or failure is
+decided, because that is the only place the outcome exists. A probe is not a client request and
+produces no lifecycle event: the event set describes request lifecycles, and widening it to carry
+provider maintenance would add a second kind of event to a set that is closed for a reason.
 
 An admitted exchange raises its in-flight gauge, and at the terminal point increments exactly one
 completed-exchange counter, records exactly one latency observation, and releases exactly one gauge. The

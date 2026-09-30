@@ -274,6 +274,77 @@ where
     .await
 }
 
+/// Runs both planes with the provider health prober, the administration service,
+/// and bounded shutdown of every background task.
+///
+/// The prober is the one task that contacts an upstream on a schedule rather than
+/// on a request, so it is joined here rather than inside a listener: a stopping
+/// process must not leave a probe in flight, and the same bounded wait that
+/// flushes the log writer bounds this one.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_with_health<M, D, C, S, L>(
+    data_address: SocketAddr,
+    control_address: SocketAddr,
+    migrations: M,
+    data_authenticator: D,
+    control_service: C,
+    admission: AdmissionControl,
+    metrics: Metrics,
+    shutdown: S,
+    drain_timeout: Duration,
+    events: crate::events::EventBus,
+    log_worker: crate::logging::LogWriter<L>,
+    log_flush_timeout: Duration,
+    health: crate::providers::health::HealthProber,
+) -> io::Result<BoundPlanes>
+where
+    M: MigrationRunner,
+    D: DataPlaneService,
+    C: ControlPlaneService,
+    S: Future<Output = io::Result<()>>,
+    L: crate::logging::LogStore,
+{
+    // One stop signal, so the prober and the server leave together rather than a
+    // probe racing a listener that is already closing.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let prober = std::sync::Arc::new(health);
+    let mut prober_task = tokio::spawn(prober.clone().run(stopped));
+
+    let result = run_with_control_and_logging(
+        data_address,
+        control_address,
+        migrations,
+        data_authenticator,
+        control_service,
+        admission,
+        metrics,
+        async {
+            let result = shutdown.await;
+            let _ = stop.send(true);
+            result
+        },
+        drain_timeout,
+        events,
+        log_worker,
+        log_flush_timeout,
+    )
+    .await;
+
+    // The prober is told to stop as soon as the shutdown signal resolves, and is
+    // given the same bounded wait as the log flush so a probe that is mid-request
+    // cannot hold the process open. A probe that outlasts the bound is aborted
+    // rather than awaited, because it holds no state that anything else reads.
+    let _ = stop.send(true);
+    if tokio::time::timeout(log_flush_timeout, &mut prober_task)
+        .await
+        .is_err()
+    {
+        prober_task.abort();
+        let _ = prober_task.await;
+    }
+    result
+}
+
 /// Runs both planes with a complete administration service and bounded log shutdown.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_with_control_and_logging<M, D, C, S, L>(

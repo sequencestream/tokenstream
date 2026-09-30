@@ -27,6 +27,10 @@ fn every_error_class_has_a_stable_code_status_and_message() {
     let expected = [
         (GatewayError::InvalidGatewayCredential, 401),
         (GatewayError::ProviderDisabled, 403),
+        (GatewayError::ProviderUnhealthy, 503),
+        (GatewayError::AccountDisabled, 403),
+        (GatewayError::KeyExpired, 401),
+        (GatewayError::NoProviderSelected, 400),
         (GatewayError::UnsupportedRoute, 404),
         (GatewayError::InvalidUpgrade, 400),
         (GatewayError::UpstreamConnectFailed, 502),
@@ -55,6 +59,10 @@ fn the_code_set_is_exactly_the_documented_data_plane_contract() {
     let codes: BTreeSet<&'static str> = [
         GatewayError::InvalidGatewayCredential,
         GatewayError::ProviderDisabled,
+        GatewayError::ProviderUnhealthy,
+        GatewayError::AccountDisabled,
+        GatewayError::KeyExpired,
+        GatewayError::NoProviderSelected,
         GatewayError::UnsupportedRoute,
         GatewayError::InvalidUpgrade,
         GatewayError::UpstreamConnectFailed,
@@ -72,6 +80,10 @@ fn the_code_set_is_exactly_the_documented_data_plane_contract() {
         BTreeSet::from([
             "invalid_gateway_credential",
             "provider_disabled",
+            "provider_unhealthy",
+            "account_disabled",
+            "key_expired",
+            "no_provider_selected",
             "unsupported_route",
             "invalid_upgrade",
             "upstream_connect_failed",
@@ -104,6 +116,10 @@ fn authentication_and_route_failures_classify_into_the_contract() {
     assert_eq!(
         GatewayError::from(GatewayAuthError::ProviderDisabled),
         GatewayError::ProviderDisabled
+    );
+    assert_eq!(
+        GatewayError::from(GatewayAuthError::ProviderUnhealthy),
+        GatewayError::ProviderUnhealthy
     );
     assert_eq!(
         GatewayError::from(GatewayAuthError::Busy),
@@ -142,6 +158,10 @@ fn hostile_upstream_text_never_reaches_a_local_message() {
     for error in [
         GatewayError::InvalidGatewayCredential,
         GatewayError::ProviderDisabled,
+        GatewayError::ProviderUnhealthy,
+        GatewayError::AccountDisabled,
+        GatewayError::KeyExpired,
+        GatewayError::NoProviderSelected,
         GatewayError::UnsupportedRoute,
         GatewayError::InvalidUpgrade,
         GatewayError::UpstreamConnectFailed,

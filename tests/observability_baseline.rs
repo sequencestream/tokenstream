@@ -90,6 +90,9 @@ fn a_fresh_process_already_publishes_the_whole_series_set() {
         rendered
             .contains("tokenstream_event_subscriber_events_total{subscriber=\"request_log\"} 0")
     );
+    assert!(rendered.contains("tokenstream_provider_health_refusals_total 0"));
+    assert!(rendered.contains("tokenstream_provider_health_probes_total{outcome=\"reachable\"} 0"));
+    assert!(rendered.contains("tokenstream_providers_by_health_state{state=\"isolated\"} 0"));
     // A quantile with no observation is unknown, not zero.
     assert!(rendered.contains("quantile=\"0.99\"} NaN"), "{rendered}");
 }
@@ -219,6 +222,8 @@ fn the_exposition_grows_no_series_with_traffic() {
         );
         metrics.record_rejection(RejectionLayer::GlobalGate, RejectionReason::Concurrency);
     }
+    metrics.record_health_refusal();
+    metrics.record_probe(tokenstream::telemetry::ProbeOutcomeLabel::Failing);
     assert_eq!(
         series_names(&metrics.render()),
         before,

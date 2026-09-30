@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{TimeZone, Utc};
 use sqlx::{PgPool, SqlitePool};
 use tokenstream::domain::{
-    AccountId, ApiKeyId, ProtocolType, ProviderCursor, ProviderId, ProviderStatus, SecretCiphertext,
+    AccountId, ApiKeyId, ProtocolType, ProviderCursor, ProviderHealthState, ProviderId,
+    ProviderStatus, SecretCiphertext, validate_provider_probe,
 };
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
@@ -247,6 +248,41 @@ where
             .expect_err("missing delete is rejected"),
         RepositoryError::NotFound
     );
+
+    let endpoint = Url::parse("https://health.example.com/base").expect("valid endpoint");
+    let probe = validate_provider_probe(Some("/ready"), Some(2), Some(30_000), Some(5_000))
+        .expect("valid probe")
+        .expect("configured probe")
+        .resolve(&endpoint)
+        .expect("probe target");
+    let observed = repository
+        .create(
+            NewProvider::new(
+                format!("{prefix}-health"),
+                ProtocolType::OpenAi,
+                endpoint,
+                SecretCiphertext::new("health-ciphertext"),
+                ProviderStatus::Enabled,
+                Utc::now(),
+            )
+            .with_probe(Some(probe)),
+        )
+        .await
+        .expect("create observed provider");
+    repository
+        .set_health(
+            observed.id(),
+            ProviderHealthState::Healthy,
+            ProviderHealthState::Isolated,
+        )
+        .await
+        .expect("isolate provider");
+    let cleared = repository
+        .update(observed.id(), ProviderUpdate::new().with_probe(None))
+        .await
+        .expect("remove probe");
+    assert_eq!(cleared.health(), ProviderHealthState::Healthy);
+    assert!(cleared.probe().is_none());
     ids
 }
 

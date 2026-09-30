@@ -299,7 +299,13 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
         "protocol_type": "openai",
         "endpoint": "https://api.example.com/base",
         "upstream_api_key": "upstream-secret",
-        "status": "enabled"
+        "status": "enabled",
+        "health": {
+            "probe_path": "/ready",
+            "failure_threshold": 3,
+            "probe_interval_ms": 30000,
+            "probe_timeout_ms": 5000
+        }
     });
     let (status, headers, created) = send(
         &api,
@@ -325,6 +331,35 @@ async fn provider_and_log_endpoints_enforce_redaction_cursor_and_filter_contract
     assert!(!rendered.contains("upstream-secret"));
     assert!(!rendered.contains("ciphertext"));
     assert!(!rendered.contains("password_hash"));
+    assert_eq!(created["health"], "healthy");
+    assert_eq!(created["health_probe"]["probe_path"], "/ready");
+
+    let (status, _, maintenance) = send(
+        &api,
+        request(
+            Method::PUT,
+            &format!("/admin/api/providers/{provider_id}/maintenance"),
+            Value::Null,
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(maintenance["health"], "maintenance");
+    let (status, _, healthy) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/providers/{provider_id}/maintenance"),
+            Value::Null,
+            Some(&cookie),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(healthy["health"], "healthy");
 
     let (status, headers, listed) = send(
         &api,
@@ -678,6 +713,19 @@ async fn accounts_and_credentials_are_role_scoped_and_never_return_a_secret() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
     let provider_id = provider["id"].as_i64().expect("provider ID");
+
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::PUT,
+            &format!("/admin/api/providers/{provider_id}/maintenance"),
+            Value::Null,
+            Some(&user_cookie),
+            Some(&user_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 
     let (status, _, issued) = send(
         &api,

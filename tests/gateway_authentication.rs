@@ -9,8 +9,9 @@ use tokenstream::credentials::{CreateApiKeyRequest, UpdateAccountRequest, Update
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::domain::{
     AccountStatus, ApiKeyStatus, GATEWAY_SECRET_LENGTH, GatewayCredential, GatewayKeyId,
-    ProtocolType, ProviderStatus, SecretString,
+    ProtocolType, ProviderHealthState, ProviderStatus, SecretString,
 };
+use tokenstream::persistence::ProviderRepository;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::providers::{CreateProviderRequest, ProviderService, UpdateProviderRequest};
 
@@ -642,6 +643,108 @@ async fn a_disabled_provider_is_still_selectable_and_reported_as_disabled() {
             .expect_err("a disabled provider is reported as disabled"),
         GatewayAuthError::ProviderDisabled
     );
+}
+
+#[tokio::test]
+async fn maintenance_refuses_new_work_without_changing_an_existing_snapshot() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("maintenance.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+    let provider = service
+        .create(request(
+            "maintained",
+            ProtocolType::OpenAi,
+            "https://api.maintained.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create provider");
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
+    let snapshot = authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("authenticate before maintenance");
+
+    service
+        .set_health(provider.id(), ProviderHealthState::Maintenance)
+        .await
+        .expect("enter maintenance");
+    assert_eq!(snapshot.health(), ProviderHealthState::Healthy);
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&credential))
+            .await
+            .expect_err("maintenance refuses new work"),
+        GatewayAuthError::ProviderUnhealthy
+    );
+
+    service
+        .set_health(provider.id(), ProviderHealthState::Healthy)
+        .await
+        .expect("leave maintenance");
+    authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("new work resumes after maintenance");
+}
+
+#[tokio::test]
+async fn isolation_refuses_new_work_without_changing_an_existing_snapshot() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("isolated.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let authenticator = authenticator(database.clone());
+    let account = bootstrap_account(&accounts).await;
+    let provider = service
+        .create(request(
+            "isolated",
+            ProtocolType::OpenAi,
+            "https://api.isolated.example",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create provider");
+    let issued = issue_api_key(&accounts, account.id(), vec![provider.id()]).await;
+    let credential = render(&issued);
+    let snapshot = authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("authenticate before isolation");
+
+    database
+        .set_health(
+            provider.id(),
+            ProviderHealthState::Healthy,
+            ProviderHealthState::Isolated,
+        )
+        .await
+        .expect("isolate provider");
+    assert_eq!(snapshot.health(), ProviderHealthState::Healthy);
+    assert_eq!(
+        authenticator
+            .authenticate(&with_bearer(&credential))
+            .await
+            .expect_err("isolation refuses new work"),
+        GatewayAuthError::ProviderUnhealthy
+    );
+
+    database
+        .set_health(
+            provider.id(),
+            ProviderHealthState::Isolated,
+            ProviderHealthState::Healthy,
+        )
+        .await
+        .expect("recover provider");
+    authenticator
+        .authenticate(&with_bearer(&credential))
+        .await
+        .expect("new work resumes after recovery");
 }
 
 #[tokio::test]

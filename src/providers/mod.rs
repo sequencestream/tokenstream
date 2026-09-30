@@ -14,12 +14,14 @@ use url::Url;
 
 use crate::crypto::SecretCipher;
 use crate::domain::{
-    ProtocolType, Provider, ProviderAdmission, ProviderId, ProviderStatus, SecretString,
+    ProtocolType, Provider, ProviderAdmission, ProviderHealthState, ProviderId, ProviderProbe,
+    ProviderStatus, SecretString,
 };
 use crate::persistence::{
-    NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderUpdate,
-    RepositoryError,
+    HealthOutcome, NewProvider, ProviderListRequest, ProviderPage, ProviderRepository,
+    ProviderUpdate, RepositoryError,
 };
+use crate::telemetry::{HealthTransition, Metrics};
 
 /// Longest accepted provider name, counted in Unicode scalar values.
 pub const MAX_PROVIDER_NAME_LEN: usize = 128;
@@ -38,6 +40,7 @@ pub struct CreateProviderRequest {
     upstream_api_key: SecretString,
     status: ProviderStatus,
     admission: ProviderAdmission,
+    probe: Option<ProviderProbe>,
 }
 
 impl CreateProviderRequest {
@@ -55,6 +58,7 @@ impl CreateProviderRequest {
             upstream_api_key,
             status,
             admission: ProviderAdmission::default(),
+            probe: None,
         }
     }
 
@@ -62,6 +66,16 @@ impl CreateProviderRequest {
     /// capacity that belongs to the providers around it.
     pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
         self.admission = admission;
+        self
+    }
+
+    /// Watches this provider's health by probing it.
+    ///
+    /// Absent is the default and means the provider is never probed, so health is
+    /// opt-in per provider rather than a reachability contract the gateway would
+    /// otherwise assert on the operator's behalf.
+    pub fn with_probe(mut self, probe: Option<ProviderProbe>) -> Self {
+        self.probe = probe;
         self
     }
 }
@@ -87,6 +101,7 @@ impl fmt::Debug for CreateProviderRequest {
 /// credential are not editable values.
 #[derive(Default)]
 pub struct UpdateProviderRequest {
+    probe: Option<Option<ProviderProbe>>,
     name: Option<String>,
     endpoint: Option<String>,
     upstream_api_key: Option<SecretString>,
@@ -110,8 +125,28 @@ impl UpdateProviderRequest {
         self
     }
 
+    /// The endpoint this edit would leave in place, if it names one.
+    ///
+    /// Exposed so a probe written in the same request can be validated against
+    /// the endpoint it will actually run against, rather than against the one the
+    /// provider happened to have when the request arrived.
+    pub fn endpoint(&self) -> Option<&String> {
+        self.endpoint.as_ref()
+    }
+
     pub fn with_upstream_api_key(mut self, upstream_api_key: SecretString) -> Self {
         self.upstream_api_key = Some(upstream_api_key);
+        self
+    }
+
+    /// Watches or stops watching this provider's health.
+    ///
+    /// The inner `None` clears the probe, so a provider can be taken out of
+    /// health observation in one edit. Clearing it also means the provider can
+    /// never be isolated again, so it is a deliberate act rather than a way to
+    /// hide a failing upstream.
+    pub fn with_probe(mut self, probe: Option<ProviderProbe>) -> Self {
+        self.probe = Some(probe);
         self
     }
 
@@ -209,6 +244,7 @@ pub struct ProviderService<R, C> {
     repository: R,
     cipher: C,
     allow_insecure_endpoints: bool,
+    health_metrics: Metrics,
 }
 
 impl<R, C> ProviderService<R, C>
@@ -295,7 +331,20 @@ where
             repository,
             cipher,
             allow_insecure_endpoints,
+            health_metrics: Metrics::default(),
         }
+    }
+
+    /// Attaches the exposition a health transition is recorded in.
+    ///
+    /// A transition is a fact about the running process rather than about the
+    /// stored row, so it belongs in the exposition the process already renders
+    /// rather than in a new store. Absent means the service records into a
+    /// private default, which keeps a caller that has no exposition — a
+    /// one-shot script, a repository test — from having to know about it.
+    pub fn with_health_metrics(mut self, metrics: Metrics) -> Self {
+        self.health_metrics = metrics;
+        self
     }
 
     /// Reports whether plain-HTTP provider endpoints are admitted.
@@ -329,7 +378,8 @@ where
             request.status,
             Utc::now(),
         )
-        .with_admission(request.admission);
+        .with_admission(request.admission)
+        .with_probe(request.probe);
         self.repository
             .create(new_provider)
             .await
@@ -373,6 +423,9 @@ where
         if let Some(admission) = request.admission {
             update = update.with_admission(admission);
         }
+        if let Some(probe) = request.probe {
+            update = update.with_probe(probe);
+        }
         if update.is_empty() {
             return Err(ProviderServiceError::NoFieldsToUpdate);
         }
@@ -393,6 +446,50 @@ where
     ) -> Result<Provider, ProviderServiceError> {
         self.update(id, UpdateProviderRequest::new().with_status(status))
             .await
+    }
+
+    /// Moves a provider into or out of a maintenance window.
+    ///
+    /// Only an administrator reaches this, and it is the only way to return a
+    /// provider to service without waiting for a probe. It is also the only way
+    /// to say a provider is *expected* to be unavailable, which is why a
+    /// provider in a window is not probed: probing something an operator is
+    /// deliberately changing would isolate it for a condition already known.
+    ///
+    /// The write moves the provider only from the state it was read in, so an
+    /// operator closing a window cannot silently discard an isolation a probe
+    /// recorded a moment earlier; the caller re-reads and decides again.
+    pub async fn set_health(
+        &self,
+        id: ProviderId,
+        health: ProviderHealthState,
+    ) -> Result<Provider, ProviderServiceError> {
+        let current = self.get(id).await?;
+        // The healthy edge exposed by the administration API means "leave
+        // maintenance", not "override an isolation". If a probe isolated the
+        // provider before this request observed it, keep that verdict and let a
+        // successful probe recover it.
+        if health == ProviderHealthState::Healthy
+            && current.health() != ProviderHealthState::Maintenance
+        {
+            return Ok(current);
+        }
+        let outcome = self
+            .repository
+            .set_health(id, current.health(), health)
+            .await
+            .map_err(map_repository_error)?;
+        if let HealthOutcome::Applied(_) = outcome {
+            self.health_metrics
+                .record_health_transition(HealthTransition {
+                    from: current.health(),
+                    to: health,
+                });
+        }
+        // Either the move landed, the provider already held the requested state,
+        // or a probe moved it first. Reporting what storage actually holds is
+        // the honest answer in all three cases, and it is the same read.
+        self.get(id).await
     }
 
     /// Deletes a provider that no request log references.
@@ -460,6 +557,8 @@ fn map_repository_error(error: RepositoryError) -> ProviderServiceError {
         _ => ProviderServiceError::Storage,
     }
 }
+
+pub mod health;
 
 #[cfg(test)]
 mod tests {

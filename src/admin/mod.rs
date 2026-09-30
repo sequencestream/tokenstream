@@ -26,11 +26,14 @@ use crate::credentials::{
 use crate::crypto::{
     AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher, SharedCipher,
 };
+use url::Url;
+
 use crate::domain::{
     AccountAdminView, AccountCursor, AccountId, AccountRole, AccountStatus, ApiKeyAdminView,
     ApiKeyCursor, ApiKeyId, ApiKeyStatus, CredentialAdmission, InvalidAdmissionBound, ProtocolType,
-    ProviderAdminView, ProviderAdmission, ProviderCursor, ProviderId, ProviderStatus, RequestLog,
-    RequestLogCursor, SecretString, TransportType,
+    ProviderAdminView, ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId,
+    ProviderProbe, ProviderStatus, RequestLog, RequestLogCursor, SecretString, TransportType,
+    validate_provider_probe,
 };
 use crate::persistence::{
     AccountListRequest, AccountRepository, ApiKeyListRequest, Database, ProviderListRequest,
@@ -397,7 +400,7 @@ where
                 _ => method_not_allowed(),
             };
         }
-        if let Some((id, rotate)) = provider_item_path(&path) {
+        if let Some((id, rotate, maintenance)) = provider_item_path(&path) {
             let Ok(id) = ProviderId::try_from(id) else {
                 return invalid_input("Provider ID must be a positive integer.");
             };
@@ -407,9 +410,26 @@ where
                 return method_not_allowed();
             }
             return match method {
-                Method::GET => self.get_provider(id).await,
-                Method::PATCH if principal.is_admin() => self.update_provider(id, request).await,
-                Method::DELETE if principal.is_admin() => self.delete_provider(id).await,
+                // Entering and leaving a maintenance window is a write to which
+                // upstreams this gateway trusts, so it is administrator-only on
+                // both edges: the window is the manual way to say a provider is
+                // expected to be unavailable, and no account but an administrator
+                // has standing to make that claim.
+                Method::PUT if maintenance && principal.is_admin() => {
+                    self.set_provider_health(id, ProviderHealthState::Maintenance)
+                        .await
+                }
+                Method::DELETE if maintenance && principal.is_admin() => {
+                    self.set_provider_health(id, ProviderHealthState::Healthy)
+                        .await
+                }
+                Method::GET if !maintenance => self.get_provider(id).await,
+                Method::PATCH if !maintenance && principal.is_admin() => {
+                    self.update_provider(id, request).await
+                }
+                Method::DELETE if !maintenance && principal.is_admin() => {
+                    self.delete_provider(id).await
+                }
                 _ if !principal.is_admin() => forbidden(),
                 _ => method_not_allowed(),
             };
@@ -981,6 +1001,21 @@ where
             Ok(admission) => admission,
             Err(_) => return invalid_input("Invalid provider configuration."),
         };
+        let endpoint = match Url::parse(&input.endpoint) {
+            Ok(endpoint) => endpoint,
+            Err(_) => return invalid_input("Invalid provider configuration."),
+        };
+        // A health block that is present but unusable is refused rather than
+        // dropped: an operator who wrote a probe and got no error would believe a
+        // provider is being watched when it is not. A null path is not an error —
+        // it is the way to say this provider is not probed.
+        let probe = match input.health.as_ref() {
+            Some(health) => match health.resolve(&endpoint) {
+                Ok(probe) => probe,
+                Err(()) => return invalid_input("Invalid provider health configuration."),
+            },
+            None => None,
+        };
         let request = CreateProviderRequest::new(
             input.name,
             protocol_type,
@@ -988,9 +1023,26 @@ where
             SecretString::new(input.upstream_api_key),
             status,
         )
-        .with_admission(admission);
+        .with_admission(admission)
+        .with_probe(probe);
         match self.providers.create(request).await {
             Ok(provider) => json_response(StatusCode::CREATED, &ProviderAdminView::from(&provider)),
+            Err(error) => self.provider_error(error),
+        }
+    }
+
+    /// Moves a provider into or out of a maintenance window.
+    ///
+    /// Closing a window returns the provider to healthy, which is the only manual
+    /// way back to service without waiting for a probe. It does not cancel
+    /// anything: an exchange already admitted keeps its snapshot and finishes.
+    async fn set_provider_health(
+        &self,
+        id: ProviderId,
+        health: ProviderHealthState,
+    ) -> Response<ApiBody> {
+        match self.providers.set_health(id, health).await {
+            Ok(provider) => json_response(StatusCode::OK, &ProviderAdminView::from(&provider)),
             Err(error) => self.provider_error(error),
         }
     }
@@ -1037,6 +1089,29 @@ where
                 Err(_) => return invalid_input("Invalid provider configuration."),
             };
             change = change.with_admission(admission);
+        }
+        if let Some(health) = &input.health {
+            // The probe is resolved against the endpoint this edit leaves in
+            // place, so a probe and an endpoint change in the same request are
+            // validated against each other rather than in an order the operator
+            // did not write.
+            // An endpoint named in this same edit is the one the probe will run
+            // against, so a request that changes both is validated against the
+            // combination it actually writes rather than against the stored row.
+            let endpoint = match change
+                .endpoint()
+                .and_then(|endpoint| Url::parse(endpoint).ok())
+            {
+                Some(endpoint) => endpoint,
+                None => match self.providers.get(id).await {
+                    Ok(provider) => provider.endpoint().clone(),
+                    Err(error) => return self.provider_error(error),
+                },
+            };
+            match health.resolve(&endpoint) {
+                Ok(probe) => change = change.with_probe(probe),
+                Err(()) => return invalid_input("Invalid provider health configuration."),
+            }
         }
         match self.providers.update(id, change).await {
             Ok(provider) => json_response(StatusCode::OK, &ProviderAdminView::from(&provider)),
@@ -1435,6 +1510,9 @@ struct CreateProviderBody {
     /// the same as absent, because "no bound" is what null already means.
     max_concurrent_requests: Option<u32>,
     max_requests_per_second: Option<u32>,
+    /// The health probe. Absent means this provider is never probed, which is the
+    /// default and is why an upgrade cannot take a provider out of service.
+    health: Option<ProviderHealthFields>,
 }
 
 #[derive(Deserialize)]
@@ -1448,6 +1526,44 @@ struct UpdateProviderBody {
     /// leaves every bound unchanged, and a present one names both, so a single
     /// edit can widen, narrow, or clear them together.
     admission: Option<ProviderAdmissionFields>,
+    /// The health probe. An absent object leaves probing untouched; a present one
+    /// replaces it, and a null path takes the provider out of health observation.
+    health: Option<ProviderHealthFields>,
+}
+
+/// The health probe a request may name on a provider.
+///
+/// All four values are set together or not at all. A path with no threshold, an
+/// interval, or a timeout would leave the probe undecidable — an absent threshold
+/// isolates immediately and an absent interval never probes — so a half-written
+/// probe is refused at the edge rather than completed with a value nobody chose.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderHealthFields {
+    probe_path: Option<String>,
+    failure_threshold: Option<i64>,
+    probe_interval_ms: Option<i64>,
+    probe_timeout_ms: Option<i64>,
+}
+
+impl ProviderHealthFields {
+    /// Validates this probe and resolves it against a provider endpoint.
+    ///
+    /// A present object with a null path is a deliberate removal, and is reported
+    /// as the inner `None` that clears the probe rather than as "leave it alone".
+    fn resolve(&self, endpoint: &Url) -> Result<Option<ProviderProbe>, ()> {
+        let probe = validate_provider_probe(
+            self.probe_path.as_deref(),
+            self.failure_threshold,
+            self.probe_interval_ms,
+            self.probe_timeout_ms,
+        )
+        .map_err(|_| ())?;
+        match probe {
+            Some(probe) => probe.resolve(endpoint).map(Some).map_err(|_| ()),
+            None => Ok(None),
+        }
+    }
 }
 
 /// The admission bounds a request may name on a provider.
@@ -1896,16 +2012,25 @@ fn parse_status(value: &str) -> Option<ProviderStatus> {
     }
 }
 
-fn provider_item_path(path: &str) -> Option<(i64, bool)> {
+/// Splits a provider item path into its identifier and which sub-resource it names.
+///
+/// The two sub-resources are parsed rather than matched by a prefix, so a path
+/// that names neither is not mistaken for a provider identifier and a path that
+/// names an unknown sub-resource is refused rather than silently treated as a
+/// provider.
+fn provider_item_path(path: &str) -> Option<(i64, bool, bool)> {
     let suffix = path.strip_prefix("/admin/api/providers/")?;
-    let (id, rotate) = match suffix.strip_suffix("/gateway-key:rotate") {
-        Some(id) => (id, true),
-        None => (suffix, false),
+    let (id, rotate, maintenance) = match suffix.strip_suffix("/gateway-key:rotate") {
+        Some(id) => (id, true, false),
+        None => match suffix.strip_suffix("/maintenance") {
+            Some(id) => (id, false, true),
+            None => (suffix, false, false),
+        },
     };
     if id.is_empty() || id.contains('/') {
         return None;
     }
-    Some((id.parse().ok()?, rotate))
+    Some((id.parse().ok()?, rotate, maintenance))
 }
 
 fn resource_exhausted() -> Response<ApiBody> {

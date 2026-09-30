@@ -23,7 +23,9 @@ use crate::proxy::http::HttpProxy;
 use crate::proxy::layered::{LayerRejection, LayeredAdmission, LayeredSlots};
 use crate::proxy::websocket::{RelayOutcome, WebSocketProxy};
 use crate::routing::resolve_route;
-use crate::telemetry::{ExchangeOutcome, Metrics, RejectionLayer, RejectionReason};
+use crate::telemetry::{
+    ExchangeOutcome, Metrics, ProxyFailureCategory, RejectionLayer, RejectionReason,
+};
 
 pub type DataBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 pub type Session = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -327,6 +329,13 @@ impl crate::DataPlaneService for Gateway {
         let mut result = match self.forward(request, peer, permit, id.clone()).await {
             Ok(result) => result,
             Err((error, transport)) => {
+                // Health isolation is a refusal before an exchange exists. It
+                // has its own counter and must not contribute a latency sample
+                // or inflate the gateway-failure rate.
+                if error.category() == ProxyFailureCategory::ProviderUnhealthy {
+                    metrics.record_health_refusal();
+                    return with_request_id((error_response(error, &id), None), &id);
+                }
                 // Every gateway-originated failure classifies through the error
                 // contract, so no failure the exposition has a series for goes
                 // uncounted. A failure with a lifecycle of its own already
@@ -346,6 +355,14 @@ impl crate::DataPlaneService for Gateway {
         );
         result
     }
+}
+
+fn with_request_id(mut exchange: Exchange, id: &RequestId) -> Exchange {
+    exchange.0.headers_mut().insert(
+        "x-request-id",
+        id.as_str().parse().expect("generated request ID"),
+    );
+    exchange
 }
 
 pub fn error_response(error: GatewayError, id: &RequestId) -> Response<DataBody> {

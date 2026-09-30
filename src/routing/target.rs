@@ -82,6 +82,23 @@ pub fn build_upstream_uri(
     target.parse().map_err(|_| TargetError::InvalidPath)
 }
 
+/// Builds the request URI for one health probe.
+///
+/// A probe target is a configured URL in its own right rather than an endpoint
+/// joined with a validated data-plane path, because it is not a proxied request:
+/// there is no route, no snapshot, and no caller behind it. The same origin and
+/// prefix rules apply, so a target that could not be a provider endpoint cannot
+/// be a probe target either, and no user information, query, or fragment is
+/// ever sent. An empty path becomes the origin root.
+pub fn build_probe_uri(target: &Url) -> Result<Uri, TargetError> {
+    let origin = origin(target)?;
+    let prefix = base_path_prefix(target.path())?;
+    let mut uri = String::with_capacity(origin.len() + prefix.len());
+    uri.push_str(&origin);
+    uri.push_str(if prefix.is_empty() { "/" } else { prefix });
+    uri.parse().map_err(|_| TargetError::InvalidPath)
+}
+
 /// Returns the endpoint origin (`scheme://authority`) with no user information.
 fn origin(endpoint: &Url) -> Result<String, TargetError> {
     if !matches!(endpoint.scheme(), "http" | "https")

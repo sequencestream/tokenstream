@@ -14,6 +14,8 @@ function provider(id: number): Provider {
     has_upstream_api_key: true,
     max_concurrent_requests: null,
     max_requests_per_second: null,
+    health: 'healthy',
+    health_probe: null,
     created_at: '2026-09-01T00:00:00Z',
   }
 }

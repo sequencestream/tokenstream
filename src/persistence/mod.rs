@@ -11,8 +11,9 @@ use crate::domain::{
     Account, AccountCursor, AccountId, AccountRole, AccountStatus, AdmissionBound, ApiKey,
     ApiKeyBinding, ApiKeyCursor, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings, CredentialAdmission,
     EmptyOpaqueValueError, GatewayKeyId, MAX_ADMISSION_BOUND, PasswordHash, PositiveValueError,
-    ProtocolType, Provider, ProviderAdmission, ProviderCursor, ProviderId, ProviderStatus,
-    RequestId, RequestLog, RequestLogCursor, RequestLogId, SecretCiphertext, TransportType,
+    ProtocolType, Provider, ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId,
+    ProviderProbe, ProviderStatus, RequestId, RequestLog, RequestLogCursor, RequestLogId,
+    SecretCiphertext, TransportType, validate_provider_probe,
 };
 
 pub mod postgres;
@@ -157,6 +158,7 @@ pub struct NewProvider {
     upstream_api_key_ciphertext: SecretCiphertext,
     status: ProviderStatus,
     admission: ProviderAdmission,
+    probe: Option<ProviderProbe>,
     created_at: DateTime<Utc>,
 }
 
@@ -177,6 +179,7 @@ impl NewProvider {
             upstream_api_key_ciphertext,
             status,
             admission: ProviderAdmission::default(),
+            probe: None,
             created_at,
         }
     }
@@ -185,6 +188,20 @@ impl NewProvider {
     pub fn with_admission(mut self, admission: ProviderAdmission) -> Self {
         self.admission = admission;
         self
+    }
+
+    /// Attaches the health probe this provider is checked with, if any.
+    ///
+    /// Absent is the default and means the provider is never probed, so health
+    /// is opt-in per provider rather than a reachability contract the gateway
+    /// would otherwise assert on the operator's behalf.
+    pub fn with_probe(mut self, probe: Option<ProviderProbe>) -> Self {
+        self.probe = probe;
+        self
+    }
+
+    pub fn probe(&self) -> Option<&ProviderProbe> {
+        self.probe.as_ref()
     }
 
     pub fn admission(&self) -> ProviderAdmission {
@@ -529,6 +546,7 @@ pub struct ProviderUpdate {
     upstream_api_key_ciphertext: Option<SecretCiphertext>,
     status: Option<ProviderStatus>,
     admission: Option<ProviderAdmission>,
+    probe: Option<Option<ProviderProbe>>,
 }
 
 impl ProviderUpdate {
@@ -563,16 +581,37 @@ impl ProviderUpdate {
         self
     }
 
+    /// Replaces the health probe configuration.
+    ///
+    /// An inner `None` clears the probe, so a provider can be taken out of
+    /// health observation entirely in one edit. Clearing it also means the
+    /// provider is never isolated again, so it is a deliberate act rather than
+    /// a way to hide a failing upstream.
+    pub fn with_probe(mut self, probe: Option<ProviderProbe>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         self.name.is_none()
             && self.endpoint.is_none()
             && self.upstream_api_key_ciphertext.is_none()
             && self.status.is_none()
             && self.admission.is_none()
+            && self.probe.is_none()
     }
 
     pub fn admission(&self) -> Option<ProviderAdmission> {
         self.admission
+    }
+
+    /// The probe this update writes, absent when the update leaves it alone.
+    ///
+    /// Nested rather than flattened on purpose: an update that names no probe
+    /// must leave the stored probe untouched, which is a different fact from
+    /// writing an update that clears it.
+    pub fn probe(&self) -> Option<Option<&ProviderProbe>> {
+        self.probe.as_ref().map(Option::as_ref)
     }
 
     pub fn name(&self) -> Option<&str> {
@@ -1044,6 +1083,37 @@ impl fmt::Display for RepositoryError {
 
 impl Error for RepositoryError {}
 
+/// What a conditional health write actually did.
+///
+/// Splitting "applied", "already there", and "moved underneath me" is what
+/// keeps a transition counter honest: only an applied move is a transition, and
+/// a caller that lost the race is told what now holds rather than assuming its
+/// own write landed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthOutcome {
+    /// The move was written, so the state changed.
+    Applied(ProviderHealthState),
+    /// The row already held the requested state; nothing needed writing.
+    Unchanged(ProviderHealthState),
+    /// The row held a different state than the caller observed. The state now
+    /// stored is reported so the caller can decide again from it.
+    Moved(ProviderHealthState),
+}
+
+impl HealthOutcome {
+    /// The state stored after the call.
+    pub fn state(self) -> ProviderHealthState {
+        match self {
+            Self::Applied(state) | Self::Unchanged(state) | Self::Moved(state) => state,
+        }
+    }
+
+    /// Whether this call is the one that changed the state.
+    pub fn is_transition(self) -> bool {
+        matches!(self, Self::Applied(_))
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait ProviderRepository: Send + Sync {
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError>;
@@ -1059,6 +1129,20 @@ pub trait ProviderRepository: Send + Sync {
     ) -> Result<Provider, RepositoryError>;
 
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError>;
+
+    /// Moves a provider's health state, only from the state the caller observed.
+    ///
+    /// The write is conditional, so two concurrent probes or an operator cannot
+    /// overwrite each other. The outcome distinguishes the three cases: the
+    /// caller's move was applied, the caller already agreed with what is
+    /// stored, or the row moved under the caller and now holds something else.
+    /// Only the first is a transition, and only it is recorded as one.
+    async fn set_health(
+        &self,
+        id: ProviderId,
+        expected: ProviderHealthState,
+        health: ProviderHealthState,
+    ) -> Result<HealthOutcome, RepositoryError>;
 }
 
 /// Accounts, the principals that own credentials and sign into the control plane.
@@ -1170,6 +1254,22 @@ impl ProviderRepository for Database {
         match self {
             Self::Sqlite(database) => ProviderRepository::delete(database, id).await,
             Self::Postgres(database) => ProviderRepository::delete(database, id).await,
+        }
+    }
+
+    async fn set_health(
+        &self,
+        id: ProviderId,
+        expected: ProviderHealthState,
+        health: ProviderHealthState,
+    ) -> Result<HealthOutcome, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => {
+                ProviderRepository::set_health(database, id, expected, health).await
+            }
+            Self::Postgres(database) => {
+                ProviderRepository::set_health(database, id, expected, health).await
+            }
         }
     }
 }
@@ -1338,6 +1438,11 @@ struct ProviderRow {
     endpoint: String,
     upstream_api_key_ciphertext: String,
     status: String,
+    health: String,
+    probe_path: Option<String>,
+    probe_interval_ms: Option<i64>,
+    probe_timeout_ms: Option<i64>,
+    probe_failure_threshold: Option<i64>,
     max_concurrent_requests: Option<i64>,
     max_requests_per_second: Option<i64>,
     created_at: i64,
@@ -1358,6 +1463,17 @@ impl ProviderRow {
             "disabled" => ProviderStatus::Disabled,
             _ => return Err(RepositoryError::InvalidStoredData),
         };
+        let health = parse_health(&self.health)?;
+        // The probe is resolved against this row's own endpoint on read, so an
+        // endpoint edit moves the probe with it and a stored path can never
+        // outlive the origin it was validated against.
+        let probe = parse_probe(
+            &endpoint,
+            self.probe_path.as_deref(),
+            self.probe_interval_ms,
+            self.probe_timeout_ms,
+            self.probe_failure_threshold,
+        )?;
         let created_at = time::from_epoch_micros(self.created_at)?;
         let admission = ProviderAdmission::new(
             admission_bound(self.max_concurrent_requests)?,
@@ -1374,7 +1490,88 @@ impl ProviderRow {
             status,
             created_at,
         )
-        .with_admission(admission))
+        .with_admission(admission)
+        .with_health(health)
+        .with_probe(probe))
+    }
+}
+
+/// The stored probe columns of one row, as a probe configuration.
+///
+/// A probe is all-or-nothing: a row that carries a path without the rest, or any
+/// of the three numbers without the path, was written outside this process and is
+/// rejected rather than completed with a value nobody chose. The stored path is
+/// re-validated here as well, so a hand-edited row cannot aim a probe at a target
+/// the write path would have refused.
+pub(crate) fn parse_probe(
+    endpoint: &Url,
+    path: Option<&str>,
+    interval_ms: Option<i64>,
+    timeout_ms: Option<i64>,
+    failure_threshold: Option<i64>,
+) -> Result<Option<ProviderProbe>, RepositoryError> {
+    let probe = validate_provider_probe(path, failure_threshold, interval_ms, timeout_ms)
+        .map_err(|_| RepositoryError::InvalidStoredData)?;
+    let Some(probe) = probe else {
+        return Ok(None);
+    };
+    probe
+        .resolve(endpoint)
+        .map(Some)
+        .map_err(|_| RepositoryError::InvalidStoredData)
+}
+
+/// The stored columns of one probe, ready to be bound.
+///
+/// A resolved probe is decomposed back into its path and its three numbers rather
+/// than storing the URL it resolved to, so the stored form stays origin-relative
+/// and an endpoint edit moves the probe with it.
+pub(crate) struct ProbeColumns {
+    pub(crate) path: String,
+    pub(crate) interval_ms: i64,
+    pub(crate) timeout_ms: i64,
+    pub(crate) failure_threshold: i64,
+}
+
+/// Decomposes a resolved probe into the four columns storage holds.
+pub(crate) fn probe_columns(probe: &ProviderProbe) -> Result<ProbeColumns, RepositoryError> {
+    let path = probe.path().to_owned();
+    Ok(ProbeColumns {
+        path,
+        interval_ms: duration_millis(probe.interval())?,
+        timeout_ms: duration_millis(probe.timeout())?,
+        failure_threshold: i64::from(probe.failure_threshold()),
+    })
+}
+
+/// Converts a duration to the positive millisecond count storage holds.
+fn duration_millis(duration: Duration) -> Result<i64, RepositoryError> {
+    i64::try_from(duration.as_millis()).map_err(|_| RepositoryError::InvalidStoredData)
+}
+
+/// The stored name of a health state.
+///
+/// Health names are stored as text rather than as an integer so a row stays
+/// readable in a database and an operator can see which state a provider is in
+/// without knowing the process's encoding.
+pub(crate) const fn health_name(health: ProviderHealthState) -> &'static str {
+    match health {
+        ProviderHealthState::Healthy => "healthy",
+        ProviderHealthState::Isolated => "isolated",
+        ProviderHealthState::Maintenance => "maintenance",
+    }
+}
+
+/// Reads one stored health state, rejecting a name this build does not know.
+///
+/// An unknown name is invalid stored data rather than a default, because
+/// defaulting would silently bring a provider nobody chose back into service.
+pub(crate) fn parse_health(value: &str) -> Result<ProviderHealthState, RepositoryError> {
+    match value {
+        "healthy" => Ok(ProviderHealthState::Healthy),
+        "isolated" => Ok(ProviderHealthState::Isolated),
+        "maintenance" => Ok(ProviderHealthState::Maintenance),
+        _ => Err(RepositoryError::InvalidStoredData),
     }
 }
 

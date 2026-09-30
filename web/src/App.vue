@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 
-import { AdminApi, type ProviderStatus, type ProtocolType } from './api/client.ts'
+import { AdminApi, type ProviderHealthWrite, type ProviderStatus, type ProtocolType } from './api/client.ts'
 import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
 import { emptyApiKeyPage, loadApiKeys, type ApiKeyPage } from './keys/list.ts'
 import { boundDraft, boundSummary, emptyBoundDrafts, readBounds, type BoundDrafts } from './limits/bounds.ts'
@@ -41,6 +41,7 @@ function emptyCreateForm() {
     endpoint: 'https://',
     upstream_api_key: '',
     status: 'enabled' as ProviderStatus,
+    health: { probe_path: '', failure_threshold: '3', probe_interval_ms: '30000', probe_timeout_ms: '5000' },
     bounds: { ...emptyBoundDrafts(), max_websockets: '' },
   }
 }
@@ -51,6 +52,7 @@ const editForm = reactive({
   endpoint: '',
   upstream_api_key: '',
   status: 'enabled' as ProviderStatus,
+  health: { probe_path: '', failure_threshold: '3', probe_interval_ms: '30000', probe_timeout_ms: '5000' },
   bounds: { ...emptyBoundDrafts(), max_websockets: '' },
 })
 
@@ -213,9 +215,15 @@ async function createProvider() {
     errorMessage.value = bounds.error
     return
   }
+  const health = readHealth(createForm.health)
+  if ('error' in health) {
+    errorMessage.value = health.error
+    return
+  }
   await runAction(async () => {
     const { bounds: _drafts, ...fields } = createForm
-    await api.createProvider({ ...fields, ...bounds.values })
+    const { health: _health, ...providerFields } = fields
+    await api.createProvider({ ...providerFields, ...bounds.values, ...(health.value ? { health: health.value } : {}) })
     Object.assign(createForm, emptyCreateForm())
     creatingProvider.value = false
     notice.value = 'Provider created. Issue a credential to call it.'
@@ -230,6 +238,12 @@ function beginEdit(providerId: number, source: typeof providers.value[number]) {
     endpoint: source.endpoint,
     upstream_api_key: '',
     status: source.status,
+    health: {
+      probe_path: source.health_probe?.probe_path ?? '',
+      failure_threshold: String(source.health_probe?.failure_threshold ?? 3),
+      probe_interval_ms: String(source.health_probe?.probe_interval_ms ?? 30000),
+      probe_timeout_ms: String(source.health_probe?.probe_timeout_ms ?? 5000),
+    },
     bounds: {
       max_concurrent_requests: boundDraft(source.max_concurrent_requests),
       max_requests_per_second: boundDraft(source.max_requests_per_second),
@@ -245,16 +259,54 @@ async function saveProvider(id: number) {
     errorMessage.value = bounds.error
     return
   }
+  const health = readHealth(editForm.health, true)
+  if ('error' in health) {
+    errorMessage.value = health.error
+    return
+  }
   await runAction(async () => {
     await api.updateProvider(id, {
       name: editForm.name,
       endpoint: editForm.endpoint,
       status: editForm.status,
       admission: bounds.values,
+      health: health.value!,
       ...(editForm.upstream_api_key ? { upstream_api_key: editForm.upstream_api_key } : {}),
     })
     editingProviderId.value = null
     notice.value = 'Provider updated.'
+    providerPage.value = await loadProviders(api, providerPage.value, true)
+  })
+}
+
+function readHealth(
+  fields: { probe_path: string; failure_threshold: string; probe_interval_ms: string; probe_timeout_ms: string },
+  includeDisabled = false,
+): { value: ProviderHealthWrite | null } | { error: string } {
+  const probePath = fields.probe_path.trim()
+  if (!probePath) {
+    return includeDisabled
+      ? { value: { probe_path: null, failure_threshold: null, probe_interval_ms: null, probe_timeout_ms: null } }
+      : { value: null }
+  }
+  const values = [fields.failure_threshold, fields.probe_interval_ms, fields.probe_timeout_ms].map((value) => Number(value))
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    return { error: 'Probe threshold, interval, and timeout must be positive integers.' }
+  }
+  return {
+    value: {
+      probe_path: probePath,
+      failure_threshold: values[0],
+      probe_interval_ms: values[1],
+      probe_timeout_ms: values[2],
+    },
+  }
+}
+
+async function toggleMaintenance(id: number, maintenance: boolean) {
+  await runAction(async () => {
+    await api.setProviderMaintenance(id, maintenance)
+    notice.value = maintenance ? 'Provider entered maintenance.' : 'Provider left maintenance.'
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -739,6 +791,14 @@ onMounted(restoreSession)
               </label>
               <p class="section-note">Leave a field empty for no bound. A bound of 0 is refused.</p>
             </fieldset>
+            <fieldset class="wide bounds">
+              <legend>Health probe</legend>
+              <label>Path<input v-model="createForm.health.probe_path" placeholder="disabled" aria-label="Probe path" /></label>
+              <label>Failure threshold<input v-model="createForm.health.failure_threshold" inputmode="numeric" aria-label="Probe failure threshold" /></label>
+              <label>Interval (ms)<input v-model="createForm.health.probe_interval_ms" inputmode="numeric" aria-label="Probe interval milliseconds" /></label>
+              <label>Timeout (ms)<input v-model="createForm.health.probe_timeout_ms" inputmode="numeric" aria-label="Probe timeout milliseconds" /></label>
+              <p class="section-note">Leave the path empty to disable probing. Probes carry no credentials or request body.</p>
+            </fieldset>
             <div class="actions wide">
               <button class="button primary" :disabled="busy">Create provider</button>
               <button class="button ghost" type="button" @click="cancelCreate">Cancel</button>
@@ -755,6 +815,7 @@ onMounted(restoreSession)
                   <th>Name</th>
                   <th>Protocol</th>
                   <th>Status</th>
+                  <th>Health</th>
                   <th class="fill">Endpoint</th>
                   <th>Upstream key</th>
                   <th>Bounds</th>
@@ -773,6 +834,15 @@ onMounted(restoreSession)
                         <option value="enabled">Enabled</option>
                         <option value="disabled">Disabled</option>
                       </select>
+                    </td>
+                    <td>
+                      <div class="row-probe">
+                        <span class="badge" :class="provider.health">{{ provider.health }}</span>
+                        <input v-model="editForm.health.probe_path" placeholder="probe disabled" aria-label="Probe path" />
+                        <input v-model="editForm.health.failure_threshold" inputmode="numeric" aria-label="Probe failure threshold" />
+                        <input v-model="editForm.health.probe_interval_ms" inputmode="numeric" aria-label="Probe interval milliseconds" />
+                        <input v-model="editForm.health.probe_timeout_ms" inputmode="numeric" aria-label="Probe timeout milliseconds" />
+                      </div>
                     </td>
                     <td class="fill"><input v-model="editForm.endpoint" type="url" required aria-label="Endpoint" /></td>
                     <td>
@@ -813,6 +883,11 @@ onMounted(restoreSession)
                     <td>{{ provider.name }}</td>
                     <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
                     <td><span class="badge" :class="provider.status">{{ provider.status }}</span></td>
+                    <td>
+                      <span class="badge" :class="provider.health">{{ provider.health }}</span>
+                      <small v-if="provider.health_probe">{{ provider.health_probe.probe_path }} · {{ provider.health_probe.failure_threshold }} failures · {{ provider.health_probe.probe_interval_ms }} ms</small>
+                      <small v-else>Probe disabled</small>
+                    </td>
                     <td class="fill">{{ provider.endpoint }}</td>
                     <td>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</td>
                     <td>{{ boundSummary([['conc', provider.max_concurrent_requests], ['rate', provider.max_requests_per_second]]) }}</td>
@@ -820,6 +895,11 @@ onMounted(restoreSession)
                     <td class="row-actions">
                       <div class="actions">
                         <button class="button ghost" @click="beginEdit(provider.id, provider)">Edit</button>
+                        <button
+                          class="button ghost"
+                          :disabled="busy"
+                          @click="toggleMaintenance(provider.id, provider.health !== 'maintenance')"
+                        >{{ provider.health === 'maintenance' ? 'Leave maintenance' : 'Maintenance' }}</button>
                         <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
                         <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">Delete</button>
                       </div>
@@ -1263,6 +1343,7 @@ input:focus, select:focus {
 .bounds { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-2) var(--space-3); }
 .bounds .section-note { grid-column: 1 / -1; margin: 0; }
 .row-bounds { display: grid; gap: var(--space-1); }
+.row-probe { display: grid; gap: var(--space-1); min-width: 10rem; }
 .binding { display: inline-flex; align-items: center; gap: var(--space-1); margin: 0; }
 .binding input { width: auto; min-width: 0; }
 .badge {
@@ -1276,6 +1357,8 @@ input:focus, select:focus {
 }
 .badge.enabled { color: var(--color-enabled); background: var(--color-enabled-fill); }
 .badge.disabled { color: var(--color-danger); background: var(--color-danger-fill); }
+.badge.healthy { color: var(--color-success); background: var(--color-success-fill); }
+.badge.isolated, .badge.maintenance { color: var(--color-warning); background: var(--color-warning-fill); }
 .badge.neutral { color: var(--color-neutral); background: var(--color-neutral-fill); }
 .badge.incomplete { color: var(--color-warning); background: var(--color-warning-fill); }
 .filters { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: var(--space-2) var(--space-3); align-items: end; }

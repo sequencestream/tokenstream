@@ -22,6 +22,7 @@ sequenceDiagram
     participant P as Process
     participant D as DataPlane
     participant C as ControlPlane
+    participant H as Health probes
     participant L as LogWriter
 
     Op->>P: Start with environment, overlay, and defaults
@@ -31,15 +32,21 @@ sequenceDiagram
         P->>P: Run migrations
         P->>D: Bind data-plane listener
         P->>C: Bind control-plane listener
+        P->>H: Start bounded probe task
         Note over D,C: Serve until SIGINT or SIGTERM
         Op->>P: Stop request
         P->>D: Stop accepting
         P->>C: Stop accepting
+        P->>H: Stop issuing probes
         P->>D: Drain up to timeout
         P->>C: Drain up to timeout
         opt Drain deadline exceeded
             P->>D: Abort remaining work
             P->>C: Abort remaining work
+        end
+        P->>H: Join the probe task up to timeout
+        opt Probe deadline exceeded
+            P->>H: Abort the in-flight probe
         end
         P->>L: Close sink and flush up to timeout
         opt Flush deadline exceeded
@@ -57,6 +64,7 @@ The compiled administration page is served from the control-plane listener so th
 - Neither listener binds unless every required or defaulted setting is valid, including hashing budgets that sum to at most the process-wide ceiling, authentication reservations inside the pool size, and a data-plane connection cap that is never below the proxy admission limit.
 - The master key is exactly 32 bytes encoded as 64 hexadecimal characters. The administrator hash uses Argon2id. The master key is never stored in the database.
 - Forced cancellation after the drain period leaves unfinished WebSocket records incomplete and does not invent a close event ([ADR 0005](../adr/0005-best-effort-metadata-logging.md)).
+- The probe task is the only background work that contacts an upstream on a schedule rather than on a request, and it is joined on the same bounded wait as the log flush so a stopping process does not leave a probe in flight.
 - Exhausting one plane's hashing budget does not borrow the other plane's slots.
 
 ## Failures and bounds
@@ -65,3 +73,4 @@ The compiled administration page is served from the control-plane listener so th
 - A full connection limit rejects new work immediately.
 - Database access uses a bounded pool with explicit execution deadlines for authentication, administration, and log batches.
 - Remaining queued log events dropped when the flush is aborted increment the dropped-log metric.
+- An in-flight probe aborted at the join deadline holds no state anything else reads, so aborting it cannot leave a half-written health verdict.

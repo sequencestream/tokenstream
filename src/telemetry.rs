@@ -22,16 +22,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use crate::domain::TransportType;
+use crate::domain::{ProviderHealthState, TransportType};
 
 const LATENCY_BUCKETS_SECONDS: [f64; 10] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
-const FAILURE_CATEGORY_COUNT: usize = 16;
+const FAILURE_CATEGORY_COUNT: usize = 17;
 const SUBSCRIBER_COUNT: usize = 1;
 const TRANSPORT_COUNT: usize = 2;
 const RESULT_COUNT: usize = 4;
 const REJECTION_LAYER_COUNT: usize = 6;
 const REJECTION_REASON_COUNT: usize = 2;
+const HEALTH_STATE_COUNT: usize = 3;
+const PROBE_OUTCOME_COUNT: usize = 3;
 
 /// The closed set of event subscribers that can appear in the exposition.
 ///
@@ -198,6 +200,132 @@ impl TransportType {
     }
 }
 
+/// A transition the health state machine performed.
+///
+/// The pair is the whole label, and both members come from the closed state set,
+/// so the transition series is a fixed shape no matter how many providers exist
+/// or how often they move. A provider identifier is deliberately not a label: it
+/// is unbounded over a process lifetime, and the fact an operator alerts on is
+/// "a provider was isolated", not "provider 41 was isolated".
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct HealthTransition {
+    pub from: ProviderHealthState,
+    pub to: ProviderHealthState,
+}
+
+impl HealthTransition {
+    /// Every transition the state machine can perform, compiled in.
+    ///
+    /// Declaring all of them is what keeps the exposition's size a property of
+    /// the build: a deployment that has never isolated anything still renders
+    /// the same series, so a rate over one of them is always well defined.
+    pub const ALL: [Self; HEALTH_TRANSITION_COUNT] = [
+        Self {
+            from: ProviderHealthState::Healthy,
+            to: ProviderHealthState::Isolated,
+        },
+        Self {
+            from: ProviderHealthState::Isolated,
+            to: ProviderHealthState::Healthy,
+        },
+        Self {
+            from: ProviderHealthState::Healthy,
+            to: ProviderHealthState::Maintenance,
+        },
+        Self {
+            from: ProviderHealthState::Maintenance,
+            to: ProviderHealthState::Healthy,
+        },
+        Self {
+            from: ProviderHealthState::Isolated,
+            to: ProviderHealthState::Maintenance,
+        },
+        Self {
+            from: ProviderHealthState::Maintenance,
+            to: ProviderHealthState::Isolated,
+        },
+        Self {
+            from: ProviderHealthState::Healthy,
+            to: ProviderHealthState::Healthy,
+        },
+        Self {
+            from: ProviderHealthState::Isolated,
+            to: ProviderHealthState::Isolated,
+        },
+        Self {
+            from: ProviderHealthState::Maintenance,
+            to: ProviderHealthState::Maintenance,
+        },
+    ];
+
+    fn index(self) -> usize {
+        self.from as usize * HEALTH_STATE_COUNT + self.to as usize
+    }
+
+    /// The Prometheus label value for this transition.
+    ///
+    /// The two state names are joined into one label so the series is a single
+    /// fixed name rather than a cross product the exposition has to enumerate.
+    pub fn as_str(self) -> String {
+        format!(
+            "{}->{}",
+            health_state_name(self.from),
+            health_state_name(self.to)
+        )
+    }
+}
+
+/// The outcome of one provider health probe.
+///
+/// Three members, all decided by the probe's own transport result, and none of
+/// them carrying the upstream's response text. Keeping the two failures apart is
+/// what lets an operator tell "the origin is answering with errors" from "the
+/// origin is not answering", which are different faults with different fixes, and
+/// it costs no dimension because all three are counted rather than labelled per
+/// provider.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ProbeOutcomeLabel {
+    /// The origin answered with a status below 500.
+    Reachable,
+    /// The origin answered with a status at or above 500.
+    Failing,
+    /// The probe never reached a response.
+    Unreachable,
+}
+
+impl ProbeOutcomeLabel {
+    const ALL: [Self; PROBE_OUTCOME_COUNT] = [Self::Reachable, Self::Failing, Self::Unreachable];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reachable => "reachable",
+            Self::Failing => "failing",
+            Self::Unreachable => "unreachable",
+        }
+    }
+}
+
+/// The stored-independent name of a health state, used in the exposition.
+const fn health_state_name(health: ProviderHealthState) -> &'static str {
+    match health {
+        ProviderHealthState::Healthy => "healthy",
+        ProviderHealthState::Isolated => "isolated",
+        ProviderHealthState::Maintenance => "maintenance",
+    }
+}
+
+/// The number of slots the transition counters hold.
+///
+/// One slot per ordered pair of states, including the self-pairs the state
+/// machine never performs. The spare slots cost three counters and buy a slot
+/// index that is the pair itself, so `index` needs no table and a new state
+/// cannot silently renumber the ones already recorded.
+const HEALTH_TRANSITION_COUNT: usize = HEALTH_STATE_COUNT * HEALTH_STATE_COUNT;
+
 /// The fine result category a request record and a gateway error use.
 ///
 /// This set is closed, so the number of possible results cannot grow with
@@ -208,6 +336,7 @@ impl TransportType {
 pub enum ProxyFailureCategory {
     InvalidGatewayCredential,
     ProviderDisabled,
+    ProviderUnhealthy,
     AccountDisabled,
     KeyExpired,
     NoProviderSelected,
@@ -228,6 +357,7 @@ impl ProxyFailureCategory {
     const ALL: [Self; FAILURE_CATEGORY_COUNT] = [
         Self::InvalidGatewayCredential,
         Self::ProviderDisabled,
+        Self::ProviderUnhealthy,
         Self::AccountDisabled,
         Self::KeyExpired,
         Self::NoProviderSelected,
@@ -252,6 +382,7 @@ impl ProxyFailureCategory {
         match self {
             Self::InvalidGatewayCredential => "invalid_gateway_credential",
             Self::ProviderDisabled => "provider_disabled",
+            Self::ProviderUnhealthy => "provider_unhealthy",
             Self::AccountDisabled => "account_disabled",
             Self::KeyExpired => "key_expired",
             Self::NoProviderSelected => "no_provider_selected",
@@ -287,6 +418,7 @@ impl ProxyFailureCategory {
             | Self::RelayFailed => ResultClass::UpstreamFailure,
             Self::InvalidGatewayCredential
             | Self::ProviderDisabled
+            | Self::ProviderUnhealthy
             | Self::AccountDisabled
             | Self::KeyExpired
             | Self::NoProviderSelected
@@ -347,6 +479,10 @@ struct Inner {
     subscriber_queue_depth: [AtomicUsize; SUBSCRIBER_COUNT],
     subscriber_attempted: [AtomicU64; SUBSCRIBER_COUNT],
     subscriber_dropped: [AtomicU64; SUBSCRIBER_COUNT],
+    health_transitions: [AtomicU64; HEALTH_TRANSITION_COUNT],
+    probe_outcomes: [AtomicU64; PROBE_OUTCOME_COUNT],
+    health_refusals: AtomicU64,
+    providers_by_state: [AtomicU64; HEALTH_STATE_COUNT],
 }
 
 impl Default for Inner {
@@ -363,6 +499,10 @@ impl Default for Inner {
             subscriber_queue_depth: std::array::from_fn(|_| AtomicUsize::new(0)),
             subscriber_attempted: std::array::from_fn(|_| AtomicU64::new(0)),
             subscriber_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
+            health_transitions: std::array::from_fn(|_| AtomicU64::new(0)),
+            probe_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            health_refusals: AtomicU64::new(0),
+            providers_by_state: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 }
@@ -422,6 +562,63 @@ impl Metrics {
     /// exchange that never started.
     pub fn record_rejection(&self, layer: RejectionLayer, reason: RejectionReason) {
         self.inner.rejections[layer.index()][reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one health state transition.
+    ///
+    /// Recorded where the transition is decided, which is the same conditional
+    /// write that changed storage, so a count and a stored state cannot drift.
+    pub fn record_health_transition(&self, transition: HealthTransition) {
+        self.inner.health_transitions[transition.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one probe outcome.
+    ///
+    /// Recorded by the probe itself, at the point its own response or failure was
+    /// decided, because that is the only place the outcome exists. A probe is not
+    /// a client request, so it produces no lifecycle event and no completed
+    /// exchange: it is a control-plane observation, not work the proxy ran.
+    pub fn record_probe(&self, outcome: ProbeOutcomeLabel) {
+        self.inner.probe_outcomes[outcome.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Probe outcomes of one kind since the process started.
+    pub fn probe_outcome_count(&self, outcome: ProbeOutcomeLabel) -> u64 {
+        self.inner.probe_outcomes[outcome.index()].load(Ordering::Relaxed)
+    }
+
+    /// Records a request refused because its provider was not serving.
+    ///
+    /// Counted as a refusal rather than as a completed exchange, because no
+    /// exchange started: counting it as a failure would overstate the error rate
+    /// of a gateway that is correctly protecting an upstream.
+    pub fn record_health_refusal(&self) {
+        self.inner.health_refusals.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Requests refused because their provider was not serving.
+    pub fn health_refusal_count(&self) -> u64 {
+        self.inner.health_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the count of providers in one health state.
+    ///
+    /// Set rather than incremented, because the count of providers in a state is a
+    /// property of the current configuration and not a running total. The discovery
+    /// tick writes all three, so the three always sum to the number of providers
+    /// that carry a probe.
+    pub fn set_providers_in_state(&self, state: ProviderHealthState, count: u64) {
+        self.inner.providers_by_state[state as usize].store(count, Ordering::Relaxed);
+    }
+
+    /// The count of providers currently in one health state.
+    pub fn provider_state_count(&self, state: ProviderHealthState) -> u64 {
+        self.inner.providers_by_state[state as usize].load(Ordering::Relaxed)
+    }
+
+    /// Health transitions of one kind since the process started.
+    pub fn health_transition_count(&self, transition: HealthTransition) -> u64 {
+        self.inner.health_transitions[transition.index()].load(Ordering::Relaxed)
     }
 
     pub fn active_http(&self) -> usize {
@@ -486,6 +683,7 @@ impl Metrics {
         self.render_gauges(&mut output);
         self.render_failures(&mut output);
         self.render_rejections(&mut output);
+        self.render_health(&mut output);
         self.render_subscribers(&mut output);
         output
     }
@@ -667,6 +865,62 @@ impl Metrics {
                 "tokenstream_proxy_failures_total{{category=\"{}\"}} {}",
                 category.as_str(),
                 self.failure_count(category)
+            )
+            .unwrap();
+        }
+    }
+
+    fn render_health(&self, output: &mut String) {
+        writeln!(
+            output,
+            "# TYPE tokenstream_provider_health_transitions_total counter"
+        )
+        .unwrap();
+        for transition in HealthTransition::ALL {
+            writeln!(
+                output,
+                "tokenstream_provider_health_transitions_total{{transition=\"{}\"}} {}",
+                transition.as_str(),
+                self.health_transition_count(transition)
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "# TYPE tokenstream_provider_health_probes_total counter"
+        )
+        .unwrap();
+        for outcome in ProbeOutcomeLabel::ALL {
+            writeln!(
+                output,
+                "tokenstream_provider_health_probes_total{{outcome=\"{}\"}} {}",
+                outcome.as_str(),
+                self.probe_outcome_count(outcome)
+            )
+            .unwrap();
+        }
+        writeln!(
+            output,
+            "# TYPE tokenstream_provider_health_refusals_total counter"
+        )
+        .unwrap();
+        writeln!(
+            output,
+            "tokenstream_provider_health_refusals_total {}",
+            self.health_refusal_count()
+        )
+        .unwrap();
+        writeln!(output, "# TYPE tokenstream_providers_by_health_state gauge").unwrap();
+        for state in [
+            ProviderHealthState::Healthy,
+            ProviderHealthState::Isolated,
+            ProviderHealthState::Maintenance,
+        ] {
+            writeln!(
+                output,
+                "tokenstream_providers_by_health_state{{state=\"{}\"}} {}",
+                health_state_name(state),
+                self.provider_state_count(state)
             )
             .unwrap();
         }
@@ -940,6 +1194,20 @@ mod tests {
             metrics.exchange_count_for_transport(TransportType::Http),
             0,
             "a refused request never became an exchange"
+        );
+    }
+
+    #[test]
+    fn a_health_refusal_is_neither_an_exchange_nor_a_failure() {
+        let metrics = Metrics::default();
+        metrics.record_health_refusal();
+
+        assert_eq!(metrics.health_refusal_count(), 1);
+        assert_eq!(metrics.exchange_count_for_transport(TransportType::Http), 0);
+        assert!(
+            metrics
+                .render()
+                .contains("tokenstream_proxy_failures_total{category=\"provider_unhealthy\"} 0")
         );
     }
 

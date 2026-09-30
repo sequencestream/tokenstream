@@ -23,7 +23,7 @@ use crate::domain::{ProtocolType, TransportType};
 
 pub mod target;
 
-pub use target::{TargetError, build_upstream_uri};
+pub use target::{TargetError, build_probe_uri, build_upstream_uri};
 
 /// OpenAI Chat Completions path, served over HTTP including SSE.
 pub const OPENAI_CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";

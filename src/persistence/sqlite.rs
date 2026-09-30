@@ -8,7 +8,7 @@ use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use crate::MigrationRunner;
 use crate::domain::{
     Account, AccountId, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, PasswordHash, Provider,
-    ProviderId,
+    ProviderHealthState, ProviderId,
 };
 use crate::logging::LogEvent;
 
@@ -16,11 +16,11 @@ use super::time::to_epoch_micros;
 use super::{
     AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
     ApiKeyBindingRow, ApiKeyListRequest, ApiKeyPage, ApiKeyRepository, ApiKeyRow, ApiKeyUpdate,
-    DatabaseBounds, NewAccount, NewApiKey, NewProvider, ProviderListRequest, ProviderPage,
-    ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError, RequestLogCompleted,
-    RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow, RequestLogStarted,
-    account_status_value, admission_count, api_key_status_value, protocol_value, role_value,
-    status_value, timed, transport_value,
+    DatabaseBounds, HealthOutcome, NewAccount, NewApiKey, NewProvider, ProviderListRequest,
+    ProviderPage, ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError,
+    RequestLogCompleted, RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow,
+    RequestLogStarted, account_status_value, admission_count, api_key_status_value, health_name,
+    probe_columns, protocol_value, role_value, status_value, timed, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -223,7 +223,7 @@ impl ProviderRepository for SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    status, max_concurrent_requests, max_requests_per_second, created_at
+                    status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
              FROM provider
              WHERE id = ?",
             )
@@ -244,7 +244,7 @@ impl ProviderRepository for SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                    status, max_concurrent_requests, max_requests_per_second, created_at
+                    status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
              FROM provider
              WHERE id > ?
              ORDER BY id ASC
@@ -271,15 +271,20 @@ impl ProviderRepository for SqliteDatabase {
             admission_count(provider.admission().max_concurrent_requests());
         let max_requests_per_second =
             admission_count(provider.admission().max_requests_per_second());
+        // The probe is stored as its path and its three numbers rather than as
+        // the URL it resolved to, so the row stays origin-relative.
+        let probe = provider.probe().map(probe_columns).transpose()?;
         timed(
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
                 "INSERT INTO provider (
                  name, protocol_type, endpoint, upstream_api_key_ciphertext, status,
-                 max_concurrent_requests, max_requests_per_second, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 max_concurrent_requests, max_requests_per_second,
+                 probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold,
+                 created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                       status, max_concurrent_requests, max_requests_per_second, created_at",
+                       status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at",
             )
             .bind(provider.name)
             .bind(protocol_value(provider.protocol_type))
@@ -288,6 +293,10 @@ impl ProviderRepository for SqliteDatabase {
             .bind(status_value(provider.status))
             .bind(max_concurrent_requests)
             .bind(max_requests_per_second)
+            .bind(probe.as_ref().map(|probe| probe.path.clone()))
+            .bind(probe.as_ref().map(|probe| probe.interval_ms))
+            .bind(probe.as_ref().map(|probe| probe.timeout_ms))
+            .bind(probe.as_ref().map(|probe| probe.failure_threshold))
             .bind(to_epoch_micros(provider.created_at))
             .fetch_one(&self.shared),
         )
@@ -339,11 +348,39 @@ impl ProviderRepository for SqliteDatabase {
                     .push("max_requests_per_second = ")
                     .push_bind_unseparated(admission_count(admission.max_requests_per_second()));
             }
+            // A probe edit writes or clears all four columns together, so the
+            // stored row can never hold a path without the numbers that make it
+            // decidable.
+            if let Some(probe) = update.probe() {
+                let columns = probe.map(probe_columns).transpose()?;
+                if columns.is_none() {
+                    // Removing observation must not strand a provider in the
+                    // probe-derived isolated state. Maintenance is manual and
+                    // remains in force until the operator closes it.
+                    assignments.push(
+                        "health = CASE WHEN health = 'isolated' THEN 'healthy' ELSE health END",
+                    );
+                }
+                assignments
+                    .push("probe_path = ")
+                    .push_bind_unseparated(columns.as_ref().map(|columns| columns.path.clone()));
+                assignments
+                    .push("probe_interval_ms = ")
+                    .push_bind_unseparated(columns.as_ref().map(|columns| columns.interval_ms));
+                assignments
+                    .push("probe_timeout_ms = ")
+                    .push_bind_unseparated(columns.as_ref().map(|columns| columns.timeout_ms));
+                assignments
+                    .push("probe_failure_threshold = ")
+                    .push_bind_unseparated(
+                        columns.as_ref().map(|columns| columns.failure_threshold),
+                    );
+            }
         }
         builder.push(" WHERE id = ").push_bind(id.get());
         builder.push(
             " RETURNING id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
-                      status, max_concurrent_requests, max_requests_per_second, created_at",
+                      status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at",
         );
         timed(
             self.admin_timeout,
@@ -377,6 +414,45 @@ impl ProviderRepository for SqliteDatabase {
         } else {
             Ok(())
         }
+    }
+
+    /// Moves a provider between health states, only from the state the caller
+    /// observed.
+    ///
+    /// A conditional write rather than a blind one: two probes observing the
+    /// same provider, or a probe racing an operator closing a maintenance
+    /// window, must not silently overwrite each other. A caller whose
+    /// expectation no longer holds is told the current state instead, so it can
+    /// decide again from what is actually stored.
+    async fn set_health(
+        &self,
+        id: ProviderId,
+        expected: ProviderHealthState,
+        health: ProviderHealthState,
+    ) -> Result<HealthOutcome, RepositoryError> {
+        if expected == health {
+            return Ok(HealthOutcome::Unchanged(health));
+        }
+        let result = timed(
+            self.admin_timeout,
+            sqlx::query("UPDATE provider SET health = ? WHERE id = ? AND health = ?")
+                .bind(health_name(health))
+                .bind(id.get())
+                .bind(health_name(expected))
+                .execute(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        if result.rows_affected() == 0 {
+            // Either the provider is gone or its state moved under this caller.
+            // Either way the expectation no longer holds, and reporting the
+            // state now stored is more useful to a probe than a bare conflict.
+            return match ProviderRepository::find_by_id(self, id).await? {
+                Some(provider) => Ok(HealthOutcome::Moved(provider.health())),
+                None => Err(RepositoryError::NotFound),
+            };
+        }
+        Ok(HealthOutcome::Applied(health))
     }
 }
 

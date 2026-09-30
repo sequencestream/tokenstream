@@ -6,7 +6,7 @@ Relay allowed HTTP/SSE bodies and WebSocket messages without interpreting applic
 
 ## Design
 
-The proxy applies the architecture header policy and then streams. Every point at which it refuses work or decides an exchange's outcome records an operational fact, and the set of points and the labels those facts carry belong to the [observability design](./observability.md). It does not coalesce SSE, split on newlines, decompress, retry, or convert transports ([ADR 0001](../adr/0001-transparent-proxy-core.md)). Admission is held for the whole HTTP/SSE exchange. Upgraded WebSocket work stays owned by the downstream connection supervisor so shutdown drains both transports ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
+The proxy applies the architecture header policy and then streams. Every point at which it refuses work or decides an exchange's outcome records an operational fact, and the set of points and the labels those facts carry belong to the [observability design](./observability.md). It does not coalesce SSE, split on newlines, decompress, retry, route around an unhealthy upstream, or convert transports ([ADR 0001](../adr/0001-transparent-proxy-core.md)). Admission is held for the whole HTTP/SSE exchange. Upgraded WebSocket work stays owned by the downstream connection supervisor so shutdown drains both transports ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 
 For WebSocket routes the upstream handshake completes before the downstream upgrade ([ADR 0007](../adr/0007-upstream-websocket-handshake-first.md)). An invalid `101` is a handshake failure, not a successful socket. An ordinary non-upgrade HTTP rejection is streamed through unchanged so the client can fall back on its own.
 
@@ -96,6 +96,9 @@ Ping, pong, fragmentation, and close are handled at the connection boundary. Exa
 - Lifecycle events are emitted at three points only: after every admission layer has granted, when an upstream status or handshake outcome arrives, and when the exchange ends. A rejected request emits none of them, and the finished point is emitted at most once per request.
 - Each reused idle connection still replaces credentials from the current snapshot. Mixed snapshots and replay of a cancelled exchange are forbidden.
 - Forced shutdown does not invent a WebSocket close event.
+- A request addressed to an isolated provider is refused before any upstream connection is attempted ([ADR 0018](../adr/0018-probe-derived-provider-isolation.md)). It is a refusal, not a failed exchange, and produces no lifecycle event.
+- An exchange already admitted keeps the health state it started with. Isolation never cancels a stream that is already producing tokens, and recovery never re-opens a request that was already refused.
+- An isolated provider is never bypassed. A refusal does not resolve a different provider, because the caller named this one ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md)).
 
 ## Failures and bounds
 

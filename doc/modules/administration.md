@@ -12,7 +12,7 @@ The control plane authenticates accounts, not a process-wide passphrase ([ADR 00
 
 The **bootstrap administrator** is the account that exists before any other, created from the configured administrator credentials when the store holds no account. It owns the credentials that predate accounts, and it can be neither disabled nor demoted, so a deployment always retains a way back into its own accounts.
 
-**Authorization is decided once per request**, from the session's account and role, before the route handler runs. A regular user reaches only its own credentials and its own request logs. Accounts, providers, and process settings are administrator surfaces, as is the operational exposition, and a regular user receives `403` on them rather than a `404` that would hide the resource's existence. A regular user naming another account on a write receives `403`; naming a non-existent account receives `404`.
+**Authorization is decided once per request**, from the session's account and role, before the route handler runs. A regular user reaches only its own credentials and its own request logs. Accounts, providers, and process settings are administrator surfaces, as is the operational exposition, and a regular user receives `403` on them rather than a `404` that would hide the resource's existence. A provider's health state and its maintenance control are part of the provider surface ([ADR 0018](../adr/0018-probe-derived-provider-isolation.md)): maintenance is a statement about which upstreams this gateway trusts, and a regular account has no standing to make one. A regular user naming another account on a write receives `403`; naming a non-existent account receives `404`.
 
 The page renders only the surfaces the signed-in role may reach, so a regular user never sees a control it cannot use. Hiding is presentation, not enforcement: the API decides, and the page follows.
 
@@ -84,6 +84,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - A half-edited filter form never combines one condition set with another set's cursor.
 - Provider deletion that is blocked by log or binding association returns `409` with `provider_in_use` and directs the administrator to disable.
 - Authorization is decided from the session before dispatch. A handler never decides whether the caller may reach it.
+- Only an administrator reads a provider's health state, edits its probe configuration, or enters and leaves maintenance.
 - A regular user reads and writes only its own credentials and sees only its own request logs.
 - The operational exposition is an administrator surface. It is served only to an authenticated administrator, is not cacheable, and is served at no data-plane path.
 - Disabling an account stops its new data-plane traffic immediately; already admitted streams keep running.
