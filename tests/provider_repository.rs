@@ -337,7 +337,7 @@ async fn insert_sqlite_request_log(
     prefix: &str,
 ) {
     sqlx::query(
-        "INSERT INTO request_log (
+        "INSERT INTO ts_request_log (
              request_id, account_id, api_key_id, provider_id, protocol_type,
              transport_type, path, start_time
          ) VALUES (?, ?, ?, ?, 'openai', 'http', '/v1/responses', 1)",
@@ -396,7 +396,7 @@ async fn insert_postgres_request_log(
     prefix: &str,
 ) {
     sqlx::query(
-        "INSERT INTO request_log (
+        "INSERT INTO ts_request_log (
              request_id, account_id, api_key_id, provider_id, protocol_type,
              transport_type, path, start_time
          ) VALUES ($1, $2, $3, $4, 'openai', 'http', '/v1/responses', 1)",

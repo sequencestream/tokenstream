@@ -361,7 +361,7 @@ async fn postgres_lock_wait_and_sleep_fail_within_deadlines() {
         .execute(&mut *held)
         .await
         .expect("begin");
-    sqlx::query("LOCK TABLE provider IN ACCESS EXCLUSIVE MODE")
+    sqlx::query("LOCK TABLE ts_provider IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *held)
         .await
         .expect("lock table");

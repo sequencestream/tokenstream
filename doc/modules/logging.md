@@ -64,6 +64,7 @@ queued for it and counts it, so no queue depth survives that still claims pendin
 ## Invariants
 
 - Request and response payloads are never stored. Error summaries contain no credentials, authentication headers, query-string secrets, or upstream bodies.
+- Every stored row names an account and a credential.
 - An absent end time means no completion event was persisted. It does not prove liveness.
 - Administration never writes log rows on behalf of the proxy. Proxy modules depend on the bus only, never on this writer.
 - A permanent unwritable event cannot roll back other events in the same batch.

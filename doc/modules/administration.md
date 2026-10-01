@@ -95,6 +95,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 ## Failures and bounds
 
 - Missing or expired sessions fail authentication. Invalid CSRF protection fails the state-changing request.
+- An internal failure answers a generic error to the caller and reports the cause on the process standard error stream. Query strings, credential values, and payload text stay out of that report.
 - General request rate limiting is out of scope. Connection cap, body timeout, hashing budget, and database deadlines are process bounds, not an application limiter.
 - Credential binding sets and account lists are bounded, so a write that names an oversized set is rejected before persistence.
 - The active session count is bounded, so a sign-in burst fails with a capacity error rather than growing the map.

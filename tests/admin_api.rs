@@ -897,3 +897,39 @@ async fn accounts_and_credentials_are_role_scoped_and_never_return_a_secret() {
         );
     }
 }
+
+#[tokio::test]
+async fn request_log_storage_failure_returns_a_generic_internal_error() {
+    let (api, database, _directory) = api(Duration::from_secs(60)).await;
+    let (cookie, _) = sign_in(&api).await;
+    sqlx::query("DROP TABLE ts_request_log")
+        .execute(database.pool())
+        .await
+        .expect("drop request log table");
+    let (status, headers, body) = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/request-logs?limit=100",
+            Value::Null,
+            Some(&cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    assert_eq!(body["error"]["code"], "internal_error");
+    assert_eq!(
+        body["error"]["message"],
+        "The request could not be completed."
+    );
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("request_log") && !rendered.contains("no such table"),
+        "the generic envelope must not carry the storage message: {rendered}"
+    );
+}

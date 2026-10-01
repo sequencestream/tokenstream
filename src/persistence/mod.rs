@@ -1712,23 +1712,42 @@ struct RequestLogRow {
 
 impl RequestLogRow {
     fn into_request_log(self) -> Result<RequestLog, RepositoryError> {
-        let id = RequestLogId::try_from(self.id).map_err(invalid_positive_value)?;
-        let request_id = RequestId::new(self.request_id).map_err(invalid_opaque_value)?;
-        let account_id = AccountId::try_from(self.account_id).map_err(invalid_positive_value)?;
-        let api_key_id = ApiKeyId::try_from(self.api_key_id).map_err(invalid_positive_value)?;
-        let provider_id = ProviderId::try_from(self.provider_id).map_err(invalid_positive_value)?;
-        let protocol_type = parse_protocol_value(&self.protocol_type)?;
+        let row_id = self.id;
+        self.try_into_request_log().map_err(|reason| {
+            eprintln!("request log {row_id} has invalid stored data: {reason}");
+            RepositoryError::InvalidStoredData
+        })
+    }
+
+    fn try_into_request_log(self) -> Result<RequestLog, &'static str> {
+        let id = RequestLogId::try_from(self.id).map_err(|_| "id is not positive")?;
+        let request_id = RequestId::new(self.request_id).map_err(|_| "request_id is empty")?;
+        let account_id =
+            AccountId::try_from(self.account_id).map_err(|_| "account_id is not positive")?;
+        let api_key_id =
+            ApiKeyId::try_from(self.api_key_id).map_err(|_| "api_key_id is not positive")?;
+        let provider_id =
+            ProviderId::try_from(self.provider_id).map_err(|_| "provider_id is not positive")?;
+        let protocol_type = match self.protocol_type.as_str() {
+            "openai" => ProtocolType::OpenAi,
+            "anthropic" => ProtocolType::Anthropic,
+            _ => return Err("protocol_type is unknown"),
+        };
         let transport_type = match self.transport_type.as_str() {
             "http" => TransportType::Http,
             "websocket" => TransportType::WebSocket,
-            _ => return Err(RepositoryError::InvalidStoredData),
+            _ => return Err("transport_type is unknown"),
         };
         let status_code = self
             .status_code
-            .map(|value| u16::try_from(value).map_err(|_| RepositoryError::InvalidStoredData))
+            .map(|value| u16::try_from(value).map_err(|_| "status_code is out of range"))
             .transpose()?;
-        let start_time = time::from_epoch_micros(self.start_time)?;
-        let end_time = self.end_time.map(time::from_epoch_micros).transpose()?;
+        let start_time =
+            time::from_epoch_micros(self.start_time).map_err(|_| "start_time is out of range")?;
+        let end_time = self
+            .end_time
+            .map(|value| time::from_epoch_micros(value).map_err(|_| "end_time is out of range"))
+            .transpose()?;
 
         Ok(RequestLog::new(
             id,
@@ -1759,14 +1778,6 @@ fn protocol_value(protocol_type: ProtocolType) -> &'static str {
     match protocol_type {
         ProtocolType::OpenAi => "openai",
         ProtocolType::Anthropic => "anthropic",
-    }
-}
-
-fn parse_protocol_value(value: &str) -> Result<ProtocolType, RepositoryError> {
-    match value {
-        "openai" => Ok(ProtocolType::OpenAi),
-        "anthropic" => Ok(ProtocolType::Anthropic),
-        _ => Err(RepositoryError::InvalidStoredData),
     }
 }
 

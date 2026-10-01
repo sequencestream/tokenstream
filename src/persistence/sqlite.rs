@@ -131,7 +131,7 @@ impl SqliteDatabase {
             match event {
                 LogEvent::Started(event) => {
                     sqlx::query(
-                        "INSERT INTO request_log (
+                        "INSERT INTO ts_request_log (
                              request_id, account_id, api_key_id, provider_id, protocol_type,
                              transport_type, path, start_time
                          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -150,7 +150,7 @@ impl SqliteDatabase {
                 }
                 LogEvent::Completed(event) => {
                     sqlx::query(
-                        "UPDATE request_log
+                        "UPDATE ts_request_log
                          SET status_code = ?, end_time = ?, error_msg = ?
                          WHERE request_id = ? AND end_time IS NULL",
                     )
@@ -224,7 +224,7 @@ impl ProviderRepository for SqliteDatabase {
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
-             FROM provider
+             FROM ts_provider
              WHERE id = ?",
             )
             .bind(id.get())
@@ -245,7 +245,7 @@ impl ProviderRepository for SqliteDatabase {
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
-             FROM provider
+             FROM ts_provider
              WHERE id > ?
              ORDER BY id ASC
              LIMIT ?",
@@ -277,7 +277,7 @@ impl ProviderRepository for SqliteDatabase {
         timed(
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
-                "INSERT INTO provider (
+                "INSERT INTO ts_provider (
                  name, protocol_type, endpoint, upstream_api_key_ciphertext, status,
                  max_concurrent_requests, max_requests_per_second,
                  probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold,
@@ -319,7 +319,7 @@ impl ProviderRepository for SqliteDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE provider SET ");
+        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE ts_provider SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -397,7 +397,7 @@ impl ProviderRepository for SqliteDatabase {
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM provider WHERE id = ?")
+            sqlx::query("DELETE FROM ts_provider WHERE id = ?")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -435,7 +435,7 @@ impl ProviderRepository for SqliteDatabase {
         }
         let result = timed(
             self.admin_timeout,
-            sqlx::query("UPDATE provider SET health = ? WHERE id = ? AND health = ?")
+            sqlx::query("UPDATE ts_provider SET health = ? WHERE id = ? AND health = ?")
                 .bind(health_name(health))
                 .bind(id.get())
                 .bind(health_name(expected))
@@ -462,7 +462,7 @@ impl AccountRepository for SqliteDatabase {
             self.auth_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE is_bootstrap = 1",
             )
             .fetch_optional(&self.auth),
@@ -478,7 +478,7 @@ impl AccountRepository for SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE name = ?",
             )
             .bind(name)
@@ -495,7 +495,7 @@ impl AccountRepository for SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE id = ?",
             )
             .bind(id.get())
@@ -515,7 +515,7 @@ impl AccountRepository for SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE id > ?
              ORDER BY id ASC
              LIMIT ?",
@@ -548,7 +548,7 @@ impl AccountRepository for SqliteDatabase {
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
-                "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+                "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at)
              VALUES (?, ?, ?, ?, ?, ?)
              RETURNING id, name, password_hash, role, status, is_bootstrap, created_at",
             )
@@ -579,7 +579,7 @@ impl AccountRepository for SqliteDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE account SET ");
+        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE ts_account SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -620,7 +620,7 @@ impl AccountRepository for SqliteDatabase {
     async fn delete(&self, id: AccountId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM account WHERE id = ?")
+            sqlx::query("DELETE FROM ts_account WHERE id = ?")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -642,7 +642,7 @@ impl AccountRepository for SqliteDatabase {
     async fn count(&self) -> Result<i64, RepositoryError> {
         timed(
             self.admin_timeout,
-            sqlx::query_scalar("SELECT COUNT(*) FROM account").fetch_one(&self.shared),
+            sqlx::query_scalar("SELECT COUNT(*) FROM ts_account").fetch_one(&self.shared),
         )
         .await
         .map_err(map_storage_error)
@@ -660,7 +660,7 @@ impl ApiKeyRepository for SqliteDatabase {
                 "SELECT id, account_id, name, key_id, secret_hash, status,
                         default_provider_id, expires_at,
                         max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-             FROM api_key
+             FROM ts_api_key
              WHERE key_id = ?",
             )
             .bind(key_id.as_str())
@@ -687,7 +687,7 @@ impl ApiKeyRepository for SqliteDatabase {
                 "SELECT id, account_id, name, key_id, secret_hash, status,
                         default_provider_id, expires_at,
                         max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-             FROM api_key
+             FROM ts_api_key
              WHERE id = ?",
             )
             .bind(id.get())
@@ -712,7 +712,7 @@ impl ApiKeyRepository for SqliteDatabase {
             "SELECT id, account_id, name, key_id, secret_hash, status,
                     default_provider_id, expires_at,
                     max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-             FROM api_key
+             FROM ts_api_key
              WHERE id > ",
         );
         builder.push_bind(after_id);
@@ -748,7 +748,7 @@ impl ApiKeyRepository for SqliteDatabase {
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
-                "INSERT INTO api_key (
+                "INSERT INTO ts_api_key (
                      account_id, name, key_id, secret_hash, status,
                      default_provider_id, expires_at,
                      max_concurrent_requests, max_requests_per_second, max_websockets, created_at
@@ -800,7 +800,7 @@ impl ApiKeyRepository for SqliteDatabase {
         if let Some(provider_ids) = update.provider_ids() {
             timed(
                 self.admin_timeout,
-                sqlx::query("DELETE FROM api_key_provider WHERE api_key_id = ?")
+                sqlx::query("DELETE FROM ts_api_key_provider WHERE api_key_id = ?")
                     .bind(id.get())
                     .execute(&mut *transaction),
             )
@@ -808,7 +808,7 @@ impl ApiKeyRepository for SqliteDatabase {
             .map_err(|error| map_write_error(error, LABEL))?;
             write_bindings(&mut transaction, id, provider_ids).await?;
         }
-        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE api_key SET ");
+        let mut builder = QueryBuilder::<Sqlite>::new("UPDATE ts_api_key SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -877,7 +877,7 @@ impl ApiKeyRepository for SqliteDatabase {
         let updated = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
-                "UPDATE api_key
+                "UPDATE ts_api_key
              SET key_id = ?, secret_hash = ?
              WHERE id = ?
              RETURNING id, account_id, name, key_id, secret_hash, status,
@@ -901,7 +901,7 @@ impl ApiKeyRepository for SqliteDatabase {
     async fn delete(&self, id: ApiKeyId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM api_key WHERE id = ?")
+            sqlx::query("DELETE FROM ts_api_key WHERE id = ?")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -931,7 +931,7 @@ impl SqliteDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyBindingRow>(
                 "SELECT api_key_id, provider_id, position
-             FROM api_key_provider
+             FROM ts_api_key_provider
              WHERE api_key_id = ?
              ORDER BY position ASC",
             )
@@ -960,7 +960,7 @@ async fn write_bindings(
         timed(
             BINDING_WRITE_DEADLINE,
             sqlx::query(
-                "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+                "INSERT INTO ts_api_key_provider (api_key_id, provider_id, position)
                  VALUES (?, ?, ?)",
             )
             .bind(api_key_id.get())
@@ -984,7 +984,7 @@ async fn adopt_legacy_keys(
     transaction: &mut sqlx::Transaction<'_, Sqlite>,
     account_id: AccountId,
 ) -> Result<(), RepositoryError> {
-    let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM legacy_gateway_key")
+    let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM ts_legacy_gateway_key")
         .fetch_all(&mut **transaction)
         .await
         .map_err(map_storage_error)?;
@@ -993,7 +993,7 @@ async fn adopt_legacy_keys(
         let key_id: String = row.get("key_id");
         let secret_hash: String = row.get("secret_hash");
         let created = sqlx::query(
-            "INSERT INTO api_key (
+            "INSERT INTO ts_api_key (
                  account_id, name, key_id, secret_hash, status,
                  default_provider_id, expires_at, created_at
              ) VALUES (?, ?, ?, ?, 'enabled', ?, NULL, ?)
@@ -1010,7 +1010,7 @@ async fn adopt_legacy_keys(
         .map_err(|error| map_write_error(error, LABEL))?;
         let api_key_id: i64 = created.get("id");
         sqlx::query(
-            "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+            "INSERT INTO ts_api_key_provider (api_key_id, provider_id, position)
              VALUES (?, ?, 0)",
         )
         .bind(api_key_id)
@@ -1019,7 +1019,7 @@ async fn adopt_legacy_keys(
         .await
         .map_err(|error| map_write_error(error, LABEL))?;
     }
-    sqlx::query("DELETE FROM legacy_gateway_key")
+    sqlx::query("DELETE FROM ts_legacy_gateway_key")
         .execute(&mut **transaction)
         .await
         .map_err(map_storage_error)?;
@@ -1031,7 +1031,7 @@ impl RequestLogRepository for SqliteDatabase {
         timed(
             self.log_timeout,
             sqlx::query(
-                "INSERT INTO request_log (
+                "INSERT INTO ts_request_log (
                  request_id, account_id, api_key_id, provider_id, protocol_type,
                  transport_type, path, start_time
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1055,7 +1055,7 @@ impl RequestLogRepository for SqliteDatabase {
         timed(
             self.log_timeout,
             sqlx::query(
-                "UPDATE request_log
+                "UPDATE ts_request_log
              SET status_code = ?, end_time = ?, error_msg = ?
              WHERE request_id = ? AND end_time IS NULL",
             )
@@ -1074,7 +1074,7 @@ impl RequestLogRepository for SqliteDatabase {
         let mut statement = QueryBuilder::<Sqlite>::new(
             "SELECT id, request_id, account_id, api_key_id, provider_id, protocol_type,
                     transport_type, path, status_code, start_time, end_time, error_msg
-             FROM request_log
+             FROM ts_request_log
              WHERE id > ",
         );
         statement.push_bind(query.after_id().map_or(0, |cursor| cursor.get()));
@@ -1141,6 +1141,8 @@ fn map_write_error(error: sqlx::Error, label: &str) -> RepositoryError {
         // rejected the write, so it is reported rather than discarded.
         if let Some(database_error) = error.as_database_error() {
             eprintln!("{label} write failed: {database_error}");
+        } else {
+            eprintln!("{label} write failed: {error}");
         }
         RepositoryError::Storage
     }
@@ -1150,6 +1152,10 @@ fn map_storage_error(error: sqlx::Error) -> RepositoryError {
     if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else {
+        // A read that fails without a classified code would otherwise become a
+        // silent 500. The database's own message names the table, column, or
+        // constraint, so it is reported rather than discarded.
+        eprintln!("{LABEL} storage operation failed: {error}");
         RepositoryError::Storage
     }
 }

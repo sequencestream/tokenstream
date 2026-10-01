@@ -14,7 +14,7 @@ async fn database(path: &Path, max_connections: usize) -> SqliteDatabase {
 /// Inserts a provider, which now holds configuration only and issues nothing.
 async fn insert_provider(pool: &SqlitePool, name: &str) -> i64 {
     sqlx::query(
-        "INSERT INTO provider (
+        "INSERT INTO ts_provider (
             name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at
          ) VALUES (?, 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
     )
@@ -28,7 +28,7 @@ async fn insert_provider(pool: &SqlitePool, name: &str) -> i64 {
 /// Inserts the account and credential a request log is attributed to.
 async fn insert_principal(pool: &SqlitePool) -> (i64, i64, i64) {
     let account_id = sqlx::query(
-        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+        "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at)
          VALUES ('migrated-admin', 'hash', 'admin', 'enabled', 1, 1)",
     )
     .execute(pool)
@@ -36,7 +36,7 @@ async fn insert_principal(pool: &SqlitePool) -> (i64, i64, i64) {
     .expect("insert account")
     .last_insert_rowid();
     let api_key_id = sqlx::query(
-        "INSERT INTO api_key (
+        "INSERT INTO ts_api_key (
             account_id, name, key_id, secret_hash, status, default_provider_id,
             expires_at, created_at
          ) VALUES (?, 'migrated', 'migrated-key', 'hash', 'enabled', NULL, NULL, 1)",
@@ -58,7 +58,7 @@ async fn insert_request_log(
     provider_id: i64,
 ) {
     sqlx::query(
-        "INSERT INTO request_log (
+        "INSERT INTO ts_request_log (
             request_id, account_id, api_key_id, provider_id,
             protocol_type, transport_type, path, start_time
          ) VALUES (?, ?, ?, ?, 'openai', 'http', '/v1/responses', 1)",
@@ -86,7 +86,7 @@ async fn migrations_are_versioned_and_repeatable() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 4);
+    assert_eq!(version, 1);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
@@ -98,16 +98,68 @@ async fn migrations_are_versioned_and_repeatable() {
     .map(|row| row.get("name"))
     .collect();
     for expected in [
-        "account",
-        "api_key",
-        "api_key_provider",
-        "provider",
-        "request_log",
-        "request_log_start_time_idx",
-        "request_log_provider_id_idx",
-        "request_log_account_id_idx",
+        "ts_account",
+        "ts_api_key",
+        "ts_api_key_provider",
+        "ts_provider",
+        "ts_request_log",
+        "ts_legacy_gateway_key",
+        "ts_request_log_start_time_idx",
+        "ts_request_log_provider_id_idx",
+        "ts_request_log_account_id_idx",
     ] {
         assert!(objects.contains(expected), "missing {expected}");
+    }
+}
+
+#[tokio::test]
+async fn schema_records_table_and_column_comments() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = database(&directory.path().join("comments.db"), 1).await;
+    database.migrate().await.expect("migrations");
+
+    for (table, remark) in [
+        (
+            "ts_account",
+            "Control-plane principal and owner of data-plane credentials.",
+        ),
+        (
+            "ts_provider",
+            "Upstream configuration. A provider issues no credentials.",
+        ),
+        ("ts_api_key", "Account-owned data-plane credential."),
+        (
+            "ts_api_key_provider",
+            "Ordered provider bindings for a credential.",
+        ),
+        (
+            "ts_request_log",
+            "Metadata-only record of one proxy exchange.",
+        ),
+        (
+            "ts_legacy_gateway_key",
+            "Staging for credentials that predate accounts. Empty on a fresh database.",
+        ),
+    ] {
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+                .bind(table)
+                .fetch_one(database.pool())
+                .await
+                .expect("table sql");
+        assert!(
+            sql.contains(remark),
+            "{table} is missing its table remark: {sql}"
+        );
+
+        let columns = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(database.pool())
+            .await
+            .expect("column info");
+        assert!(
+            sql.matches("-- ").count() > columns.len(),
+            "{table} is missing a remark for every column: {sql}"
+        );
     }
 }
 
@@ -140,22 +192,22 @@ async fn schema_rejects_invalid_unique_and_enum_values() {
 
     for statement in [
         // A provider name is unique.
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('primary', 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
+        "INSERT INTO ts_provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('primary', 'openai', 'https://example.com', 'ciphertext', 'enabled', 1)",
         // Only the two known protocols and the two known statuses are accepted.
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'unknown', 'https://example.com', 'ciphertext', 'enabled', 1)",
-        "INSERT INTO provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'openai', 'https://example.com', 'ciphertext', 'retired', 1)",
+        "INSERT INTO ts_provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'unknown', 'https://example.com', 'ciphertext', 'enabled', 1)",
+        "INSERT INTO ts_provider (name, protocol_type, endpoint, upstream_api_key_ciphertext, status, created_at) VALUES ('secondary', 'openai', 'https://example.com', 'ciphertext', 'retired', 1)",
         // An account name and a credential key identifier are each unique.
-        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('migrated-admin', 'hash', 'user', 'enabled', 0, 1)",
-        "INSERT INTO api_key (account_id, name, key_id, secret_hash, status, default_provider_id, expires_at, created_at) VALUES (1, 'other', 'migrated-key', 'hash', 'enabled', NULL, NULL, 1)",
+        "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('migrated-admin', 'hash', 'user', 'enabled', 0, 1)",
+        "INSERT INTO ts_api_key (account_id, name, key_id, secret_hash, status, default_provider_id, expires_at, created_at) VALUES (1, 'other', 'migrated-key', 'hash', 'enabled', NULL, NULL, 1)",
         // Only the two known roles and statuses are accepted.
-        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'owner', 'enabled', 0, 1)",
-        "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'user', 'locked', 0, 1)",
+        "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'owner', 'enabled', 0, 1)",
+        "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at) VALUES ('other', 'hash', 'user', 'locked', 0, 1)",
     ] {
         assert!(database.pool().execute(statement).await.is_err());
     }
 
     let invalid_transport = sqlx::query(
-        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time)
+        "INSERT INTO ts_request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time)
          VALUES ('request-invalid', ?, ?, ?, 'openai', 'stream', '/v1/responses', 1)",
     )
     .bind(account_id)
@@ -175,10 +227,12 @@ async fn schema_rejects_invalid_unique_and_enum_values() {
     .await;
     for statement in [
         // A request identifier is unique, so a start event is recorded once.
-        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-1', 1, 1, 1, 'openai', 'http', '/v1/responses', 1)",
-        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-2', 1, 1, 1, 'unknown', 'http', '/v1/responses', 1)",
+        "INSERT INTO ts_request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-1', 1, 1, 1, 'openai', 'http', '/v1/responses', 1)",
+        "INSERT INTO ts_request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-2', 1, 1, 1, 'unknown', 'http', '/v1/responses', 1)",
         // A credential belongs to an account that exists.
-        "INSERT INTO request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-3', 999, 999, 1, 'openai', 'http', '/v1/responses', 1)",
+        "INSERT INTO ts_request_log (request_id, account_id, api_key_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-3', 999, 999, 1, 'openai', 'http', '/v1/responses', 1)",
+        // Every stored request log names an account and a credential.
+        "INSERT INTO ts_request_log (request_id, provider_id, protocol_type, transport_type, path, start_time) VALUES ('request-unowned', 1, 'openai', 'http', '/v1/responses', 1)",
     ] {
         assert!(database.pool().execute(statement).await.is_err());
     }
@@ -201,7 +255,7 @@ async fn referenced_providers_cannot_be_deleted_and_ids_are_not_reused() {
     )
     .await;
     assert!(
-        sqlx::query("DELETE FROM provider WHERE id = ?")
+        sqlx::query("DELETE FROM ts_provider WHERE id = ?")
             .bind(referenced_id)
             .execute(database.pool())
             .await
@@ -209,7 +263,7 @@ async fn referenced_providers_cannot_be_deleted_and_ids_are_not_reused() {
     );
 
     let deleted_id = insert_provider(database.pool(), "deleted").await;
-    sqlx::query("DELETE FROM provider WHERE id = ?")
+    sqlx::query("DELETE FROM ts_provider WHERE id = ?")
         .bind(deleted_id)
         .execute(database.pool())
         .await
@@ -229,7 +283,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
     let provider_id = insert_provider(database.pool(), "unbounded").await;
     let stored: (Option<i64>, Option<i64>) = sqlx::query_as(
         "SELECT max_concurrent_requests, max_requests_per_second
-         FROM provider WHERE id = ?",
+         FROM ts_provider WHERE id = ?",
     )
     .bind(provider_id)
     .fetch_one(database.pool())
@@ -240,7 +294,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
     let (account_id, _, _) = insert_principal(database.pool()).await;
     let credential_bounds: (Option<i64>, Option<i64>, Option<i64>) = sqlx::query_as(
         "SELECT max_concurrent_requests, max_requests_per_second, max_websockets
-         FROM api_key WHERE account_id = ?",
+         FROM ts_api_key WHERE account_id = ?",
     )
     .bind(account_id)
     .fetch_one(database.pool())
@@ -251,7 +305,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
     // A positive bound is stored; zero is refused by the table itself, because
     // a bound of zero would forbid all traffic rather than bound it.
     sqlx::query(
-        "UPDATE provider SET max_concurrent_requests = ?, max_requests_per_second = ?
+        "UPDATE ts_provider SET max_concurrent_requests = ?, max_requests_per_second = ?
          WHERE id = ?",
     )
     .bind(4_i64)
@@ -261,7 +315,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
     .await
     .expect("store positive bounds");
     assert!(
-        sqlx::query("UPDATE provider SET max_concurrent_requests = 0 WHERE id = ?")
+        sqlx::query("UPDATE ts_provider SET max_concurrent_requests = 0 WHERE id = ?")
             .bind(provider_id)
             .execute(database.pool())
             .await
@@ -269,7 +323,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
         "a zero provider bound is refused"
     );
     assert!(
-        sqlx::query("UPDATE provider SET max_requests_per_second = 0 WHERE id = ?")
+        sqlx::query("UPDATE ts_provider SET max_requests_per_second = 0 WHERE id = ?")
             .bind(provider_id)
             .execute(database.pool())
             .await
@@ -277,7 +331,7 @@ async fn admission_bounds_default_to_unbounded_and_refuse_zero() {
         "a zero provider rate is refused"
     );
     assert!(
-        sqlx::query("UPDATE api_key SET max_websockets = 0 WHERE account_id = ?")
+        sqlx::query("UPDATE ts_api_key SET max_websockets = 0 WHERE account_id = ?")
             .bind(account_id)
             .execute(database.pool())
             .await
@@ -294,10 +348,10 @@ async fn provider_health_is_complete_bounded_and_closed() {
     let provider_id = insert_provider(database.pool(), "health-provider").await;
 
     for statement in [
-        "UPDATE provider SET health = 'unknown' WHERE id = ?",
-        "UPDATE provider SET probe_path = '/ready' WHERE id = ?",
-        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 86400001, probe_timeout_ms = 1000, probe_failure_threshold = 2 WHERE id = ?",
-        "UPDATE provider SET probe_path = '/ready', probe_interval_ms = 1000, probe_timeout_ms = 1000, probe_failure_threshold = 1001 WHERE id = ?",
+        "UPDATE ts_provider SET health = 'unknown' WHERE id = ?",
+        "UPDATE ts_provider SET probe_path = '/ready' WHERE id = ?",
+        "UPDATE ts_provider SET probe_path = '/ready', probe_interval_ms = 86400001, probe_timeout_ms = 1000, probe_failure_threshold = 2 WHERE id = ?",
+        "UPDATE ts_provider SET probe_path = '/ready', probe_interval_ms = 1000, probe_timeout_ms = 1000, probe_failure_threshold = 1001 WHERE id = ?",
     ] {
         assert!(
             sqlx::query(statement)

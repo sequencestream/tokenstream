@@ -484,13 +484,13 @@ where
                     .record_failure(ProxyFailureCategory::ResourceExhausted);
                 return resource_exhausted();
             }
-            Err(_) => return internal_error(),
+            Err(error) => return internal_error(error),
         };
         let Ok(session_token) = random_token() else {
-            return internal_error();
+            return internal_error("failed to generate a session token");
         };
         let Ok(csrf_token) = random_token() else {
-            return internal_error();
+            return internal_error("failed to generate a CSRF token");
         };
         let now = Instant::now();
         let mut sessions = self.sessions.lock().expect("session lock is not poisoned");
@@ -1210,13 +1210,13 @@ where
         // passphrase that can drift from the account it stands for.
         if let Some(hash) = new_password_hash {
             if let Some(data_dir) = data_dir.as_deref()
-                && crate::local_state::save_admin_hash_file(data_dir, &hash).is_err()
+                && let Err(error) = crate::local_state::save_admin_hash_file(data_dir, &hash)
             {
-                return internal_error();
+                return internal_error(error);
             }
             let bootstrap = match AccountRepository::find_bootstrap(&self.repository).await {
                 Ok(bootstrap) => bootstrap,
-                Err(_) => return internal_error(),
+                Err(error) => return internal_error(error),
             };
             if let Some(bootstrap) = bootstrap {
                 let mut change = UpdateAccountRequest::new();
@@ -1226,13 +1226,12 @@ where
                         .cloned()
                         .unwrap_or_default(),
                 ));
-                if self
+                if let Err(error) = self
                     .credentials
                     .update_account(bootstrap.id(), change)
                     .await
-                    .is_err()
                 {
-                    return internal_error();
+                    return internal_error(error);
                 }
             }
             *self
@@ -1247,14 +1246,14 @@ where
                 Err(_) => return invalid_input("Invalid master key."),
             };
             let next = AesGcmCipher::new(&key);
-            if self.providers.reencrypt_upstream_keys(&next).await.is_err() {
-                return internal_error();
+            if let Err(error) = self.providers.reencrypt_upstream_keys(&next).await {
+                return internal_error(error);
             }
             self.providers.cipher().install_master_key(&key);
             if let Some(data_dir) = data_dir.as_deref()
-                && crate::local_state::save_master_key_file(data_dir, &hex).is_err()
+                && let Err(error) = crate::local_state::save_master_key_file(data_dir, &hex)
             {
-                return internal_error();
+                return internal_error(error);
             }
         }
 
@@ -1272,9 +1271,9 @@ where
                 .map(ToOwned::to_owned)
                 .or_else(|| process.desired.data_dir().map(ToOwned::to_owned));
             if let Some(data_dir) = overlay_dir.as_deref()
-                && crate::local_state::save_overlay(data_dir, &process.overlay).is_err()
+                && let Err(error) = crate::local_state::save_overlay(data_dir, &process.overlay)
             {
-                return internal_error();
+                return internal_error(error);
             }
             *self
                 .body_timeout
@@ -1337,7 +1336,7 @@ where
                     .record_failure(ProxyFailureCategory::ResourceExhausted);
                 resource_exhausted()
             }
-            Err(_) => internal_error(),
+            Err(error) => internal_error(error),
         }
     }
 
@@ -1378,7 +1377,7 @@ where
                     .record_failure(ProxyFailureCategory::ResourceExhausted);
                 resource_exhausted()
             }
-            ProviderServiceError::Cipher | ProviderServiceError::Storage => internal_error(),
+            ProviderServiceError::Cipher | ProviderServiceError::Storage => internal_error(error),
         }
     }
 
@@ -1427,7 +1426,7 @@ where
                     .record_failure(ProxyFailureCategory::ResourceExhausted);
                 resource_exhausted()
             }
-            CredentialServiceError::Storage => internal_error(),
+            CredentialServiceError::Storage => internal_error(error),
         }
     }
 }
@@ -2072,7 +2071,11 @@ fn invalid_input(message: &'static str) -> Response<ApiBody> {
     api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
 }
 
-fn internal_error() -> Response<ApiBody> {
+fn internal_error(source: impl std::fmt::Display) -> Response<ApiBody> {
+    // The caller receives a generic envelope so a storage message, path, or
+    // query never leaves the process. The cause is written to the process
+    // standard error stream, which is the operator console.
+    eprintln!("Tokenstream administration request failed: {source}");
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",

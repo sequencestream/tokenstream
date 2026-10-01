@@ -130,7 +130,7 @@ impl PostgresDatabase {
             match event {
                 LogEvent::Started(event) => {
                     sqlx::query(
-                        "INSERT INTO request_log (
+                        "INSERT INTO ts_request_log (
                              request_id, account_id, api_key_id, provider_id, protocol_type,
                              transport_type, path, start_time
                          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -149,7 +149,7 @@ impl PostgresDatabase {
                 }
                 LogEvent::Completed(event) => {
                     sqlx::query(
-                        "UPDATE request_log
+                        "UPDATE ts_request_log
                          SET status_code = $1, end_time = $2, error_msg = $3
                          WHERE request_id = $4 AND end_time IS NULL",
                     )
@@ -201,7 +201,7 @@ impl ProviderRepository for PostgresDatabase {
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
-             FROM provider
+             FROM ts_provider
              WHERE id = $1",
             )
             .bind(id.get())
@@ -222,7 +222,7 @@ impl ProviderRepository for PostgresDatabase {
             sqlx::query_as::<_, ProviderRow>(
                 "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
                     status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
-             FROM provider
+             FROM ts_provider
              WHERE id > $1
              ORDER BY id ASC
              LIMIT $2",
@@ -254,7 +254,7 @@ impl ProviderRepository for PostgresDatabase {
         timed(
             self.admin_timeout,
             sqlx::query_as::<_, ProviderRow>(
-                "INSERT INTO provider (
+                "INSERT INTO ts_provider (
                  name, protocol_type, endpoint, upstream_api_key_ciphertext, status,
                  max_concurrent_requests, max_requests_per_second,
                  probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold,
@@ -300,7 +300,7 @@ impl ProviderRepository for PostgresDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut builder = QueryBuilder::<Postgres>::new("UPDATE provider SET ");
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE ts_provider SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -378,7 +378,7 @@ impl ProviderRepository for PostgresDatabase {
     async fn delete(&self, id: ProviderId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM provider WHERE id = $1")
+            sqlx::query("DELETE FROM ts_provider WHERE id = $1")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -416,7 +416,7 @@ impl ProviderRepository for PostgresDatabase {
         }
         let result = timed(
             self.admin_timeout,
-            sqlx::query("UPDATE provider SET health = $1 WHERE id = $2 AND health = $3")
+            sqlx::query("UPDATE ts_provider SET health = $1 WHERE id = $2 AND health = $3")
                 .bind(health_name(health))
                 .bind(id.get())
                 .bind(health_name(expected))
@@ -442,7 +442,7 @@ impl RequestLogRepository for PostgresDatabase {
         timed(
             self.log_timeout,
             sqlx::query(
-                "INSERT INTO request_log (
+                "INSERT INTO ts_request_log (
                  request_id, account_id, api_key_id, provider_id, protocol_type,
                  transport_type, path, start_time
              ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -466,7 +466,7 @@ impl RequestLogRepository for PostgresDatabase {
         timed(
             self.log_timeout,
             sqlx::query(
-                "UPDATE request_log
+                "UPDATE ts_request_log
              SET status_code = $1, end_time = $2, error_msg = $3
              WHERE request_id = $4 AND end_time IS NULL",
             )
@@ -486,7 +486,7 @@ impl RequestLogRepository for PostgresDatabase {
             "SELECT id, request_id, account_id, api_key_id, provider_id, protocol_type,
                     transport_type, path, status_code::BIGINT AS status_code,
                     start_time, end_time, error_msg
-             FROM request_log
+             FROM ts_request_log
              WHERE id > ",
         );
         statement.push_bind(query.after_id().map_or(0, |cursor| cursor.get()));
@@ -543,7 +543,7 @@ impl AccountRepository for PostgresDatabase {
             self.auth_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE is_bootstrap = TRUE",
             )
             .fetch_optional(&self.auth),
@@ -559,7 +559,7 @@ impl AccountRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE name = $1",
             )
             .bind(name)
@@ -576,7 +576,7 @@ impl AccountRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE id = $1",
             )
             .bind(id.get())
@@ -596,7 +596,7 @@ impl AccountRepository for PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
                 "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
-             FROM account
+             FROM ts_account
              WHERE id > $1
              ORDER BY id ASC
              LIMIT $2",
@@ -629,7 +629,7 @@ impl AccountRepository for PostgresDatabase {
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
-                "INSERT INTO account (name, password_hash, role, status, is_bootstrap, created_at)
+                "INSERT INTO ts_account (name, password_hash, role, status, is_bootstrap, created_at)
              VALUES ($1, $2, $3, $4, $5, $6)
              RETURNING id, name, password_hash, role, status, is_bootstrap, created_at",
             )
@@ -660,7 +660,7 @@ impl AccountRepository for PostgresDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut builder = QueryBuilder::<Postgres>::new("UPDATE account SET ");
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE ts_account SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -701,7 +701,7 @@ impl AccountRepository for PostgresDatabase {
     async fn delete(&self, id: AccountId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM account WHERE id = $1")
+            sqlx::query("DELETE FROM ts_account WHERE id = $1")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -723,7 +723,7 @@ impl AccountRepository for PostgresDatabase {
     async fn count(&self) -> Result<i64, RepositoryError> {
         timed(
             self.admin_timeout,
-            sqlx::query_scalar("SELECT COUNT(*) FROM account").fetch_one(&self.shared),
+            sqlx::query_scalar("SELECT COUNT(*) FROM ts_account").fetch_one(&self.shared),
         )
         .await
         .map_err(map_storage_error)
@@ -741,7 +741,7 @@ impl ApiKeyRepository for PostgresDatabase {
                 "SELECT id, account_id, name, key_id, secret_hash, status,
                         default_provider_id, expires_at,
                         max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-                 FROM api_key
+                 FROM ts_api_key
                  WHERE key_id = $1",
             )
             .bind(key_id.as_str())
@@ -768,7 +768,7 @@ impl ApiKeyRepository for PostgresDatabase {
                 "SELECT id, account_id, name, key_id, secret_hash, status,
                         default_provider_id, expires_at,
                         max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-                 FROM api_key
+                 FROM ts_api_key
                  WHERE id = $1",
             )
             .bind(id.get())
@@ -793,7 +793,7 @@ impl ApiKeyRepository for PostgresDatabase {
             "SELECT id, account_id, name, key_id, secret_hash, status,
                     default_provider_id, expires_at,
                     max_concurrent_requests, max_requests_per_second, max_websockets, created_at
-             FROM api_key
+             FROM ts_api_key
              WHERE id > $1",
         );
         builder.push_bind(after_id);
@@ -829,7 +829,7 @@ impl ApiKeyRepository for PostgresDatabase {
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
-                "INSERT INTO api_key (
+                "INSERT INTO ts_api_key (
                      account_id, name, key_id, secret_hash, status,
                      default_provider_id, expires_at,
                      max_concurrent_requests, max_requests_per_second, max_websockets, created_at
@@ -881,7 +881,7 @@ impl ApiKeyRepository for PostgresDatabase {
         if let Some(provider_ids) = update.provider_ids() {
             timed(
                 self.admin_timeout,
-                sqlx::query("DELETE FROM api_key_provider WHERE api_key_id = $1")
+                sqlx::query("DELETE FROM ts_api_key_provider WHERE api_key_id = $1")
                     .bind(id.get())
                     .execute(&mut *transaction),
             )
@@ -889,7 +889,7 @@ impl ApiKeyRepository for PostgresDatabase {
             .map_err(|error| map_write_error(error, LABEL))?;
             write_bindings(&mut transaction, id, provider_ids).await?;
         }
-        let mut builder = QueryBuilder::<Postgres>::new("UPDATE api_key SET ");
+        let mut builder = QueryBuilder::<Postgres>::new("UPDATE ts_api_key SET ");
         {
             let mut assignments = builder.separated(", ");
             if let Some(name) = update.name() {
@@ -958,7 +958,7 @@ impl ApiKeyRepository for PostgresDatabase {
         let updated = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
-                "UPDATE api_key
+                "UPDATE ts_api_key
                  SET key_id = $1, secret_hash = $2
                  WHERE id = $3
                  RETURNING id, account_id, name, key_id, secret_hash, status,
@@ -982,7 +982,7 @@ impl ApiKeyRepository for PostgresDatabase {
     async fn delete(&self, id: ApiKeyId) -> Result<(), RepositoryError> {
         let result = timed(
             self.admin_timeout,
-            sqlx::query("DELETE FROM api_key WHERE id = $1")
+            sqlx::query("DELETE FROM ts_api_key WHERE id = $1")
                 .bind(id.get())
                 .execute(&self.shared),
         )
@@ -1009,7 +1009,7 @@ impl PostgresDatabase {
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyBindingRow>(
                 "SELECT api_key_id, provider_id, position
-                 FROM api_key_provider
+                 FROM ts_api_key_provider
                  WHERE api_key_id = $1
                  ORDER BY position ASC",
             )
@@ -1038,7 +1038,7 @@ async fn write_bindings(
         timed(
             BINDING_WRITE_DEADLINE,
             sqlx::query(
-                "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+                "INSERT INTO ts_api_key_provider (api_key_id, provider_id, position)
                  VALUES ($1, $2, $3)",
             )
             .bind(api_key_id.get())
@@ -1062,7 +1062,7 @@ async fn adopt_legacy_keys(
     transaction: &mut sqlx::Transaction<'_, Postgres>,
     account_id: AccountId,
 ) -> Result<(), RepositoryError> {
-    let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM legacy_gateway_key")
+    let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM ts_legacy_gateway_key")
         .fetch_all(&mut **transaction)
         .await
         .map_err(map_storage_error)?;
@@ -1071,7 +1071,7 @@ async fn adopt_legacy_keys(
         let key_id: String = row.get("key_id");
         let secret_hash: String = row.get("secret_hash");
         let created = sqlx::query(
-            "INSERT INTO api_key (
+            "INSERT INTO ts_api_key (
                  account_id, name, key_id, secret_hash, status,
                  default_provider_id, expires_at,
                  max_concurrent_requests, max_requests_per_second, max_websockets, created_at
@@ -1089,7 +1089,7 @@ async fn adopt_legacy_keys(
         .map_err(|error| map_write_error(error, LABEL))?;
         let api_key_id: i64 = created.get("id");
         sqlx::query(
-            "INSERT INTO api_key_provider (api_key_id, provider_id, position)
+            "INSERT INTO ts_api_key_provider (api_key_id, provider_id, position)
              VALUES ($1, $2, 0)",
         )
         .bind(api_key_id)
@@ -1098,7 +1098,7 @@ async fn adopt_legacy_keys(
         .await
         .map_err(|error| map_write_error(error, LABEL))?;
     }
-    sqlx::query("DELETE FROM legacy_gateway_key")
+    sqlx::query("DELETE FROM ts_legacy_gateway_key")
         .execute(&mut **transaction)
         .await
         .map_err(map_storage_error)?;
@@ -1121,6 +1121,8 @@ fn map_write_error(error: sqlx::Error, label: &str) -> RepositoryError {
         // rejected the write, so it is reported rather than discarded.
         if let Some(database_error) = error.as_database_error() {
             eprintln!("{label} write failed: {database_error}");
+        } else {
+            eprintln!("{label} write failed: {error}");
         }
         RepositoryError::Storage
     }
@@ -1146,6 +1148,10 @@ fn map_storage_error(error: sqlx::Error) -> RepositoryError {
     if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else {
+        // A read that fails without a classified code would otherwise become a
+        // silent 500. The database's own message names the table, column, or
+        // constraint, so it is reported rather than discarded.
+        eprintln!("{LABEL} storage operation failed: {error}");
         RepositoryError::Storage
     }
 }
