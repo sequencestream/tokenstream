@@ -22,6 +22,8 @@ JSON responses, including errors and empty success bodies, forbid shared caching
 
 Lists use increasing-ID cursors ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)). The page keeps two filter states: conditions being edited, and the conditions that produced the rows on screen. Advancing always uses the applied conditions with the cursor those conditions produced.
 
+The page presents five views: credentials, providers, accounts, request logs, and settings. A sixth view, docs, presents the data-plane integration reference and is described under [The docs view](#the-docs-view).
+
 Public paths and bodies are in the [architecture document](../architecture.md). Provider writes follow the [providers design](./providers.md). The page's visual language is specified under [Page presentation](#page-presentation); new operator surfaces follow that language rather than inventing a second look.
 
 ## Core flows
@@ -99,6 +101,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - An issued credential is edited in place through the same owner-checked path as its creation, and an edit neither returns a plaintext nor changes the key identifier or the secret.
 - Control-plane hashing and database work use the reserved control-plane budgets so a burst of sign-ins or rotations cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 - Hashed page assets may cache long-lived. The entry document does not, so a replaced binary is picked up on the next navigation.
+- The docs view is static and role-independent. It reaches no administration endpoint, and the examples it shows never carry a real credential.
 
 ## Failures and bounds
 
@@ -108,6 +111,18 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - Credential binding sets and account lists are bounded, so a write that names an oversized set is rejected before persistence.
 - The active session count is bounded, so a sign-in burst fails with a capacity error rather than growing the map.
 - Browser acceptance of reachability, sign-in, restoration, credential handling, expiry, and sign-out is a release check, both against the control-plane hosted page and against the development-server proxy.
+
+## The docs view
+
+The docs view is the integration entry point for whoever holds an issued credential. Without it, the addresses, protocol pairings, and credential-header rules exist only in the developer-facing material, so reaching a working client depends on asking a person.
+
+The view is static copy. It reads nothing and sends nothing: it adds no administration endpoint, performs no lookup, and issues no request against the data plane. Signing in is the only precondition, and the view is not a role-gated surface — a regular user reaches it exactly as an administrator does, because the reader it serves is the credential holder.
+
+Its content is fixed by the architecture document rather than chosen by the page. The base address is this instance's data-plane listen address, written as a placeholder that the reader replaces. The endpoint table repeats the public route allowlist row for row, giving each route its protocol, method, path, credential header, and transport. Each HTTP route carries one runnable example built from placeholders alone, so no example can require or reveal a real credential, and the WebSocket route is described by its upgrade rather than by an example a shell could not run. Troubleshooting names only the failures a client meets first: a rejected credential, a protocol presented against the wrong path, and an unavailable provider, which is refused rather than rerouted.
+
+Because the copy is written twice, the page's rows are pinned by a test that fails when the allowlist grows and the view does not follow. That test is the guard; the duplicate prose is accepted drift.
+
+This view is presentation only. It does not change the data-plane public contract or the allowlist, adds no per-provider or generated content, and offers no way to enter a credential, run a request, or reach an SDK example.
 
 ## Page presentation
 
@@ -130,6 +145,7 @@ Name each role once and reuse those names. A new surface does not introduce a se
 - The provider create form stays closed until the operator opens it with New provider. Cancel or a successful create closes it again.
 - Forms are compact field grids. A primary submit is content-sized, not stretched across leftover columns. On the narrow chrome breakpoint, a submit may fill the row.
 - Sign-in is a centered, narrow card under the same chrome. It does not use a split marketing layout.
+- The docs view is a stack of ordinary cards: the endpoint table, the examples, and the troubleshooting table, each with a section title. A route is shown with its method, path, credential header, and transport as plain text; an example is a monospace block that wraps and never scrolls the page sideways.
 
 ### Color
 

@@ -4,6 +4,14 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { AdminApi, type ProviderHealthWrite, type ProviderStatus, type ProtocolType } from './api/client.ts'
 import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
 import {
+  BASE_URL_NOTE,
+  ENDPOINTS,
+  PROTOCOL_LABELS,
+  TROUBLESHOOTING,
+  WEBSOCKET_NOTE,
+  curlExamples,
+} from './docs/endpoints.ts'
+import {
   changeSetFor,
   editDraftFor,
   moveProvider,
@@ -28,8 +36,11 @@ const password = ref('')
 const busy = ref(false)
 const notice = ref('')
 const errorMessage = ref('')
-type View = 'providers' | 'keys' | 'accounts' | 'logs' | 'settings'
+type View = 'providers' | 'keys' | 'accounts' | 'logs' | 'settings' | 'docs'
 const activeView = ref<View>('keys')
+
+// The Docs view is static copy, so it is computed once rather than per render.
+const docsExamples = curlExamples()
 
 const settingsPage = ref({ items: [] as import('./api/client.ts').Setting[] })
 const settingDrafts = ref<Record<string, string>>({})
@@ -642,6 +653,7 @@ function viewTitle(view: View) {
   if (view === 'accounts') return 'Accounts'
   if (view === 'logs') return 'Request logs'
   if (view === 'settings') return 'Settings'
+  if (view === 'docs') return 'Docs'
   return 'Credentials'
 }
 
@@ -650,6 +662,7 @@ function viewLede(view: View) {
   if (view === 'accounts') return 'Principals that own data-plane credentials.'
   if (view === 'logs') return 'Transport metadata for proxied requests. Payloads are not stored.'
   if (view === 'settings') return 'Process configuration. Secrets are write-only; bind-time values apply after restart.'
+  if (view === 'docs') return 'Where to point a client, which credential header each protocol takes, and what a failure means.'
   return 'API keys owned by an account, each bound to the providers it may reach.'
 }
 
@@ -692,6 +705,11 @@ onMounted(restoreSession)
           :aria-current="activeView === 'settings' ? 'page' : undefined"
           @click="activeView = 'settings'"
         >Settings</button>
+        <button
+          :class="{ active: activeView === 'docs' }"
+          :aria-current="activeView === 'docs' ? 'page' : undefined"
+          @click="activeView = 'docs'"
+        >Docs</button>
       </nav>
       <span v-if="session.signedIn.value" class="identity">
         {{ session.accountName.value }}
@@ -1197,7 +1215,7 @@ onMounted(restoreSession)
         </section>
       </template>
 
-      <template v-else>
+      <template v-else-if="activeView === 'settings'">
         <section class="card table-card">
           <div class="table-wrap">
             <table>
@@ -1233,6 +1251,70 @@ onMounted(restoreSession)
           </div>
           <div class="actions settings-actions">
             <button class="button primary" :disabled="busy" @click="saveSettings">Save settings</button>
+          </div>
+        </section>
+      </template>
+
+      <template v-else-if="activeView === 'docs'">
+        <section class="card docs-card">
+          <div class="section-title">
+            <h2>Endpoints</h2>
+            <span class="section-note">Static reference. Nothing here is sent to the gateway.</span>
+          </div>
+          <p class="docs-note">{{ BASE_URL_NOTE }}</p>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Protocol</th>
+                  <th>Method</th>
+                  <th class="fill">Path</th>
+                  <th>Authentication</th>
+                  <th>Transport</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in ENDPOINTS" :key="`${row.protocol}-${row.method}-${row.path}-${row.transport}`">
+                  <td>{{ PROTOCOL_LABELS[row.protocol] }}</td>
+                  <td><code>{{ row.method }}</code></td>
+                  <td class="fill"><code>{{ row.path }}</code></td>
+                  <td><code>{{ row.auth }}</code></td>
+                  <td>{{ row.transport }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="section-note">{{ WEBSOCKET_NOTE }}</p>
+        </section>
+
+        <section class="card docs-card" aria-label="Request examples">
+          <div class="section-title">
+            <h2>Examples</h2>
+            <span class="section-note">Replace the base URL and the credential, then run as-is.</span>
+          </div>
+          <div class="docs-examples">
+            <article v-for="example in docsExamples" :key="example.id" class="docs-example">
+              <h3>{{ example.title }}</h3>
+              <pre><code>{{ example.command }}</code></pre>
+            </article>
+          </div>
+        </section>
+
+        <section class="card docs-card" aria-label="Troubleshooting">
+          <div class="section-title">
+            <h2>Troubleshooting</h2>
+            <span class="section-note">The three failures a client hits first.</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Symptom</th><th class="fill">Meaning</th></tr></thead>
+              <tbody>
+                <tr v-for="note in TROUBLESHOOTING" :key="note.symptom">
+                  <td><span class="badge neutral">{{ note.symptom }}</span></td>
+                  <td class="fill">{{ note.cause }}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </section>
       </template>
@@ -1588,6 +1670,20 @@ th.fill, td.fill { width: 100%; }
 .filters-pending { margin: var(--space-2) 0 0; color: var(--color-muted); font-size: var(--font-size-ui); }
 .settings-actions { padding: var(--space-2) var(--space-3) var(--space-3); }
 td small { display: block; margin-top: var(--space-1); color: var(--color-muted); font-weight: var(--font-weight-medium); letter-spacing: 0; text-transform: none; }
+
+.docs-card { width: 100%; margin-bottom: var(--space-2); padding: var(--space-3); }
+.docs-note { margin: 0 0 var(--space-2); color: var(--color-muted); font-size: var(--font-size-ui); }
+.docs-examples { display: grid; gap: var(--space-2); }
+.docs-example h3 { margin-bottom: var(--space-1); font-size: var(--font-size-title); font-weight: var(--font-weight-semibold); }
+.docs-example pre {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  overflow-x: auto;
+  background: var(--color-control-fill);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+.docs-example code { font-family: var(--font-mono); font-size: var(--font-size-body); white-space: pre; }
 
 @media (max-width: 780px) {
   .masthead {

@@ -478,6 +478,25 @@ async function runSuite(browser, origin, label) {
       'a regular user must not see another account\'s credentials',
     )
 
+    // The Docs view is static reference, so the role gate does not hide it from
+    // a regular user: a credential holder needs the addresses most.
+    const docsButton = page.getByRole('button', { name: 'Docs' })
+    await docsButton.click()
+    await page.getByRole('heading', { name: 'Docs' }).waitFor()
+    assert.equal(await docsButton.getAttribute('aria-current'), 'page')
+    const docsRoutes = page.locator('table').first().locator('tbody tr')
+    assert.equal(await docsRoutes.count(), 4)
+    await page.getByRole('cell', { name: '/v1/messages' }).waitFor()
+    await page.getByText('x-api-key', { exact: true }).first().waitFor()
+    // Every example carries the placeholders, never a credential from this run.
+    assert.equal(await page.getByText(createdCredential).count(), 0)
+    assert.equal(await page.locator('pre').count(), 3)
+    // Leaving the view must not leave its state behind.
+    await page.getByRole('button', { name: 'Credentials' }).click()
+    await page.getByRole('heading', { name: 'Credentials' }).waitFor()
+    assert.equal(await docsButton.getAttribute('aria-current'), null)
+    assert.equal(await page.locator('pre').count(), 0)
+
     await signOut(page)
     await page.getByLabel('Account').fill(accountName)
     await page.getByLabel('Password').fill(password)
