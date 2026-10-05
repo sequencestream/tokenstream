@@ -14,7 +14,11 @@ The credential is the unit admission counts ([ADR 0015](../adr/0015-layered-tran
 
 Bounds are configuration, not an allowance over usage. Nothing is measured or accumulated against them, and a credential that stays under them is unaffected by any other credential, including one owned by the same account. Aggregating above one credential belongs to the billing stage.
 
-A credential is created and rotated by the account that owns it, or by an administrator on its behalf. Rotation replaces the secret in place and returns the new plaintext once; the previous secret stops authenticating as soon as the replacement is committed.
+A credential is created, edited, and rotated by the account that owns it, or by an administrator on its behalf. Rotation replaces the secret in place and returns the new plaintext once; the previous secret stops authenticating as soon as the replacement is committed.
+
+**Edit** is separate from rotation and never reissues. One edit may change the name, the expiration, the status, the ordered set of allowed providers, the default provider, and the credential's own admission bounds together, and it leaves the key identifier and the secret exactly as they were, so no client has to be reconfigured. A field the edit does not name keeps its stored value, and a field it names as empty clears it, so an operator can widen, narrow, or clear any of them in a single deliberate step.
+
+The three admission bounds are submitted as one group: an edit either names all of them or names none, which keeps "tighten the concurrency limit" from being ambiguous about what happened to the rate and connection limits. Replacing the provider set is likewise a whole-set operation whose new order is the credential's preference order.
 
 **Disable** and **expiry** are distinct. Disabling is an operator action that can be lifted; expiry is a time bound the issuer set in advance. Both fail new authentication. Neither is retroactive: an admitted stream or connection keeps the snapshot it holds ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md)).
 
@@ -42,6 +46,19 @@ sequenceDiagram
     Store-->>K: Persisted row
     K-->>Caller: Redacted credential, plaintext once
 
+    Caller->>K: Edit an issued credential
+    K->>K: Validate name, expiry, providers, default, bounds
+    alt any check fails
+        K-->>Caller: Refused, nothing written
+    else all checks pass
+        K->>Store: Rewrite bindings and scalars in one write
+        Store-->>K: Committed
+        K-->>Caller: Redacted credential, no plaintext
+        Note over Auth: The key identifier and secret are unchanged
+    end
+    Note over Auth: New requests read the edited bounds
+    Note over Auth: Admitted streams keep their snapshots
+
     Caller->>K: Rotate
     K->>Store: Replace identifier and hash atomically
     Store-->>K: Committed
@@ -57,9 +74,12 @@ sequenceDiagram
 
 If a create or rotate response is lost, the secret cannot be recovered. The owner rotates again.
 
+A lost or failed edit is recoverable by editing again: nothing about a credential that an edit would change is stored anywhere else, and a refused edit leaves the previous configuration in place rather than a partial one.
+
 ## Invariants
 
-- The full credential plaintext appears only at creation or rotation. Later reads omit it, and no read of any kind can return a secret that was already issued.
+- The full credential plaintext appears only at creation or rotation. Later reads and every edit omit it, and no read of any kind can return a secret that was already issued.
+- An edit never changes the key identifier or the secret, so it never forces a client to be reconfigured and never requires a rotation to take effect.
 - A credential's allowed provider set is non-empty, and its default is a member of that set, so a stored credential can always resolve to exactly one provider.
 - A regular user may name only its own account; an administrator may name any. Nobody may name a different owner.
 - The bootstrap administrator cannot be disabled, demoted, or deleted.
@@ -71,7 +91,10 @@ If a create or rotate response is lost, the secret cannot be recovered. The owne
 
 ## Failures and bounds
 
-- An empty allowed provider set, a default outside that set, an unknown provider, a non-positive expiration, an oversized name, or an oversized binding set fails before persistence.
+- An empty allowed provider set, a default outside that set, an unknown provider, a non-positive expiration, an oversized name, or an oversized binding set fails before persistence, on creation and on edit alike.
+- Replacing the allowed provider set on edit rechecks the stored default against the set that will actually be stored, so an edit cannot leave a default pointing outside the providers the credential may reach.
+- An edit that names no writable field is refused rather than silently accepted as a no-op.
+- The binding set and the scalar fields of a credential are written in one transaction, so a stored credential never shows a partially applied edit and a reader never observes a half-edited record.
 - A name collision fails the write.
 - Deleting a referenced account or credential returns `in_use` rather than cascading into its logs or alias configuration.
 - List pages are bounded and use increasing-ID cursors ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)).

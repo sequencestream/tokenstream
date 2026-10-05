@@ -285,6 +285,16 @@ impl UpdateApiKeyRequest {
             && self.admission.is_none()
     }
 
+    /// The named name, if this edit names one.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// The named expiry, if this edit names one.
+    pub fn expires_at(&self) -> Option<Option<DateTime<Utc>>> {
+        self.expires_at
+    }
+
     fn into_update(self) -> ApiKeyUpdate {
         let mut update = ApiKeyUpdate::new();
         if let Some(name) = self.name {
@@ -612,9 +622,24 @@ where
         if request.is_empty() {
             return Err(CredentialServiceError::NoFieldsToUpdate);
         }
-        if let Some(name) = &request.name {
-            validate_name(name.clone())?;
+        // An expiration that has already passed would edit a credential into one
+        // that can never authenticate, so it is refused as creation refuses it.
+        if request
+            .expires_at()
+            .is_some_and(|at| at.is_some_and(|at| at <= Utc::now()))
+        {
+            return Err(CredentialServiceError::InvalidExpiry);
         }
+        // A stored name is the validated name, so an edit cannot store the
+        // whitespace-surrounded form that creation trims away.
+        let validated_name = match request.name() {
+            Some(name) => Some(validate_name(name.to_owned())?),
+            None => None,
+        };
+        let request = match validated_name {
+            Some(name) => request.with_name(name),
+            None => request,
+        };
         let update = request.into_update();
 
         let mut allowed: Vec<ProviderId> = current

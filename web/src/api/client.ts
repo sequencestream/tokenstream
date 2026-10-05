@@ -66,6 +66,8 @@ export interface ApiKeyWrite {
   provider_ids: number[]
   default_provider_id?: number | null
   status: ApiKeyStatus
+  /** Absent or null means the credential never expires. */
+  expires_at?: string | null
   max_concurrent_requests?: number | null
   max_requests_per_second?: number | null
   max_websockets?: number | null
@@ -311,11 +313,20 @@ export class AdminApi {
     return this.#request<ApiKeyIssueResponse>(`${API_KEYS_PATH}/${id}:rotate`, { method: 'POST' })
   }
 
-  /** Changes a credential's name, status, providers, or default provider. */
+  /**
+   * Edits a credential in place, without reissuing it.
+   *
+   * An absent field is left alone and an explicit null clears it, so one edit
+   * can widen, narrow, or clear the expiration and the default provider
+   * alongside the rest of the configuration.
+   */
   updateApiKey(
     id: number,
     body: Partial<
-      Pick<ApiKeyWrite, 'name' | 'status' | 'provider_ids' | 'default_provider_id'> & {
+      Pick<
+        ApiKeyWrite,
+        'name' | 'status' | 'provider_ids' | 'default_provider_id' | 'expires_at'
+      > & {
         /** Bounds are set together or not at all. */
         admission?: ApiKeyAdmissionWrite
       }

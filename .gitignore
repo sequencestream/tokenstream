@@ -29,3 +29,6 @@ web/test-results/
 
 
 __pycache__
+
+# Local editor/agent MCP configuration (may embed local tokens)
+.cursor/mcp.json
