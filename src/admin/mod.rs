@@ -1488,13 +1488,32 @@ struct UpdateApiKeyBody {
     name: Option<String>,
     status: Option<String>,
     /// Present-and-null clears the expiration; absent leaves it unchanged.
+    ///
+    /// Read from the raw document rather than through a double option, because a
+    /// plain nested option cannot tell an absent field from an explicit null and
+    /// would make "clear the expiration" unreachable over the wire.
+    #[serde(default, deserialize_with = "deserialize_clearable")]
     expires_at: Option<Option<DateTime<Utc>>>,
     provider_ids: Option<Vec<i64>>,
+    /// Present-and-null clears the default provider, for the same reason.
+    #[serde(default, deserialize_with = "deserialize_clearable")]
     default_provider_id: Option<Option<i64>>,
     /// Admission bounds. All three are set together or not at all: an absent
     /// object leaves every bound unchanged, and a present one names all three,
     /// so a single edit can widen, narrow, or clear them together.
     admission: Option<CredentialAdmissionFields>,
+}
+
+/// Reads a field that is absent, null, or a value.
+///
+/// An absent field leaves the stored value alone and an explicit null clears it,
+/// so a caller can express all three outcomes of "what happens to this field".
+fn deserialize_clearable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 #[derive(Deserialize)]
