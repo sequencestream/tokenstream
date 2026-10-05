@@ -6,7 +6,7 @@ Read this document first, then the [ADR index](./adr/), then the module designs 
 
 ## 1. Positioning
 
-Tokenstream is a transparent, account-scoped AI gateway. It terminates downstream connections, authenticates an account-owned gateway credential, resolves exactly one upstream provider, validates the requested route and transport, replaces credentials, and relays HTTP/SSE byte streams and WebSocket messages without interpreting application payloads.
+Tokenstream is a transparent, account-scoped AI gateway. It terminates downstream connections, authenticates an account-owned gateway credential, resolves exactly one upstream provider, validates the requested route and transport, replaces credentials, and relays HTTP/SSE byte streams and WebSocket messages without interpreting application payloads. The control plane may store account-owned model aliases, but they are inert configuration and are not consulted by the data plane.
 
 The gateway is infrastructure, not application logic. It does not select models, transform payloads, choose transports, schedule or bill usage, or make fallback decisions. A credential may be bound to several providers and selects one of them through a dedicated non-payload field; it never selects through the body.
 
@@ -38,7 +38,7 @@ The gateway is infrastructure, not application logic. It does not select models,
 - Decrypted keys live only in short-lived secret wrappers: they are never logged, serialized, rendered by debug output, or returned by an API.
 - The control plane authenticates accounts, not a process-wide passphrase. A session carries the account identity and one of two fixed roles; there is no general permission table.
 - Plane separation is absolute: a control-plane session never authenticates data-plane traffic, and a data-plane credential never authenticates a control-plane request.
-- A regular user may read and write only its own credentials. It cannot write providers or process settings, cannot manage accounts, and cannot observe another account's credentials.
+- A regular user may read and write only its own credentials and model aliases. It cannot write providers or process settings, cannot manage accounts, and cannot observe another account's credentials or aliases.
 
 ## 5. Route and Transport Policy
 
@@ -121,10 +121,11 @@ Further boundaries:
 6. **A sideband lifecycle event bus**: The proxy reports a closed set of transport facts to a bus with a fixed set of bounded subscribers. Fan-out is per subscriber, a saturated subscriber loses only its own copy, and nothing about a subscriber can change a proxy result. The request-log writer is the first subscriber.
 7. **An operational exposition**: Throughput and pass/fail by transport and coarse result, latency percentiles over the whole exchange, HTTP and WebSocket connections in flight, per-subscriber dropped and attempted event counts, and admission refusals by the layer that refused. It is built from compiled closed sets, adds no payload, and counts no token.
 8. **Accounts and credentials**: Accounts can be created, enabled, and disabled. Every data-plane credential belongs to an account, is created and rotated by that account, and identifies the account to the gateway. Each request still resolves to exactly one provider.
-9. **Two fixed roles**: Administrators manage accounts, credentials, providers, and process settings. Regular users manage only their own credentials. There is no general permission table.
-10. **Administration**: Provider create, read, update, disable, and restricted delete; account and credential management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
+9. **Two fixed roles**: Administrators manage accounts, credentials, model aliases, providers, and process settings. Regular users manage only their own credentials and model aliases. There is no general permission table.
+10. **Administration**: Provider create, read, update, disable, and restricted delete; account, credential, and model-alias management; request-log queries by increasing ID cursor; process settings with compiled defaults and an operator overlay.
 11. **Layered admission**: Optional per-provider and per-credential bounds on concurrent requests and request rate, and a per-credential bound on long-lived WebSocket connections. Each is configured explicitly, applies to new work only, and fails closed with the existing sanitized gateway errors.
 12. **Upstream health and isolation**: A provider configured with a probe path is probed on an interval, and consecutive failures past a threshold isolate it, while a single successful probe recovers it. An isolated provider refuses new work before any upstream is contacted and is never rerouted elsewhere. An administrator may hold a provider in manual maintenance, which suppresses probing entirely. Health is persisted, a newly created provider starts healthy, and a health state is read only by an administrator ([ADR 0018](./adr/0018-probe-derived-provider-isolation.md)).
+13. **Account-owned model alias configuration**: An account may store a bounded set of aliases, each with one or more provider-specific upstream model names. This is control-plane configuration only: it is not read by authentication, routing, admission, proxying, events, logs, or metrics ([ADR 0019](./adr/0019-account-owned-model-alias-configuration.md)).
 
 ### Excluded
 
@@ -133,7 +134,7 @@ Further boundaries:
 3. Application-layer scheduling: rerouting a request to a different provider, retries, request/response caching, weighted, priority, or latency-based upstream selection, load balancing, half-open trial traffic, proactive upstream termination, and disconnect-loss mitigation. Provider credentials are looked up directly for each new request or connection; there is no application-level credential cache. Admission counting belongs to the transport layer, not here ([ADR 0015](./adr/0015-layered-transport-admission.md)). Upstream health is not scheduling: a probe decides whether a provider is isolated, and isolation refuses new work rather than choosing where that work goes ([ADR 0018](./adr/0018-probe-derived-provider-isolation.md)).
 4. Token parsing, usage billing, cost estimation, and reconciliation.
 5. A general role and permission system. Roles are a fixed set, and adding one is an architectural change.
-6. User-defined model names, choosing an upstream by a request body field, and multi-provider failover or retries.
+6. Using a model alias on the data plane, choosing an upstream by a request body field, default-model injection, and multi-provider failover or retries. Storing an account-owned alias is included; interpreting it is not.
 7. A dashboard page, alert rules, notification channels, and a productized tracing exporter. An alert reads the exposition; the gateway does not evaluate or deliver one.
 8. Per-provider and per-account metric dimensions, exact percentiles, and any token or usage metric. Provider and account series are a deliberate deferral: the cost when they are needed is series count, not a change in what a series means ([ADR 0017](./adr/0017-cardinality-bounded-observability.md)).
 9. Aggregate allowances wider than one credential, monthly token quotas, and any accounting-based allowance. A credential carries the per-caller admission bounds; an account-wide aggregate belongs to the billing stage, which has no measurement to divide ([ADR 0015](./adr/0015-layered-transport-admission.md)).
@@ -153,6 +154,19 @@ An API credential belongs to exactly one account and is what a data-plane caller
 A credential also carries its own admission bounds: a maximum concurrent request count, an optional maximum request rate, and a maximum number of long-lived WebSocket connections. Each is optional, and an absent bound is unbounded rather than zero.
 
 A credential never carries a protocol of its own. The protocol belongs to the provider it resolves to, and the required downstream credential header is chosen from that provider.
+
+### Model alias
+
+A model alias belongs to exactly one account. It contains an identity, an account-scoped unique name,
+one or more targets, and a creation time. A target contains one provider identity and one opaque upstream
+model name. A provider appears at most once within an alias.
+
+Target order is persisted for stable configuration round-trips but carries no priority, weight,
+fallback, or scheduling semantics. Alias ownership cannot be changed. Accounts and providers named by
+an alias cannot be deleted while the reference remains.
+
+An alias is not part of a credential and grants no data-plane access. It is never loaded into a request
+snapshot and has no effect on provider resolution.
 
 ### Provider and request snapshot
 
@@ -274,6 +288,33 @@ The create and rotate responses include a one-time field, and later reads omit i
 
 `provider_ids` is the allowed set in preference order and must be non-empty. `default_provider_id`, when present, must be a member of that set. A credential with exactly one allowed provider needs no selector.
 
+### Model alias API
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /admin/api/model-aliases?after_id=&limit=&account_id=` | List aliases by increasing ID |
+| `POST /admin/api/model-aliases` | Create an alias for an account |
+| `GET /admin/api/model-aliases/{id}` | Read one alias and its targets |
+| `PATCH /admin/api/model-aliases/{id}` | Change the name or replace the complete target set |
+| `DELETE /admin/api/model-aliases/{id}` | Delete an alias |
+
+A regular user may reach only aliases owned by its session account. An administrator may reach every
+alias. The create request names an account, an alias name, and a non-empty target array:
+
+```json
+{
+  "account_id": 1,
+  "name": "coding-default",
+  "targets": [
+    { "provider_id": 1, "upstream_model": "gpt-5.2-codex" }
+  ]
+}
+```
+
+Responses preserve target order. That order is presentation state only and does not select a provider.
+The same alias name may exist under different accounts, while a duplicate within one account returns a
+conflict.
+
 ### Provider administration API
 
 | Method and path | Purpose |
@@ -375,6 +416,7 @@ Key forks among alternatives are recorded as architecture decision records under
 | Process | [`modules/process.md`](./modules/process.md) | Defaulted settings, listener binding, graceful shutdown |
 | Authentication | [`modules/authentication.md`](./modules/authentication.md) | Gateway credential verification and immutable snapshots |
 | Accounts and credentials | [`modules/credentials.md`](./modules/credentials.md) | Account ownership, credential lifecycle, and provider bindings |
+| Model aliases | [`modules/model-aliases.md`](./modules/model-aliases.md) | Account-owned alias configuration and provider-specific targets |
 | Routing | [`modules/routing.md`](./modules/routing.md) | Allowlist decision over provider, method, path, and transport |
 | Proxy | [`modules/proxy.md`](./modules/proxy.md) | HTTP/SSE streaming and bidirectional WebSocket relay |
 | Providers | [`modules/providers.md`](./modules/providers.md) | Provider lifecycle, credential issuance, snapshot loading |
@@ -383,7 +425,7 @@ Key forks among alternatives are recorded as architecture decision records under
 | Observability | [`modules/observability.md`](./modules/observability.md) | The bounded operational exposition and its result classification |
 | Administration | [`modules/administration.md`](./modules/administration.md) | Control-plane session, APIs, administration page, and page presentation |
 
-Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Routing, Proxy, Providers, Events, Logging, Observability, Administration. Provider health is designed inside the providers document rather than in a document of its own, because a provider's probe configuration, state machine, and invariants are one concern.
+Recommended reading order after this document: the [ADR index](./adr/), then Process, Authentication, Accounts and credentials, Model aliases, Routing, Proxy, Providers, Events, Logging, Observability, Administration. Provider health is designed inside the providers document rather than in a document of its own, because a provider's probe configuration, state machine, and invariants are one concern.
 
 ## 12. Verification
 

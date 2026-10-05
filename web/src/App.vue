@@ -321,7 +321,7 @@ async function toggleProvider(id: number, current: ProviderStatus) {
 }
 
 async function deleteProvider(id: number, name: string) {
-  if (!window.confirm(`Delete ${name}? Providers referenced by request logs cannot be deleted.`)) {
+  if (!window.confirm(`Delete ${name}? Providers referenced by request logs or a model alias cannot be deleted.`)) {
     return
   }
   await runAction(async () => {

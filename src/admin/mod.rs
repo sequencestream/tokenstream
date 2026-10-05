@@ -26,18 +26,24 @@ use crate::credentials::{
 use crate::crypto::{
     AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher, SharedCipher,
 };
+use crate::model_aliases::{
+    CreateModelAliasRequest, ModelAliasService, ModelAliasServiceError, ModelAliasTargetInput,
+    UpdateModelAliasRequest,
+};
 use url::Url;
 
 use crate::domain::{
     AccountAdminView, AccountCursor, AccountId, AccountRole, AccountStatus, ApiKeyAdminView,
-    ApiKeyCursor, ApiKeyId, ApiKeyStatus, CredentialAdmission, InvalidAdmissionBound, ProtocolType,
-    ProviderAdminView, ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId,
-    ProviderProbe, ProviderStatus, RequestLog, RequestLogCursor, SecretString, TransportType,
+    ApiKeyCursor, ApiKeyId, ApiKeyStatus, CredentialAdmission, InvalidAdmissionBound,
+    ModelAliasAdminView, ModelAliasCursor, ModelAliasId, ProtocolType, ProviderAdminView,
+    ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId, ProviderProbe,
+    ProviderStatus, RequestLog, RequestLogCursor, SecretString, TransportType,
     validate_provider_probe,
 };
 use crate::persistence::{
-    AccountListRequest, AccountRepository, ApiKeyListRequest, Database, ProviderListRequest,
-    ProviderRepository, RepositoryError, RequestLogQuery, RequestLogRepository,
+    AccountListRequest, AccountRepository, ApiKeyListRequest, Database, ModelAliasListRequest,
+    ModelAliasRepository, ProviderListRequest, ProviderRepository, RepositoryError,
+    RequestLogQuery, RequestLogRepository,
 };
 use crate::providers::{
     CreateProviderRequest, ProviderService, ProviderServiceError, UpdateProviderRequest,
@@ -60,6 +66,7 @@ pub struct AdminApi<R, C, V> {
     repository: R,
     providers: Arc<ProviderService<R, C>>,
     credentials: Arc<CredentialService<R, V>>,
+    model_aliases: Arc<ModelAliasService<R>>,
     bootstrap_password_hash: Arc<Mutex<Arc<str>>>,
     body_timeout: Arc<Mutex<Duration>>,
     connection_settings: crate::ConnectionSettings,
@@ -107,6 +114,7 @@ where
         + RequestLogRepository
         + AccountRepository
         + crate::persistence::ApiKeyRepository
+        + ModelAliasRepository
         + Clone,
     C: SecretCipher,
     V: GatewaySecretVerifier + 'static,
@@ -148,6 +156,7 @@ where
             // control-plane budget, so a burst of administration cannot consume
             // data-plane verification capacity.
             credentials: Arc::new(CredentialService::new(repository.clone(), verifier)),
+            model_aliases: Arc::new(ModelAliasService::new(repository.clone())),
             repository,
             // The bootstrap name identifies the first account; the configured
             // password hash stays the operator's way back into a deployment
@@ -374,6 +383,27 @@ where
                     Method::DELETE => self.delete_api_key(principal, parse_api_key_id(id)).await,
                     _ => method_not_allowed(),
                 }
+            };
+        }
+        if path == "/admin/api/model-aliases" {
+            return match method {
+                Method::GET => {
+                    self.list_model_aliases(principal, request.uri().query())
+                        .await
+                }
+                Method::POST => self.create_model_alias(principal, request).await,
+                _ => method_not_allowed(),
+            };
+        }
+        if let Some(id) = model_alias_item_path(&path) {
+            let Ok(id) = ModelAliasId::try_from(id) else {
+                return invalid_input("Model alias ID must be a positive integer.");
+            };
+            return match method {
+                Method::GET => self.get_model_alias(principal, id).await,
+                Method::PATCH => self.update_model_alias(principal, id, request).await,
+                Method::DELETE => self.delete_model_alias(principal, id).await,
+                _ => method_not_allowed(),
             };
         }
         if path == "/admin/api/providers" {
@@ -948,6 +978,143 @@ where
         }
     }
 
+    async fn list_model_aliases(
+        &self,
+        principal: Principal,
+        query: Option<&str>,
+    ) -> Response<ApiBody> {
+        let Ok(mut page) = parse_model_alias_page(query) else {
+            return invalid_input("Invalid model alias cursor or page size.");
+        };
+        if !principal.is_admin() {
+            if page
+                .account_id()
+                .is_some_and(|id| id != principal.account_id)
+            {
+                return forbidden();
+            }
+            page = ModelAliasListRequest::new(
+                page.after_id(),
+                page.limit(),
+                Some(principal.account_id),
+            )
+            .expect("an already validated page remains valid when scoped");
+        }
+        match self.model_aliases.list(page).await {
+            Ok(page) => json_response(
+                StatusCode::OK,
+                &ModelAliasListView {
+                    items: page.items().iter().map(ModelAliasAdminView::from).collect(),
+                    next_after_id: page.next_after_id().map(|cursor| cursor.get()),
+                },
+            ),
+            Err(error) => self.model_alias_error(error),
+        }
+    }
+
+    async fn create_model_alias<B>(
+        &self,
+        principal: Principal,
+        request: Request<B>,
+    ) -> Response<ApiBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let Ok(input) =
+            read_json::<_, CreateModelAliasBody>(request.into_body(), self.current_body_timeout())
+                .await
+        else {
+            return invalid_input("Invalid model alias configuration.");
+        };
+        let Ok(account_id) = AccountId::try_from(input.account_id) else {
+            return invalid_input("Invalid account identifier.");
+        };
+        if !self.may_reach(principal, account_id) {
+            return forbidden();
+        }
+        let Some(targets) = parse_model_alias_targets(input.targets) else {
+            return invalid_input("Invalid model alias configuration.");
+        };
+        match self
+            .model_aliases
+            .create(CreateModelAliasRequest::new(
+                account_id, input.name, targets,
+            ))
+            .await
+        {
+            Ok(alias) => json_response(StatusCode::CREATED, &ModelAliasAdminView::from(&alias)),
+            Err(error) => self.model_alias_error(error),
+        }
+    }
+
+    async fn get_model_alias(&self, principal: Principal, id: ModelAliasId) -> Response<ApiBody> {
+        match self.model_aliases.get(id).await {
+            Ok(alias) if self.may_reach(principal, alias.alias().account_id()) => {
+                json_response(StatusCode::OK, &ModelAliasAdminView::from(&alias))
+            }
+            Ok(_) => forbidden(),
+            Err(error) => self.model_alias_error(error),
+        }
+    }
+
+    async fn update_model_alias<B>(
+        &self,
+        principal: Principal,
+        id: ModelAliasId,
+        request: Request<B>,
+    ) -> Response<ApiBody>
+    where
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        let current = match self.model_aliases.get(id).await {
+            Ok(alias) => alias,
+            Err(error) => return self.model_alias_error(error),
+        };
+        if !self.may_reach(principal, current.alias().account_id()) {
+            return forbidden();
+        }
+        let Ok(input) =
+            read_json::<_, UpdateModelAliasBody>(request.into_body(), self.current_body_timeout())
+                .await
+        else {
+            return invalid_input("Invalid model alias configuration.");
+        };
+        let mut change = UpdateModelAliasRequest::new();
+        if let Some(name) = input.name {
+            change = change.with_name(name);
+        }
+        if let Some(targets) = input.targets {
+            let Some(targets) = parse_model_alias_targets(targets) else {
+                return invalid_input("Invalid model alias configuration.");
+            };
+            change = change.with_targets(targets);
+        }
+        match self.model_aliases.update(id, change).await {
+            Ok(alias) => json_response(StatusCode::OK, &ModelAliasAdminView::from(&alias)),
+            Err(error) => self.model_alias_error(error),
+        }
+    }
+
+    async fn delete_model_alias(
+        &self,
+        principal: Principal,
+        id: ModelAliasId,
+    ) -> Response<ApiBody> {
+        let current = match self.model_aliases.get(id).await {
+            Ok(alias) => alias,
+            Err(error) => return self.model_alias_error(error),
+        };
+        if !self.may_reach(principal, current.alias().account_id()) {
+            return forbidden();
+        }
+        match self.model_aliases.delete(id).await {
+            Ok(()) => empty_response(StatusCode::NO_CONTENT),
+            Err(error) => self.model_alias_error(error),
+        }
+    }
+
     /// Whether this principal may reach a resource owned by `owner`.
     ///
     /// An administrator reaches everything; a regular user reaches only what it
@@ -1362,7 +1529,7 @@ where
             ProviderServiceError::InUse => api_error(
                 StatusCode::CONFLICT,
                 "provider_in_use",
-                "Provider is referenced by request logs.",
+                "Provider is referenced by request logs or a model alias.",
             ),
             ProviderServiceError::Bound => api_error(
                 StatusCode::CONFLICT,
@@ -1378,6 +1545,44 @@ where
                 resource_exhausted()
             }
             ProviderServiceError::Cipher | ProviderServiceError::Storage => internal_error(error),
+        }
+    }
+
+    fn model_alias_error(&self, error: ModelAliasServiceError) -> Response<ApiBody> {
+        match error {
+            ModelAliasServiceError::InvalidName | ModelAliasServiceError::InvalidTargets => {
+                invalid_input("Invalid model alias configuration.")
+            }
+            ModelAliasServiceError::AccountNotFound => api_error(
+                StatusCode::NOT_FOUND,
+                "account_not_found",
+                "Account not found.",
+            ),
+            ModelAliasServiceError::AccountDisabled => invalid_input("Account is disabled."),
+            ModelAliasServiceError::ProviderNotFound => api_error(
+                StatusCode::NOT_FOUND,
+                "provider_not_found",
+                "Provider not found.",
+            ),
+            ModelAliasServiceError::Conflict => api_error(
+                StatusCode::CONFLICT,
+                "model_alias_conflict",
+                "A model alias with this name already exists for the account.",
+            ),
+            ModelAliasServiceError::NotFound => api_error(
+                StatusCode::NOT_FOUND,
+                "model_alias_not_found",
+                "Model alias not found.",
+            ),
+            ModelAliasServiceError::NoFieldsToUpdate => {
+                invalid_input("No model alias field was supplied.")
+            }
+            ModelAliasServiceError::Busy => {
+                self.metrics
+                    .record_failure(ProxyFailureCategory::ResourceExhausted);
+                resource_exhausted()
+            }
+            ModelAliasServiceError::Storage => internal_error(error),
         }
     }
 
@@ -1419,7 +1624,7 @@ where
             CredentialServiceError::InUse => api_error(
                 StatusCode::CONFLICT,
                 "in_use",
-                "The record is referenced by request logs.",
+                "The record is referenced by request logs or a model alias.",
             ),
             CredentialServiceError::Busy => {
                 self.metrics
@@ -1495,6 +1700,28 @@ struct UpdateApiKeyBody {
     /// object leaves every bound unchanged, and a present one names all three,
     /// so a single edit can widen, narrow, or clear them together.
     admission: Option<CredentialAdmissionFields>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelAliasTargetBody {
+    provider_id: i64,
+    upstream_model: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateModelAliasBody {
+    account_id: i64,
+    name: String,
+    targets: Vec<ModelAliasTargetBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateModelAliasBody {
+    name: Option<String>,
+    targets: Option<Vec<ModelAliasTargetBody>>,
 }
 
 #[derive(Deserialize)]
@@ -1641,6 +1868,12 @@ struct ApiKeyIssueView {
     api_key: ApiKeyAdminView,
     /// The one-time plaintext, present only at creation and rotation.
     api_key_secret: String,
+}
+
+#[derive(Serialize)]
+struct ModelAliasListView {
+    items: Vec<ModelAliasAdminView>,
+    next_after_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -1862,6 +2095,39 @@ fn parse_api_key_page(query: Option<&str>) -> Result<ApiKeyListRequest, ()> {
     ApiKeyListRequest::new(after_id, limit, account_id).map_err(|_| ())
 }
 
+fn parse_model_alias_page(query: Option<&str>) -> Result<ModelAliasListRequest, ()> {
+    let params = unique_query(query, &["after_id", "limit", "account_id"])?;
+    let after_id = params
+        .get("after_id")
+        .map(|value| {
+            parse_positive(value).and_then(|id| ModelAliasCursor::try_from(id).map_err(|_| ()))
+        })
+        .transpose()?;
+    let limit = params
+        .get("limit")
+        .map(|value| value.parse::<usize>().map_err(|_| ()))
+        .transpose()?
+        .unwrap_or(100);
+    let account_id = params
+        .get("account_id")
+        .map(|value| parse_positive(value).and_then(|id| AccountId::try_from(id).map_err(|_| ())))
+        .transpose()?;
+    ModelAliasListRequest::new(after_id, limit, account_id).map_err(|_| ())
+}
+
+fn parse_model_alias_targets(
+    targets: Vec<ModelAliasTargetBody>,
+) -> Option<Vec<ModelAliasTargetInput>> {
+    targets
+        .into_iter()
+        .map(|target| {
+            ProviderId::try_from(target.provider_id)
+                .ok()
+                .map(|provider_id| ModelAliasTargetInput::new(provider_id, target.upstream_model))
+        })
+        .collect()
+}
+
 fn parse_log_query(query: Option<&str>) -> Result<RequestLogQuery, ()> {
     let params = unique_query(
         query,
@@ -2001,6 +2267,14 @@ fn api_key_item_path(path: &str) -> Option<(&str, bool)> {
         None => (suffix, false),
     };
     (!id.is_empty() && !id.contains('/')).then_some((id, rotate))
+}
+
+fn model_alias_item_path(path: &str) -> Option<i64> {
+    let id = path.strip_prefix("/admin/api/model-aliases/")?;
+    if id.is_empty() || id.contains('/') {
+        return None;
+    }
+    id.parse().ok()
 }
 
 fn parse_status(value: &str) -> Option<ProviderStatus> {

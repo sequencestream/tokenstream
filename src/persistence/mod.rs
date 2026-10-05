@@ -10,7 +10,8 @@ use url::Url;
 use crate::domain::{
     Account, AccountCursor, AccountId, AccountRole, AccountStatus, AdmissionBound, ApiKey,
     ApiKeyBinding, ApiKeyCursor, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings, CredentialAdmission,
-    EmptyOpaqueValueError, GatewayKeyId, MAX_ADMISSION_BOUND, PasswordHash, PositiveValueError,
+    EmptyOpaqueValueError, GatewayKeyId, MAX_ADMISSION_BOUND, ModelAlias, ModelAliasCursor,
+    ModelAliasId, ModelAliasTarget, ModelAliasWithTargets, PasswordHash, PositiveValueError,
     ProtocolType, Provider, ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId,
     ProviderProbe, ProviderStatus, RequestId, RequestLog, RequestLogCursor, RequestLogId,
     SecretCiphertext, TransportType, validate_provider_probe,
@@ -27,12 +28,14 @@ pub const MAX_PROVIDER_PAGE_SIZE: usize = 100;
 pub const MAX_REQUEST_LOG_PAGE_SIZE: usize = 100;
 pub const MAX_ACCOUNT_PAGE_SIZE: usize = 100;
 pub const MAX_API_KEY_PAGE_SIZE: usize = 100;
+pub const MAX_MODEL_ALIAS_PAGE_SIZE: usize = 100;
 
 /// Largest number of providers one credential may be bound to.
 ///
 /// The bound keeps provider resolution off an unbounded scan: a request that
 /// must pick one provider out of an allowed set reads at most this many rows.
 pub const MAX_API_KEY_PROVIDERS: usize = 32;
+pub const MAX_MODEL_ALIAS_TARGETS: usize = 32;
 
 /// Longest a storage operation waits for a pooled connection before failing closed.
 ///
@@ -494,6 +497,80 @@ impl ApiKeyUpdate {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct NewModelAlias {
+    account_id: AccountId,
+    name: String,
+    targets: Vec<(ProviderId, String)>,
+    created_at: DateTime<Utc>,
+}
+
+impl NewModelAlias {
+    pub fn new(
+        account_id: AccountId,
+        name: String,
+        targets: Vec<(ProviderId, String)>,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            account_id,
+            name,
+            targets,
+            created_at,
+        }
+    }
+
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn targets(&self) -> &[(ProviderId, String)] {
+        &self.targets
+    }
+
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ModelAliasUpdate {
+    name: Option<String>,
+    targets: Option<Vec<(ProviderId, String)>>,
+}
+
+impl ModelAliasUpdate {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    pub fn with_targets(mut self, targets: Vec<(ProviderId, String)>) -> Self {
+        self.targets = Some(targets);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none() && self.targets.is_none()
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub fn targets(&self) -> Option<&[(ProviderId, String)]> {
+        self.targets.as_deref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderListRequest {
     after_id: Option<ProviderCursor>,
@@ -645,6 +722,13 @@ pub struct ApiKeyListRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelAliasListRequest {
+    after_id: Option<ModelAliasCursor>,
+    limit: usize,
+    account_id: Option<AccountId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccountListRequestError {
     InvalidLimit,
 }
@@ -653,6 +737,20 @@ pub enum AccountListRequestError {
 pub enum ApiKeyListRequestError {
     InvalidLimit,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelAliasListRequestError;
+
+impl fmt::Display for ModelAliasListRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "model alias page size must be between 1 and {MAX_MODEL_ALIAS_PAGE_SIZE}"
+        )
+    }
+}
+
+impl Error for ModelAliasListRequestError {}
 
 impl fmt::Display for AccountListRequestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -725,6 +823,35 @@ impl ApiKeyListRequest {
     }
 }
 
+impl ModelAliasListRequest {
+    pub fn new(
+        after_id: Option<ModelAliasCursor>,
+        limit: usize,
+        account_id: Option<AccountId>,
+    ) -> Result<Self, ModelAliasListRequestError> {
+        if !(1..=MAX_MODEL_ALIAS_PAGE_SIZE).contains(&limit) {
+            return Err(ModelAliasListRequestError);
+        }
+        Ok(Self {
+            after_id,
+            limit,
+            account_id,
+        })
+    }
+
+    pub fn after_id(self) -> Option<ModelAliasCursor> {
+        self.after_id
+    }
+
+    pub fn limit(self) -> usize {
+        self.limit
+    }
+
+    pub fn account_id(self) -> Option<AccountId> {
+        self.account_id
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AccountPage {
     items: Vec<Account>,
@@ -757,6 +884,34 @@ impl AccountPage {
 pub struct ApiKeyPage {
     items: Vec<ApiKeyWithBindings>,
     has_more: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelAliasPage {
+    items: Vec<ModelAliasWithTargets>,
+    has_more: bool,
+}
+
+impl ModelAliasPage {
+    pub(crate) fn new(items: Vec<ModelAliasWithTargets>, has_more: bool) -> Self {
+        Self { items, has_more }
+    }
+
+    pub fn items(&self) -> &[ModelAliasWithTargets] {
+        &self.items
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.has_more
+    }
+
+    pub fn next_after_id(&self) -> Option<ModelAliasCursor> {
+        self.items
+            .last()
+            .map(|value| ModelAliasCursor::try_from(value.alias().id().get()))
+            .transpose()
+            .expect("stored model alias IDs are positive")
+    }
 }
 
 impl ApiKeyPage {
@@ -1050,7 +1205,8 @@ impl ProviderPage {
 pub enum RepositoryError {
     Conflict,
     ProviderInUse,
-    /// An account or credential referenced by request logs cannot be deleted.
+    /// An account or credential referenced by request logs or a model alias
+    /// cannot be deleted.
     InUse,
     /// A provider named by a credential binding cannot be deleted.
     ProviderBound,
@@ -1068,8 +1224,8 @@ impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::Conflict => "record conflicts with existing data",
-            Self::ProviderInUse => "provider is referenced by request logs",
-            Self::InUse => "record is referenced by request logs",
+            Self::ProviderInUse => "provider is referenced by request logs or a model alias",
+            Self::InUse => "record is referenced by request logs or a model alias",
             Self::ProviderBound => "provider is bound to a credential",
             Self::NotFound => "referenced record was not found",
             Self::NoFieldsToUpdate => "the change set named no writable field",
@@ -1205,6 +1361,32 @@ pub trait ApiKeyRepository: Send + Sync {
     ) -> Result<ApiKeyWithBindings, RepositoryError>;
 
     async fn delete(&self, id: ApiKeyId) -> Result<(), RepositoryError>;
+}
+
+#[allow(async_fn_in_trait)]
+pub trait ModelAliasRepository: Send + Sync {
+    async fn find_model_alias_by_id(
+        &self,
+        id: ModelAliasId,
+    ) -> Result<Option<ModelAliasWithTargets>, RepositoryError>;
+
+    async fn list_model_aliases(
+        &self,
+        request: ModelAliasListRequest,
+    ) -> Result<ModelAliasPage, RepositoryError>;
+
+    async fn create_model_alias(
+        &self,
+        alias: NewModelAlias,
+    ) -> Result<ModelAliasWithTargets, RepositoryError>;
+
+    async fn update_model_alias(
+        &self,
+        id: ModelAliasId,
+        update: ModelAliasUpdate,
+    ) -> Result<ModelAliasWithTargets, RepositoryError>;
+
+    async fn delete_model_alias(&self, id: ModelAliasId) -> Result<(), RepositoryError>;
 }
 
 #[allow(async_fn_in_trait)]
@@ -1400,6 +1582,56 @@ impl ApiKeyRepository for Database {
         match self {
             Self::Sqlite(database) => ApiKeyRepository::delete(database, id).await,
             Self::Postgres(database) => ApiKeyRepository::delete(database, id).await,
+        }
+    }
+}
+
+impl ModelAliasRepository for Database {
+    async fn find_model_alias_by_id(
+        &self,
+        id: ModelAliasId,
+    ) -> Result<Option<ModelAliasWithTargets>, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.find_model_alias_by_id(id).await,
+            Self::Postgres(database) => database.find_model_alias_by_id(id).await,
+        }
+    }
+
+    async fn list_model_aliases(
+        &self,
+        request: ModelAliasListRequest,
+    ) -> Result<ModelAliasPage, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.list_model_aliases(request).await,
+            Self::Postgres(database) => database.list_model_aliases(request).await,
+        }
+    }
+
+    async fn create_model_alias(
+        &self,
+        alias: NewModelAlias,
+    ) -> Result<ModelAliasWithTargets, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.create_model_alias(alias).await,
+            Self::Postgres(database) => database.create_model_alias(alias).await,
+        }
+    }
+
+    async fn update_model_alias(
+        &self,
+        id: ModelAliasId,
+        update: ModelAliasUpdate,
+    ) -> Result<ModelAliasWithTargets, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.update_model_alias(id, update).await,
+            Self::Postgres(database) => database.update_model_alias(id, update).await,
+        }
+    }
+
+    async fn delete_model_alias(&self, id: ModelAliasId) -> Result<(), RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.delete_model_alias(id).await,
+            Self::Postgres(database) => database.delete_model_alias(id).await,
         }
     }
 }
@@ -1682,6 +1914,45 @@ pub(crate) struct ApiKeyBindingRow {
     pub(crate) api_key_id: i64,
     pub(crate) provider_id: i64,
     pub(crate) position: i64,
+}
+
+#[derive(FromRow)]
+pub(crate) struct ModelAliasRow {
+    pub(crate) id: i64,
+    pub(crate) account_id: i64,
+    pub(crate) name: String,
+    pub(crate) created_at: i64,
+}
+
+impl ModelAliasRow {
+    pub(crate) fn into_alias(self) -> Result<ModelAlias, RepositoryError> {
+        Ok(ModelAlias::new(
+            ModelAliasId::try_from(self.id).map_err(invalid_positive_value)?,
+            AccountId::try_from(self.account_id).map_err(invalid_positive_value)?,
+            self.name,
+            time::from_epoch_micros(self.created_at)?,
+        ))
+    }
+}
+
+#[derive(FromRow)]
+pub(crate) struct ModelAliasTargetRow {
+    pub(crate) provider_id: i64,
+    pub(crate) upstream_model: String,
+    pub(crate) position: i64,
+}
+
+impl ModelAliasTargetRow {
+    pub(crate) fn into_target(self) -> Result<ModelAliasTarget, RepositoryError> {
+        if self.position < 0 {
+            return Err(RepositoryError::InvalidStoredData);
+        }
+        Ok(ModelAliasTarget::new(
+            ProviderId::try_from(self.provider_id).map_err(invalid_positive_value)?,
+            self.upstream_model,
+            self.position,
+        ))
+    }
 }
 
 impl ApiKeyBindingRow {

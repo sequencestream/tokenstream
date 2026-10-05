@@ -436,7 +436,7 @@ def shutdown_by_signal(directory, plain, stop, label):
 
         wait_for(listeners_closed, 'shutdown left a listener accepting connections')
         rows = sqlite3.connect(directory / f'shutdown-{label}.db').execute(
-            'select request_id, transport_type, path, end_time, error_msg from request_log'
+            'select request_id, transport_type, path, end_time, error_msg from ts_request_log'
         ).fetchall()
         assert rows, 'shutdown must flush started request logs'
         assert all(row[3] is not None for row in rows if row[1] == 'http')
@@ -603,7 +603,7 @@ def run_case(directory, trusted, untrusted, plain, development, capacity=None):
         assert process.wait(timeout=4) == 0
         assert time.monotonic() - started < 3
         wait_for(lambda: active == 0, 'shutdown left upstream sessions alive')
-        rows = sqlite3.connect(db).execute('select request_id, transport_type, path, end_time, error_msg from request_log').fetchall()
+        rows = sqlite3.connect(db).execute('select request_id, transport_type, path, end_time, error_msg from ts_request_log').fetchall()
         assert len(rows) >= 9
         assert len({row[0] for row in rows}) == len(rows)
         assert all('?' not in row[2] for row in rows)

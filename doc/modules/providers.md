@@ -40,7 +40,7 @@ sequenceDiagram
     Note over Auth: Admitted streams keep their snapshots
 
     Admin->>P: Delete
-    alt Logs or credential bindings reference the provider
+    alt Logs, credential bindings, or a model alias reference the provider
         P-->>Admin: 409 provider_in_use
     else Unreferenced
         P->>Store: Delete

@@ -63,7 +63,8 @@ pub enum CredentialServiceError {
     Conflict,
     /// No record exists for the given identifier.
     NotFound,
-    /// The record is referenced by request logs and cannot be deleted.
+    /// The record is referenced by request logs or a model alias and cannot be
+    /// deleted.
     InUse,
     /// The edit named no writable field, so nothing was changed.
     NoFieldsToUpdate,
@@ -90,7 +91,7 @@ impl fmt::Display for CredentialServiceError {
             Self::InvalidCredentials => "invalid credentials",
             Self::Conflict => "record conflicts with existing data",
             Self::NotFound => "record was not found",
-            Self::InUse => "record is referenced by request logs",
+            Self::InUse => "record is referenced by request logs or a model alias",
             Self::NoFieldsToUpdate => "the edit named no writable field",
             Self::Storage => "record could not be persisted",
         };

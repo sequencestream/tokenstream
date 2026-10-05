@@ -12,7 +12,7 @@ The control plane authenticates accounts, not a process-wide passphrase ([ADR 00
 
 The **bootstrap administrator** is the account that exists before any other, created from the configured administrator credentials when the store holds no account. It owns the credentials that predate accounts, and it can be neither disabled nor demoted, so a deployment always retains a way back into its own accounts.
 
-**Authorization is decided once per request**, from the session's account and role, before the route handler runs. A regular user reaches only its own credentials and its own request logs. Accounts, providers, and process settings are administrator surfaces, as is the operational exposition, and a regular user receives `403` on them rather than a `404` that would hide the resource's existence. A provider's health state and its maintenance control are part of the provider surface ([ADR 0018](../adr/0018-probe-derived-provider-isolation.md)): maintenance is a statement about which upstreams this gateway trusts, and a regular account has no standing to make one. A regular user naming another account on a write receives `403`; naming a non-existent account receives `404`.
+**Authorization is decided once per request**, from the session's account and role, before the route handler runs. A regular user reaches only its own credentials, model aliases, and request logs. Accounts, providers, and process settings are administrator surfaces, as is the operational exposition, and a regular user receives `403` on them rather than a `404` that would hide the resource's existence. A provider's health state and its maintenance control are part of the provider surface ([ADR 0018](../adr/0018-probe-derived-provider-isolation.md)): maintenance is a statement about which upstreams this gateway trusts, and a regular account has no standing to make one. A regular user naming another account on a write receives `403`; naming a non-existent account receives `404`.
 
 The page renders only the surfaces the signed-in role may reach, so a regular user never sees a control it cannot use. Hiding is presentation, not enforcement: the API decides, and the page follows.
 
@@ -22,7 +22,7 @@ JSON responses, including errors and empty success bodies, forbid shared caching
 
 Lists use increasing-ID cursors ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)). The page keeps two filter states: conditions being edited, and the conditions that produced the rows on screen. Advancing always uses the applied conditions with the cursor those conditions produced.
 
-Public paths and bodies are in the [architecture document](../architecture.md). Provider writes follow the [providers design](./providers.md). The page's visual language is specified under [Page presentation](#page-presentation); new operator surfaces follow that language rather than inventing a second look.
+Public paths and bodies are in the [architecture document](../architecture.md). Provider writes follow the [providers design](./providers.md), and alias writes follow the [model-alias design](./model-aliases.md). The page's visual language is specified under [Page presentation](#page-presentation); new operator surfaces follow that language rather than inventing a second look.
 
 ## Core flows
 
@@ -33,6 +33,7 @@ sequenceDiagram
     participant G as Role gate
     participant P as Providers
     participant K as Credentials
+    participant Aliases as ModelAliases
     participant Logs as RequestLogs
 
     B->>C: GET page
@@ -51,6 +52,10 @@ sequenceDiagram
             B->>C: Create or rotate a credential
             C->>K: CSRF-checked write, owner-checked
             K-->>C: Redacted credential, plaintext once
+            C-->>B: no-store JSON
+            B->>C: Create or edit an owned model alias
+            C->>Aliases: CSRF-checked write, owner-checked
+            Aliases-->>C: Alias and bounded targets
             C-->>B: no-store JSON
             opt Regular user names another account
                 C-->>B: 403
@@ -82,10 +87,10 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 
 - The page never receives upstream secrets, gateway secrets after initial creation, password hashes, encryption material, or master-key plaintext.
 - A half-edited filter form never combines one condition set with another set's cursor.
-- Provider deletion that is blocked by log or binding association returns `409` with `provider_in_use` and directs the administrator to disable.
+- Provider deletion that is blocked by log, binding, or model-alias association returns `409` with `provider_in_use` and directs the administrator to disable.
 - Authorization is decided from the session before dispatch. A handler never decides whether the caller may reach it.
 - Only an administrator reads a provider's health state, edits its probe configuration, or enters and leaves maintenance.
-- A regular user reads and writes only its own credentials and sees only its own request logs.
+- A regular user reads and writes only its own credentials and model aliases, and sees only its own request logs.
 - The operational exposition is an administrator surface. It is served only to an authenticated administrator, is not cacheable, and is served at no data-plane path.
 - Disabling an account stops its new data-plane traffic immediately; already admitted streams keep running.
 - A credential's plaintext is returned exactly once, at creation and at rotation, to whichever account owns it.

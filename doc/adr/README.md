@@ -26,6 +26,7 @@ A new architectural fork gets an ADR before the architecture document changes. A
 | [0016](./0016-metadata-event-bus.md) | Accepted | A sideband metadata event bus with per-subscriber bounded queues |
 | [0017](./0017-cardinality-bounded-observability.md) | Accepted | Result classification and a cardinality-bounded exposition |
 | [0018](./0018-probe-derived-provider-isolation.md) | Accepted | Probe-derived provider isolation, and a refusal rather than a reroute |
+| [0019](./0019-account-owned-model-alias-configuration.md) | Accepted | Account-owned model aliases as inert control-plane configuration |
 
 ## Template
 
