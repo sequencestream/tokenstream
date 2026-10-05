@@ -19,6 +19,7 @@ Tokenstream is a high-performance, transparent AI gateway. It provides native HT
 - Multi-provider configuration with encrypted upstream API keys and provider-scoped gateway credentials.
 - Non-blocking transport-layer metadata logging that never stores request or response payloads.
 - Minimal administration UI for provider management, request-log queries, and process settings.
+- A built-in **Docs** view listing the data-plane endpoints, per-protocol credential headers, and copyable cURL examples, so an issued credential is usable without reading developer material.
 
 See the [architecture](doc/architecture.md) for binding principles, contracts, and verification, the [module designs](doc/modules/) for how each module works, and the [architecture decisions](doc/adr/) for why those rules were chosen.
 
