@@ -32,7 +32,7 @@ PAYLOAD = b'opaque\x00unknown{not-json}'
 # Makes request-log writes fail without affecting the provider reads that
 # authentication depends on, so only the logging path is under fault.
 FAULT_TRIGGER = """
-CREATE TRIGGER request_log_write_fault BEFORE INSERT ON request_log
+CREATE TRIGGER request_log_write_fault BEFORE INSERT ON ts_request_log
 BEGIN SELECT RAISE(ABORT, 'injected storage fault'); END
 """
 SSE = b'data: opaque\n\ndata: [DONE]\n\n'
@@ -692,7 +692,7 @@ def run():
             stop(process)
             wait_for(lambda: active_upstream == 0, 'shutdown left upstream sessions alive')
             rows = sqlite3.connect(db).execute(
-                'select transport_type, count(*) from request_log group by transport_type').fetchall()
+                'select transport_type, count(*) from ts_request_log group by transport_type').fetchall()
             print('  request log rows by transport:', dict(rows))
             print('  upstream modes exercised:', sorted(observed_upstream))
             assert {'sse', 'hold', 'slow', 'websocket'} <= observed_upstream, observed_upstream

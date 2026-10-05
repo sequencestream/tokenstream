@@ -1526,3 +1526,340 @@ async fn an_edit_requires_a_csrf_token_and_an_identifiable_path() {
     assert_eq!(response["error"]["code"], "invalid_request");
     assert_eq!(read_key(&fixture, &fixture.owner.0).await, before);
 }
+#[tokio::test]
+async fn model_alias_api_enforces_ownership_validation_and_cursor_contracts() {
+    let (api, _, _directory) = api(Duration::from_secs(60)).await;
+    let (admin_cookie, admin_csrf) = sign_in(&api).await;
+    let (first_user_id, first_password) =
+        create_user(&api, &admin_cookie, &admin_csrf, "alias-owner").await;
+    let (second_user_id, second_password) =
+        create_user(&api, &admin_cookie, &admin_csrf, "alias-other").await;
+
+    let (status, _, provider) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/providers",
+            json!({
+                "name": "alias-provider",
+                "protocol_type": "openai",
+                "endpoint": "https://api.example.com",
+                "upstream_api_key": "upstream-secret",
+                "status": "enabled"
+            }),
+            Some(&admin_cookie),
+            Some(&admin_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let provider_id = provider["id"].as_i64().expect("provider ID");
+
+    let (first_cookie, first_csrf) = sign_in_as(&api, "alias-owner", &first_password).await;
+    let (second_cookie, second_csrf) = sign_in_as(&api, "alias-other", &second_password).await;
+
+    let create_body = json!({
+        "account_id": first_user_id,
+        "name": " coding ",
+        "targets": [{"provider_id": provider_id, "upstream_model": " model-a "}]
+    });
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            create_body.clone(),
+            Some(&first_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "writes require CSRF");
+
+    let (status, headers, created) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            create_body,
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    assert_eq!(created["account_id"], first_user_id);
+    assert_eq!(created["name"], "coding");
+    assert_eq!(created["targets"][0]["upstream_model"], "model-a");
+    let alias_id = created["id"].as_i64().expect("alias ID");
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            json!({
+                "account_id": second_user_id,
+                "name": "forbidden",
+                "targets": [{"provider_id": provider_id, "upstream_model": "model-b"}]
+            }),
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "forbidden");
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::GET,
+            "/admin/api/model-aliases?limit=1",
+            Value::Null,
+            Some(&first_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().expect("items").len(), 1);
+    assert_eq!(body["items"][0]["id"], alias_id);
+
+    for path in [
+        format!("/admin/api/model-aliases/{alias_id}"),
+        format!("/admin/api/model-aliases?account_id={first_user_id}"),
+    ] {
+        let (status, _, body) = send(
+            &api,
+            request(Method::GET, &path, Value::Null, Some(&second_cookie), None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(body["error"]["code"], "forbidden");
+    }
+
+    let (status, _, updated) = send(
+        &api,
+        request(
+            Method::PATCH,
+            &format!("/admin/api/model-aliases/{alias_id}"),
+            json!({
+                "name": "coding-next",
+                "targets": [{"provider_id": provider_id, "upstream_model": "model-next"}]
+            }),
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["name"], "coding-next");
+    assert_eq!(updated["targets"][0]["upstream_model"], "model-next");
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::PATCH,
+            &format!("/admin/api/model-aliases/{alias_id}"),
+            json!({}),
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            json!({
+                "account_id": second_user_id,
+                "name": "coding-next",
+                "targets": [{"provider_id": provider_id, "upstream_model": "other-model"}]
+            }),
+            Some(&second_cookie),
+            Some(&second_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "same name in another account: {body}"
+    );
+
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            json!({
+                "account_id": first_user_id,
+                "name": "bad-targets",
+                "targets": [
+                    {"provider_id": provider_id, "upstream_model": "one"},
+                    {"provider_id": provider_id, "upstream_model": "two"}
+                ]
+            }),
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/model-aliases/{alias_id}"),
+            Value::Null,
+            Some(&first_cookie),
+            Some(&first_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, body) = send(
+        &api,
+        request(
+            Method::GET,
+            &format!("/admin/api/model-aliases/{alias_id}"),
+            Value::Null,
+            Some(&admin_cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "model_alias_not_found");
+}
+
+#[tokio::test]
+async fn a_model_alias_reference_blocks_deletion_and_names_itself_in_the_conflict() {
+    let (api, _, _directory) = api(Duration::from_secs(60)).await;
+    let (admin_cookie, admin_csrf) = sign_in(&api).await;
+    let (owner_id, owner_password) =
+        create_user(&api, &admin_cookie, &admin_csrf, "alias-ref-owner").await;
+
+    let (status, _, provider) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/providers",
+            json!({
+                "name": "alias-ref-provider",
+                "protocol_type": "openai",
+                "endpoint": "https://api.example.com",
+                "upstream_api_key": "upstream-secret",
+                "status": "enabled"
+            }),
+            Some(&admin_cookie),
+            Some(&admin_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{provider}");
+    let provider_id = provider["id"].as_i64().expect("provider ID");
+
+    let (owner_cookie, owner_csrf) = sign_in_as(&api, "alias-ref-owner", &owner_password).await;
+    let (status, _, created) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/model-aliases",
+            json!({
+                "account_id": owner_id,
+                "name": "referencing-alias",
+                "targets": [{"provider_id": provider_id, "upstream_model": "model-a"}]
+            }),
+            Some(&owner_cookie),
+            Some(&owner_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let alias_id = created["id"].as_i64().expect("alias ID");
+
+    // An alias is a real reference, so it must block a provider deletion just
+    // as a request log does, and the conflict must say so rather than sending an
+    // operator to delete logs that may not exist.
+    let (status, headers, conflict) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/providers/{provider_id}"),
+            Value::Null,
+            Some(&admin_cookie),
+            Some(&admin_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        headers.get(CACHE_CONTROL).expect("cache policy"),
+        "no-store"
+    );
+    assert_eq!(conflict["error"]["code"], "provider_in_use");
+    let message = conflict["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("model alias"),
+        "the conflict must name what references the provider: {message}"
+    );
+
+    // The same holds for the owning account, which an alias also references.
+    let (status, _, conflict) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/accounts/{owner_id}"),
+            Value::Null,
+            Some(&admin_cookie),
+            Some(&admin_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(conflict["error"]["code"], "in_use");
+    let message = conflict["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("model alias"),
+        "the conflict must name what references the account: {message}"
+    );
+
+    // Removing the alias releases both references.
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/model-aliases/{alias_id}"),
+            Value::Null,
+            Some(&owner_cookie),
+            Some(&owner_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _, _) = send(
+        &api,
+        request(
+            Method::DELETE,
+            &format!("/admin/api/providers/{provider_id}"),
+            Value::Null,
+            Some(&admin_cookie),
+            Some(&admin_csrf),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}

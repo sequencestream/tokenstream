@@ -203,7 +203,8 @@ pub enum ProviderServiceError {
     Conflict,
     /// No provider exists for the given identifier.
     NotFound,
-    /// The provider is referenced by request logs and cannot be deleted.
+    /// The provider is referenced by request logs or a model alias and cannot
+    /// be deleted.
     InUse,
     /// The provider is bound to a credential and cannot be deleted.
     Bound,
@@ -225,7 +226,7 @@ impl fmt::Display for ProviderServiceError {
             Self::Cipher => "upstream credential encryption failed",
             Self::Conflict => "provider conflicts with existing data",
             Self::NotFound => "provider was not found",
-            Self::InUse => "provider is referenced by request logs",
+            Self::InUse => "provider is referenced by request logs or a model alias",
             Self::Bound => "provider is bound to a credential",
             Self::NoFieldsToUpdate => "the edit named no writable field",
             Self::Storage => "provider could not be persisted",

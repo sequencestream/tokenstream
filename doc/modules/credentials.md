@@ -26,6 +26,10 @@ The three admission bounds are submitted as one group: an edit either names all 
 
 Providers are global and administrator-written. A credential binds to them by reference. Deleting a provider that a binding still names is refused, so a credential can never hold a dangling selection.
 
+Model aliases are separate account-owned configuration. They are not credential bindings or an
+authorization list, and creating one does not change what any credential may call. Their ownership and
+target rules are defined in the [model-alias design](./model-aliases.md).
+
 ## Core flows
 
 ```mermaid
@@ -79,7 +83,7 @@ A lost or failed edit is recoverable by editing again: nothing about a credentia
 - A credential's allowed provider set is non-empty, and its default is a member of that set, so a stored credential can always resolve to exactly one provider.
 - A regular user may name only its own account; an administrator may name any. Nobody may name a different owner.
 - The bootstrap administrator cannot be disabled, demoted, or deleted.
-- An account or credential referenced by request logs cannot be deleted; disabling is the retirement path.
+- An account or credential referenced by request logs or a model alias cannot be deleted; disabling is the retirement path.
 - Account names, credential key identifiers, and request IDs are unique, enforced identically on both storage engines.
 - Issuance and rotation hash on the control-plane budget so a burst of administration cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 - A bound of zero or a value that is not a positive integer fails before persistence. Storing such a bound would forbid all traffic from that credential, which is an accident rather than a policy.
@@ -92,5 +96,5 @@ A lost or failed edit is recoverable by editing again: nothing about a credentia
 - An edit that names no writable field is refused rather than silently accepted as a no-op.
 - The binding set and the scalar fields of a credential are written in one transaction, so a stored credential never shows a partially applied edit and a reader never observes a half-edited record.
 - A name collision fails the write.
-- Deleting a referenced account or credential returns `in_use` rather than cascading into its logs.
+- Deleting a referenced account or credential returns `in_use` rather than cascading into its logs or alias configuration.
 - List pages are bounded and use increasing-ID cursors ([ADR 0010](../adr/0010-dual-storage-and-cursor-lists.md)).

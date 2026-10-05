@@ -46,9 +46,11 @@ macro_rules! positive_value {
 positive_value!(AccountId);
 positive_value!(ProviderId);
 positive_value!(ApiKeyId);
+positive_value!(ModelAliasId);
 positive_value!(RequestLogId);
 positive_value!(AccountCursor);
 positive_value!(ApiKeyCursor);
+positive_value!(ModelAliasCursor);
 positive_value!(ProviderCursor);
 positive_value!(RequestLogCursor);
 
@@ -615,7 +617,7 @@ impl ProviderProbe {
 pub enum AccountRole {
     /// Manages accounts, credentials, providers, and process settings.
     Admin,
-    /// Manages only its own credentials.
+    /// Manages only its own credentials and model aliases.
     User,
 }
 
@@ -845,6 +847,104 @@ impl ApiKeyWithBindings {
 
     pub fn into_parts(self) -> (ApiKey, Vec<ApiKeyBinding>) {
         (self.api_key, self.bindings)
+    }
+}
+
+/// Account-owned configuration for one caller-facing model name.
+///
+/// This value is deliberately absent from request snapshots. It is durable
+/// control-plane state only and cannot affect a proxy exchange.
+#[derive(Clone, Debug)]
+pub struct ModelAlias {
+    id: ModelAliasId,
+    account_id: AccountId,
+    name: String,
+    created_at: DateTime<Utc>,
+}
+
+impl ModelAlias {
+    pub fn new(
+        id: ModelAliasId,
+        account_id: AccountId,
+        name: String,
+        created_at: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            account_id,
+            name,
+            created_at,
+        }
+    }
+
+    pub fn id(&self) -> ModelAliasId {
+        self.id
+    }
+
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn created_at(&self) -> DateTime<Utc> {
+        self.created_at
+    }
+}
+
+/// One provider-specific target stored under a model alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ModelAliasTarget {
+    provider_id: ProviderId,
+    upstream_model: String,
+    position: i64,
+}
+
+impl ModelAliasTarget {
+    pub fn new(provider_id: ProviderId, upstream_model: String, position: i64) -> Self {
+        Self {
+            provider_id,
+            upstream_model,
+            position,
+        }
+    }
+
+    pub fn provider_id(&self) -> ProviderId {
+        self.provider_id
+    }
+
+    pub fn upstream_model(&self) -> &str {
+        &self.upstream_model
+    }
+
+    pub fn position(&self) -> i64 {
+        self.position
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelAliasWithTargets {
+    alias: ModelAlias,
+    targets: Vec<ModelAliasTarget>,
+}
+
+impl ModelAliasWithTargets {
+    pub fn new(alias: ModelAlias, targets: Vec<ModelAliasTarget>) -> Self {
+        Self { alias, targets }
+    }
+
+    pub fn alias(&self) -> &ModelAlias {
+        &self.alias
+    }
+
+    pub fn targets(&self) -> &[ModelAliasTarget] {
+        &self.targets
+    }
+
+    pub fn into_parts(self) -> (ModelAlias, Vec<ModelAliasTarget>) {
+        (self.alias, self.targets)
     }
 }
 
@@ -1423,6 +1523,40 @@ impl ApiKeyAdminView {
             max_requests_per_second: admission.max_requests_per_second().get(),
             max_websockets: admission.max_websockets().get(),
             created_at: api_key.created_at,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelAliasTargetView {
+    pub provider_id: i64,
+    pub upstream_model: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ModelAliasAdminView {
+    pub id: i64,
+    pub account_id: i64,
+    pub name: String,
+    pub targets: Vec<ModelAliasTargetView>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&ModelAliasWithTargets> for ModelAliasAdminView {
+    fn from(value: &ModelAliasWithTargets) -> Self {
+        Self {
+            id: value.alias.id.get(),
+            account_id: value.alias.account_id.get(),
+            name: value.alias.name.clone(),
+            targets: value
+                .targets
+                .iter()
+                .map(|target| ModelAliasTargetView {
+                    provider_id: target.provider_id.get(),
+                    upstream_model: target.upstream_model.clone(),
+                })
+                .collect(),
+            created_at: value.alias.created_at,
         }
     }
 }

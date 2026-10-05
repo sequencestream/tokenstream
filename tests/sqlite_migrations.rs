@@ -86,7 +86,7 @@ async fn migrations_are_versioned_and_repeatable() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT name FROM sqlite_master WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'",
@@ -104,6 +104,10 @@ async fn migrations_are_versioned_and_repeatable() {
         "ts_provider",
         "ts_request_log",
         "ts_legacy_gateway_key",
+        "ts_model_alias",
+        "ts_model_alias_target",
+        "ts_model_alias_account_id_idx",
+        "ts_model_alias_target_provider_id_idx",
         "ts_request_log_start_time_idx",
         "ts_request_log_provider_id_idx",
         "ts_request_log_account_id_idx",
@@ -139,6 +143,14 @@ async fn schema_records_table_and_column_comments() {
         (
             "ts_legacy_gateway_key",
             "Staging for credentials that predate accounts. Empty on a fresh database.",
+        ),
+        (
+            "ts_model_alias",
+            "Account-owned caller-facing model alias configuration.",
+        ),
+        (
+            "ts_model_alias_target",
+            "Provider-specific model names stored under an alias.",
         ),
     ] {
         let sql: String =

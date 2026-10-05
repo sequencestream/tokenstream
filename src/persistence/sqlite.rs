@@ -7,8 +7,8 @@ use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::MigrationRunner;
 use crate::domain::{
-    Account, AccountId, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, PasswordHash, Provider,
-    ProviderHealthState, ProviderId,
+    Account, AccountId, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, ModelAliasId, ModelAliasTarget,
+    ModelAliasWithTargets, PasswordHash, Provider, ProviderHealthState, ProviderId,
 };
 use crate::logging::LogEvent;
 
@@ -16,11 +16,13 @@ use super::time::to_epoch_micros;
 use super::{
     AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
     ApiKeyBindingRow, ApiKeyListRequest, ApiKeyPage, ApiKeyRepository, ApiKeyRow, ApiKeyUpdate,
-    DatabaseBounds, HealthOutcome, NewAccount, NewApiKey, NewProvider, ProviderListRequest,
-    ProviderPage, ProviderRepository, ProviderRow, ProviderUpdate, RepositoryError,
-    RequestLogCompleted, RequestLogPage, RequestLogQuery, RequestLogRepository, RequestLogRow,
-    RequestLogStarted, account_status_value, admission_count, api_key_status_value, health_name,
-    probe_columns, protocol_value, role_value, status_value, timed, transport_value,
+    DatabaseBounds, HealthOutcome, ModelAliasListRequest, ModelAliasPage, ModelAliasRepository,
+    ModelAliasRow, ModelAliasTargetRow, ModelAliasUpdate, NewAccount, NewApiKey, NewModelAlias,
+    NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
+    ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
+    RequestLogRepository, RequestLogRow, RequestLogStarted, account_status_value, admission_count,
+    api_key_status_value, health_name, probe_columns, protocol_value, role_value, status_value,
+    timed, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -919,6 +921,235 @@ impl ApiKeyRepository for SqliteDatabase {
             Ok(())
         }
     }
+}
+
+impl ModelAliasRepository for SqliteDatabase {
+    async fn find_model_alias_by_id(
+        &self,
+        id: ModelAliasId,
+    ) -> Result<Option<ModelAliasWithTargets>, RepositoryError> {
+        let alias = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ModelAliasRow>(
+                "SELECT id, account_id, name, created_at FROM ts_model_alias WHERE id = ?",
+            )
+            .bind(id.get())
+            .fetch_optional(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?
+        .map(ModelAliasRow::into_alias)
+        .transpose()?;
+        let Some(alias) = alias else {
+            return Ok(None);
+        };
+        let targets = self.model_alias_targets(alias.id()).await?;
+        Ok(Some(ModelAliasWithTargets::new(alias, targets)))
+    }
+
+    async fn list_model_aliases(
+        &self,
+        request: ModelAliasListRequest,
+    ) -> Result<ModelAliasPage, RepositoryError> {
+        let after_id = request.after_id().map_or(0, |cursor| cursor.get());
+        let fetch_limit =
+            i64::try_from(request.limit() + 1).expect("bounded model alias page size fits in i64");
+        let mut builder = QueryBuilder::<Sqlite>::new(
+            "SELECT id, account_id, name, created_at FROM ts_model_alias WHERE id > ",
+        );
+        builder.push_bind(after_id);
+        if let Some(account_id) = request.account_id() {
+            builder
+                .push(" AND account_id = ")
+                .push_bind(account_id.get());
+        }
+        builder
+            .push(" ORDER BY id ASC LIMIT ")
+            .push_bind(fetch_limit);
+        let mut rows = timed(
+            self.admin_timeout,
+            builder
+                .build_query_as::<ModelAliasRow>()
+                .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        let has_more = rows.len() > request.limit();
+        rows.truncate(request.limit());
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            let alias = row.into_alias()?;
+            let targets = self.model_alias_targets(alias.id()).await?;
+            items.push(ModelAliasWithTargets::new(alias, targets));
+        }
+        Ok(ModelAliasPage::new(items, has_more))
+    }
+
+    async fn create_model_alias(
+        &self,
+        alias: NewModelAlias,
+    ) -> Result<ModelAliasWithTargets, RepositoryError> {
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let created = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ModelAliasRow>(
+                "INSERT INTO ts_model_alias (account_id, name, created_at)
+                 VALUES (?, ?, ?)
+                 RETURNING id, account_id, name, created_at",
+            )
+            .bind(alias.account_id().get())
+            .bind(alias.name())
+            .bind(to_epoch_micros(alias.created_at()))
+            .fetch_one(&mut *transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?
+        .into_alias()?;
+        let targets = write_model_alias_targets(
+            &mut transaction,
+            created.id(),
+            alias.targets(),
+            self.admin_timeout,
+        )
+        .await?;
+        transaction.commit().await.map_err(map_storage_error)?;
+        Ok(ModelAliasWithTargets::new(created, targets))
+    }
+
+    async fn update_model_alias(
+        &self,
+        id: ModelAliasId,
+        update: ModelAliasUpdate,
+    ) -> Result<ModelAliasWithTargets, RepositoryError> {
+        if update.is_empty() {
+            return Err(RepositoryError::NoFieldsToUpdate);
+        }
+        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let updated = match update.name() {
+            Some(name) => timed(
+                self.admin_timeout,
+                sqlx::query_as::<_, ModelAliasRow>(
+                    "UPDATE ts_model_alias SET name = ? WHERE id = ?
+                     RETURNING id, account_id, name, created_at",
+                )
+                .bind(name)
+                .bind(id.get())
+                .fetch_optional(&mut *transaction),
+            )
+            .await
+            .map_err(|error| map_write_error(error, LABEL))?,
+            None => timed(
+                self.admin_timeout,
+                sqlx::query_as::<_, ModelAliasRow>(
+                    "SELECT id, account_id, name, created_at FROM ts_model_alias WHERE id = ?",
+                )
+                .bind(id.get())
+                .fetch_optional(&mut *transaction),
+            )
+            .await
+            .map_err(map_storage_error)?,
+        }
+        .ok_or(RepositoryError::NotFound)?
+        .into_alias()?;
+        let targets = if let Some(targets) = update.targets() {
+            timed(
+                self.admin_timeout,
+                sqlx::query("DELETE FROM ts_model_alias_target WHERE model_alias_id = ?")
+                    .bind(id.get())
+                    .execute(&mut *transaction),
+            )
+            .await
+            .map_err(map_storage_error)?;
+            write_model_alias_targets(&mut transaction, id, targets, self.admin_timeout).await?
+        } else {
+            let rows = timed(
+                self.admin_timeout,
+                sqlx::query_as::<_, ModelAliasTargetRow>(
+                    "SELECT provider_id, upstream_model, position
+                     FROM ts_model_alias_target WHERE model_alias_id = ? ORDER BY position ASC",
+                )
+                .bind(id.get())
+                .fetch_all(&mut *transaction),
+            )
+            .await
+            .map_err(map_storage_error)?;
+            rows.into_iter()
+                .map(ModelAliasTargetRow::into_target)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        transaction.commit().await.map_err(map_storage_error)?;
+        Ok(ModelAliasWithTargets::new(updated, targets))
+    }
+
+    async fn delete_model_alias(&self, id: ModelAliasId) -> Result<(), RepositoryError> {
+        let result = timed(
+            self.admin_timeout,
+            sqlx::query("DELETE FROM ts_model_alias WHERE id = ?")
+                .bind(id.get())
+                .execute(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        if result.rows_affected() == 0 {
+            Err(RepositoryError::NotFound)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl SqliteDatabase {
+    async fn model_alias_targets(
+        &self,
+        id: ModelAliasId,
+    ) -> Result<Vec<ModelAliasTarget>, RepositoryError> {
+        let rows = timed(
+            self.admin_timeout,
+            sqlx::query_as::<_, ModelAliasTargetRow>(
+                "SELECT provider_id, upstream_model, position
+                 FROM ts_model_alias_target WHERE model_alias_id = ? ORDER BY position ASC",
+            )
+            .bind(id.get())
+            .fetch_all(&self.shared),
+        )
+        .await
+        .map_err(map_storage_error)?;
+        rows.into_iter()
+            .map(ModelAliasTargetRow::into_target)
+            .collect()
+    }
+}
+
+async fn write_model_alias_targets(
+    transaction: &mut sqlx::Transaction<'_, Sqlite>,
+    id: ModelAliasId,
+    targets: &[(ProviderId, String)],
+    deadline: Duration,
+) -> Result<Vec<ModelAliasTarget>, RepositoryError> {
+    let mut stored = Vec::with_capacity(targets.len());
+    for (position, (provider_id, upstream_model)) in targets.iter().enumerate() {
+        let position = i64::try_from(position).expect("bounded target count fits in i64");
+        timed(
+            deadline,
+            sqlx::query(
+                "INSERT INTO ts_model_alias_target
+                 (model_alias_id, provider_id, upstream_model, position) VALUES (?, ?, ?, ?)",
+            )
+            .bind(id.get())
+            .bind(provider_id.get())
+            .bind(upstream_model)
+            .bind(position)
+            .execute(&mut **transaction),
+        )
+        .await
+        .map_err(|error| map_write_error(error, LABEL))?;
+        stored.push(ModelAliasTarget::new(
+            *provider_id,
+            upstream_model.clone(),
+            position,
+        ));
+    }
+    Ok(stored)
 }
 
 impl SqliteDatabase {

@@ -74,7 +74,7 @@ async fn postgres_schema_matches_sqlite_constraints() {
     .fetch_one(database.pool())
     .await
     .expect("migration version");
-    assert_eq!(version, 1);
+    assert_eq!(version, 2);
 
     let objects: HashSet<String> = sqlx::query(
         "SELECT c.relname AS name
@@ -96,6 +96,10 @@ async fn postgres_schema_matches_sqlite_constraints() {
         "ts_provider",
         "ts_request_log",
         "ts_legacy_gateway_key",
+        "ts_model_alias",
+        "ts_model_alias_target",
+        "ts_model_alias_account_id_idx",
+        "ts_model_alias_target_provider_id_idx",
         "ts_request_log_start_time_idx",
         "ts_request_log_provider_id_idx",
         "ts_request_log_account_id_idx",
@@ -108,14 +112,15 @@ async fn postgres_schema_matches_sqlite_constraints() {
          FROM information_schema.columns
          WHERE table_schema = current_schema()
            AND ((table_name = 'ts_provider' AND column_name = 'id')
-             OR (table_name = 'ts_request_log' AND column_name = 'id'))
+             OR (table_name = 'ts_request_log' AND column_name = 'id')
+             OR (table_name = 'ts_model_alias' AND column_name = 'id'))
            AND data_type = 'bigint'
            AND is_identity = 'YES'",
     )
     .fetch_one(database.pool())
     .await
     .expect("identity column metadata");
-    assert_eq!(identity_columns, 2);
+    assert_eq!(identity_columns, 3);
 
     let suffix = unique_value("constraints");
     let primary_name = format!("primary-{suffix}");
