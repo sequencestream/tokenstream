@@ -933,3 +933,596 @@ async fn request_log_storage_failure_returns_a_generic_internal_error() {
         "the generic envelope must not carry the storage message: {rendered}"
     );
 }
+
+/// The API handle and the temporary directory that keeps its database alive.
+type TestApi = AdminApi<SqliteDatabase, AesGcmCipher, Argon2GatewaySecretVerifier>;
+
+/// Three providers plus one credential owned by a regular user, so a credential
+/// edit can be driven end to end and a second user can prove that the same edit
+/// is refused for somebody else's credential.
+struct EditFixture {
+    api: TestApi,
+    _database: SqliteDatabase,
+    _directory: tempfile::TempDir,
+    provider_ids: Vec<i64>,
+    key_id: i64,
+    /// The credential owner's session cookie and CSRF token.
+    owner: (String, String),
+    admin: (String, String),
+    other: (String, String),
+}
+
+async fn edit_fixture() -> EditFixture {
+    let (api, database, directory) = api(Duration::from_secs(300)).await;
+    let (admin_cookie, admin_csrf) = sign_in(&api).await;
+    let mut provider_ids = Vec::new();
+    for number in 0..3 {
+        let (status, _, provider) = send(
+            &api,
+            request(
+                Method::POST,
+                "/admin/api/providers",
+                json!({
+                    "name": format!("edit-provider-{number}"),
+                    "protocol_type": "openai",
+                    "endpoint": format!("https://provider-{number}.example.com/base"),
+                    "upstream_api_key": "upstream-secret",
+                    "status": "enabled"
+                }),
+                Some(&admin_cookie),
+                Some(&admin_csrf),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        provider_ids.push(provider["id"].as_i64().expect("provider ID"));
+    }
+
+    let (owner_id, owner_password) = create_user(&api, &admin_cookie, &admin_csrf, "owner").await;
+    let (_, other_password) = create_user(&api, &admin_cookie, &admin_csrf, "other").await;
+    let owner = sign_in_as(&api, "owner", &owner_password).await;
+    let other = sign_in_as(&api, "other", &other_password).await;
+
+    let (status, _, issued) = send(
+        &api,
+        request(
+            Method::POST,
+            "/admin/api/api-keys",
+            json!({
+                "account_id": owner_id,
+                "name": "ci",
+                "provider_ids": provider_ids,
+                "default_provider_id": provider_ids[0],
+                "status": "enabled",
+                "max_concurrent_requests": 10,
+                "max_requests_per_second": 20,
+                "max_websockets": 30
+            }),
+            Some(&owner.0),
+            Some(&owner.1),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "fixture credential: {issued}");
+    let key_id = issued["api_key"]["id"].as_i64().expect("credential ID");
+
+    EditFixture {
+        api,
+        _database: database,
+        _directory: directory,
+        provider_ids,
+        key_id,
+        owner,
+        admin: (admin_cookie, admin_csrf),
+        other,
+    }
+}
+
+/// Reads one credential back, asserting it is the one the fixture issued.
+async fn read_key(fixture: &EditFixture, cookie: &str) -> Value {
+    let (status, _, body) = send(
+        &fixture.api,
+        request(
+            Method::GET,
+            &format!("/admin/api/api-keys/{}", fixture.key_id),
+            Value::Null,
+            Some(cookie),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read key: {body}");
+    // Both the read and the edit return the redacted credential view directly.
+    body
+}
+
+/// Issues one edit as `session` and returns its status, code, and body.
+async fn patch_key(
+    fixture: &EditFixture,
+    session: &(String, String),
+    body: Value,
+) -> (StatusCode, Value) {
+    let (status, _, response) = send(
+        &fixture.api,
+        request(
+            Method::PATCH,
+            &format!("/admin/api/api-keys/{}", fixture.key_id),
+            body,
+            Some(&session.0),
+            Some(&session.1),
+        ),
+    )
+    .await;
+    (status, response)
+}
+
+/// The identifiers of a credential's provider bindings, in preference order.
+fn provider_ids_of(view: &Value) -> Vec<i64> {
+    view["provider_ids"]
+        .as_array()
+        .expect("an ordered provider set")
+        .iter()
+        .map(|value| value.as_i64().expect("provider ID"))
+        .collect()
+}
+
+#[tokio::test]
+async fn one_patch_applies_every_named_field_and_reads_back_consistently() {
+    let fixture = edit_fixture().await;
+    let expires_at = (Utc::now() + chrono::Duration::hours(48)).to_rfc3339();
+
+    // One edit names every editable field: the provider set loses its first
+    // member and reverses, the default moves with it, all three bounds change,
+    // and the name, expiry, and status are rewritten together.
+    let (status, edited) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({
+            "name": "edited",
+            "status": "disabled",
+            "expires_at": expires_at,
+            "provider_ids": [fixture.provider_ids[2], fixture.provider_ids[1]],
+            "default_provider_id": fixture.provider_ids[2],
+            "admission": {
+                "max_concurrent_requests": 2,
+                "max_requests_per_second": 3,
+                "max_websockets": 4
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch: {edited}");
+    let view = &edited;
+    assert_eq!(view["name"], "edited");
+    assert_eq!(view["status"], "disabled");
+    assert_eq!(
+        provider_ids_of(view),
+        vec![fixture.provider_ids[2], fixture.provider_ids[1]]
+    );
+    assert_eq!(view["default_provider_id"], fixture.provider_ids[2]);
+    assert_eq!(view["max_concurrent_requests"], 2);
+    assert_eq!(view["max_requests_per_second"], 3);
+    assert_eq!(view["max_websockets"], 4);
+    assert!(view["expires_at"].is_string());
+
+    // A fresh read agrees with the edit response, field for field.
+    let reread = read_key(&fixture, &fixture.owner.0).await;
+    assert_eq!(reread["name"], "edited");
+    assert_eq!(reread["status"], "disabled");
+    assert_eq!(
+        provider_ids_of(&reread),
+        vec![fixture.provider_ids[2], fixture.provider_ids[1]]
+    );
+    assert_eq!(reread["default_provider_id"], fixture.provider_ids[2]);
+    assert_eq!(reread["max_concurrent_requests"], 2);
+    assert_eq!(reread["max_requests_per_second"], 3);
+    assert_eq!(reread["max_websockets"], 4);
+    assert_eq!(reread["expires_at"], view["expires_at"]);
+
+    // The listing reads back the same values, in the same provider order.
+    let (status, _, listed) = send(
+        &fixture.api,
+        request(
+            Method::GET,
+            "/admin/api/api-keys?limit=100",
+            Value::Null,
+            Some(&fixture.owner.0),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let items = listed["items"].as_array().expect("items");
+    let listed_view = items
+        .iter()
+        .find(|item| item["id"] == json!(fixture.key_id))
+        .expect("the edited credential is listed");
+    assert_eq!(
+        provider_ids_of(listed_view),
+        vec![fixture.provider_ids[2], fixture.provider_ids[1]]
+    );
+    assert_eq!(listed_view["default_provider_id"], fixture.provider_ids[2]);
+    assert_eq!(listed_view["max_websockets"], 4);
+}
+
+#[tokio::test]
+async fn an_edit_keeps_the_key_identifier_and_returns_no_plaintext() {
+    let fixture = edit_fixture().await;
+    let before = read_key(&fixture, &fixture.owner.0).await;
+    let key_id = before["key_id"].clone();
+
+    let (status, edited) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({"name": "renamed", "admission": {
+            "max_concurrent_requests": 1,
+            "max_requests_per_second": null,
+            "max_websockets": null
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Editing reissues nothing, so the identifier the client holds still works.
+    assert_eq!(edited["key_id"], key_id);
+
+    let rendered = edited.to_string();
+    assert!(
+        !rendered.contains("api_key_secret"),
+        "an edit must never return a plaintext"
+    );
+    assert!(
+        !rendered.contains("secret_hash"),
+        "an edit must never return a stored hash"
+    );
+    let single = read_key(&fixture, &fixture.owner.0).await;
+    assert!(!single.to_string().contains("api_key_secret"));
+    assert!(!single.to_string().contains("secret_hash"));
+    assert_eq!(single["key_id"], key_id);
+    // One bound set and two cleared, written together.
+    assert_eq!(single["max_concurrent_requests"], 1);
+    assert_eq!(single["max_requests_per_second"], Value::Null);
+    assert_eq!(single["max_websockets"], Value::Null);
+}
+
+#[tokio::test]
+async fn clearing_the_expiry_and_every_bound_is_expressed_as_null() {
+    let fixture = edit_fixture().await;
+    // An explicit null clears; the credential starts with an expiry to clear.
+    let (status, _, issued) = send(
+        &fixture.api,
+        request(
+            Method::PATCH,
+            &format!("/admin/api/api-keys/{}", fixture.key_id),
+            json!({"expires_at": (Utc::now() + chrono::Duration::hours(6)).to_rfc3339()}),
+            Some(&fixture.owner.0),
+            Some(&fixture.owner.1),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(issued["expires_at"].is_string());
+
+    let (status, cleared) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({
+            "expires_at": null,
+            "admission": {
+                "max_concurrent_requests": null,
+                "max_requests_per_second": null,
+                "max_websockets": null
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let after = read_key(&fixture, &fixture.owner.0).await;
+    assert_eq!(after["expires_at"], Value::Null);
+    assert_eq!(after["max_concurrent_requests"], Value::Null);
+    assert_eq!(after["max_requests_per_second"], Value::Null);
+    assert_eq!(after["max_websockets"], Value::Null);
+    assert_eq!(cleared["expires_at"], Value::Null);
+}
+
+#[tokio::test]
+async fn an_absent_field_leaves_the_stored_value_alone() {
+    let fixture = edit_fixture().await;
+    let before = read_key(&fixture, &fixture.owner.0).await;
+    assert_eq!(before["max_concurrent_requests"], 10);
+
+    let (status, edited) =
+        patch_key(&fixture, &fixture.owner, json!({"name": "only-the-name"})).await;
+    assert_eq!(status, StatusCode::OK, "patch: {edited}");
+    let view = &edited;
+    // Everything not named is unchanged, including the bound and the set.
+    assert_eq!(view["name"], "only-the-name");
+    assert_eq!(view["max_concurrent_requests"], 10);
+    assert_eq!(view["max_requests_per_second"], 20);
+    assert_eq!(view["max_websockets"], 30);
+    assert_eq!(view["status"], "enabled");
+    assert_eq!(provider_ids_of(view), fixture.provider_ids);
+    assert_eq!(view["default_provider_id"], fixture.provider_ids[0]);
+}
+
+#[tokio::test]
+async fn editing_a_credential_is_scoped_to_its_owner_or_an_administrator() {
+    let fixture = edit_fixture().await;
+    let before = read_key(&fixture, &fixture.owner.0).await;
+
+    // A regular user may not edit, or even read, somebody else's credential.
+    for method in [Method::GET, Method::PATCH] {
+        let csrf = if method == Method::PATCH {
+            Some(fixture.other.1.as_str())
+        } else {
+            None
+        };
+        let label = if method == Method::PATCH {
+            "PATCH"
+        } else {
+            "GET"
+        };
+        let (status, _, _) = send(
+            &fixture.api,
+            request(
+                method,
+                &format!("/admin/api/api-keys/{}", fixture.key_id),
+                json!({"name": "stolen"}),
+                Some(&fixture.other.0),
+                csrf,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{label} must not reach it");
+    }
+
+    // The refused attempts left the credential exactly as it was.
+    assert_eq!(read_key(&fixture, &fixture.owner.0).await, before);
+
+    // The owner may edit its own credential.
+    let (status, edited) = patch_key(&fixture, &fixture.owner, json!({"name": "mine"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(edited["name"], "mine");
+
+    // An administrator may edit any credential, including another account's.
+    let (status, edited) =
+        patch_key(&fixture, &fixture.admin, json!({"name": "administered"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(edited["name"], "administered");
+    assert_eq!(
+        read_key(&fixture, &fixture.owner.0).await["name"],
+        "administered"
+    );
+}
+
+#[tokio::test]
+async fn replacing_the_provider_set_rechecks_the_stored_default() {
+    let fixture = edit_fixture().await;
+    // Dropping the default's provider without naming a new default would leave
+    // the stored default outside the new set, so it is refused rather than
+    // silently cleared.
+    let (status, body) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({"provider_ids": [fixture.provider_ids[1], fixture.provider_ids[2]]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+
+    // Nothing was written, so the credential still has its original set.
+    let after = read_key(&fixture, &fixture.owner.0).await;
+    assert_eq!(provider_ids_of(&after), fixture.provider_ids);
+    assert_eq!(after["default_provider_id"], fixture.provider_ids[0]);
+}
+
+#[tokio::test]
+async fn a_default_outside_the_named_set_is_refused() {
+    let fixture = edit_fixture().await;
+    let (status, body) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({
+            "provider_ids": [fixture.provider_ids[0], fixture.provider_ids[1]],
+            "default_provider_id": fixture.provider_ids[2]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "invalid_request");
+}
+
+#[tokio::test]
+async fn an_edit_can_clear_the_default_provider() {
+    let fixture = edit_fixture().await;
+    let (status, edited) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({"default_provider_id": null}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "clear default: {edited}");
+    assert_eq!(edited["default_provider_id"], Value::Null);
+    assert_eq!(provider_ids_of(&edited), fixture.provider_ids);
+}
+
+/// Every refusal below lands before persistence, so the credential afterwards is
+/// byte-for-byte the credential that was there before the attempt.
+#[tokio::test]
+async fn a_refused_edit_leaves_no_partial_write_behind() {
+    let fixture = edit_fixture().await;
+    let mut oversized = fixture.provider_ids.clone();
+    for number in 10..40 {
+        oversized.push(number);
+    }
+    let duplicate = vec![
+        fixture.provider_ids[0],
+        fixture.provider_ids[1],
+        fixture.provider_ids[0],
+    ];
+
+    let cases: Vec<(&str, Value, StatusCode, &str)> = vec![
+        (
+            "an empty provider set",
+            json!({"provider_ids": []}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an oversized provider set",
+            json!({"provider_ids": oversized}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "a repeated provider",
+            json!({"provider_ids": duplicate, "default_provider_id": fixture.provider_ids[0]}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an unknown provider",
+            json!({"provider_ids": [fixture.provider_ids[0], i64::MAX]}),
+            StatusCode::NOT_FOUND,
+            "provider_not_found",
+        ),
+        (
+            "an empty name",
+            json!({"name": "   "}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an oversized name",
+            json!({"name": "n".repeat(129)}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "a name carrying control characters",
+            json!({"name": "bad\u{7}name"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an expiry in the past",
+            json!({"expires_at": (Utc::now() - chrono::Duration::hours(1)).to_rfc3339()}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an unknown status",
+            json!({"status": "paused"}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "a zero concurrency bound",
+            json!({"admission": {
+                "max_concurrent_requests": 0,
+                "max_requests_per_second": null,
+                "max_websockets": null
+            }}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "a zero rate bound",
+            json!({"admission": {
+                "max_concurrent_requests": null,
+                "max_requests_per_second": 0,
+                "max_websockets": null
+            }}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "a zero websocket bound",
+            json!({"admission": {
+                "max_concurrent_requests": null,
+                "max_requests_per_second": null,
+                "max_websockets": 0
+            }}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+        (
+            "an empty change set",
+            json!({}),
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        ),
+    ];
+
+    for (label, body, expected_status, expected_code) in cases {
+        let before = read_key(&fixture, &fixture.owner.0).await;
+        let (status, response) = patch_key(&fixture, &fixture.owner, body).await;
+        assert_eq!(status, expected_status, "{label}");
+        assert_eq!(response["error"]["code"], expected_code, "{label}");
+        // No half-written field survives a refusal.
+        assert_eq!(
+            read_key(&fixture, &fixture.owner.0).await,
+            before,
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_negative_or_unparsable_bound_is_refused() {
+    let fixture = edit_fixture().await;
+    // A bound is a count, so a negative or non-numeric one never reaches a
+    // stored credential, whether the parser or the value type refuses it.
+    for body in [
+        json!({"admission": {
+            "max_concurrent_requests": -1,
+            "max_requests_per_second": null,
+            "max_websockets": null
+        }}),
+        json!({"admission": {
+            "max_concurrent_requests": null,
+            "max_requests_per_second": "many",
+            "max_websockets": null
+        }}),
+    ] {
+        let (status, response) = patch_key(&fixture, &fixture.owner, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"]["code"], "invalid_request");
+    }
+    let after = read_key(&fixture, &fixture.owner.0).await;
+    assert_eq!(after["max_concurrent_requests"], 10);
+    assert_eq!(after["max_requests_per_second"], 20);
+    assert_eq!(after["max_websockets"], 30);
+}
+
+#[tokio::test]
+async fn an_edit_requires_a_csrf_token_and_an_identifiable_path() {
+    let fixture = edit_fixture().await;
+    let before = read_key(&fixture, &fixture.owner.0).await;
+
+    // A write without the CSRF token never reaches the service.
+    let (status, _, _) = send(
+        &fixture.api,
+        request(
+            Method::PATCH,
+            &format!("/admin/api/api-keys/{}", fixture.key_id),
+            json!({"name": "no-csrf"}),
+            Some(&fixture.owner.0),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(read_key(&fixture, &fixture.owner.0).await, before);
+
+    // An unknown field is refused rather than silently ignored, so a caller
+    // never believes an edit applied something the contract does not carry.
+    let (status, response) = patch_key(
+        &fixture,
+        &fixture.owner,
+        json!({"max_concurrent_requests": 3}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(response["error"]["code"], "invalid_request");
+    assert_eq!(read_key(&fixture, &fixture.owner.0).await, before);
+}

@@ -231,6 +231,117 @@ async function createAccount(page, name) {
   return generated
 }
 
+/**
+ * Edits one issued credential in place, from the page.
+ *
+ * The whole point of the edit is that the credential survives it, so this walks
+ * a single credential through a rename, a status change, a provider reorder,
+ * a default change, a bound change, and a cleared bound, and checks that the
+ * list shows each one afterwards.
+ */
+async function editCredentialInPlace(page, keyName, providerName, label) {
+  const row = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('cell', { name: keyName, exact: true }) })
+
+  await row.getByRole('button', { name: 'Edit' }).click()
+
+  // The stored bounds and provider set come back as drafts, so the edit starts
+  // from what is actually stored.
+  const editRow = page.getByRole('row').filter({ has: page.getByLabel('Max WebSocket connections') })
+  await editRow.waitFor()
+  assert.equal(
+    await page.getByLabel('Max concurrent requests').inputValue(),
+    String(CREDENTIAL_BOUNDS.maxConcurrent),
+  )
+  assert.equal(
+    await page.getByLabel('Max WebSocket connections').inputValue(),
+    String(CREDENTIAL_BOUNDS.maxWebsockets),
+  )
+
+  // A bound of zero is refused in the page, so no request is sent and the
+  // credential is left exactly as it was.
+  await page.getByLabel('Max concurrent requests').fill('0')
+  await page.getByRole('button', { name: 'Save changes' }).click()
+  await page.getByText('A bound must be at least 1.').waitFor()
+  assert.equal(await row.getByRole('button', { name: 'Save changes' }).count(), 1)
+
+  // So is a value that is not a count at all.
+  await page.getByLabel('Max concurrent requests').fill('lots')
+  await page.getByRole('button', { name: 'Save changes' }).click()
+  await page.getByText('Enter a whole number').waitFor()
+
+  // Rename the credential, disable it, retune two bounds, and clear the third.
+  const editedName = `ci-edited-${label}`
+  await page.getByLabel('Name').fill(editedName)
+  await page.getByLabel('Status').selectOption('disabled')
+  await page.getByLabel('Max concurrent requests').fill('6')
+  await page.getByLabel('Max requests per second').fill('9')
+  await page.getByLabel('Max WebSocket connections').fill('')
+  // Give it an expiry the operator can read back on the row.
+  const expiry = new Date(Date.now() + 90 * 24 * 3600 * 1000)
+  const pad = (part) => String(part).padStart(2, '0')
+  const expiryDraft =
+    `${expiry.getFullYear()}-${pad(expiry.getMonth() + 1)}-${pad(expiry.getDate())}` +
+    `T${pad(expiry.getHours())}:${pad(expiry.getMinutes())}`
+  await page.getByLabel('Expires').fill(expiryDraft)
+  await page.getByRole('button', { name: 'Save changes' }).click()
+
+  // The list shows the new name, status, bounds, and expiry, and the edit is
+  // closed because the save succeeded.
+  const editedRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('cell', { name: editedName, exact: true }) })
+  await editedRow.waitFor()
+  await editedRow.getByRole('cell', { name: 'conc 6, rate 9' }).waitFor()
+  await editedRow.getByRole('cell', { name: 'disabled', exact: true }).waitFor()
+  await page.getByLabel('Max concurrent requests').waitFor({ state: 'detached' })
+
+  // Reopen the edit and reorder the provider set, which is the credential's
+  // routing preference, then change the default within it.
+  await editedRow.getByRole('button', { name: 'Edit' }).click()
+  const reorderRow = page.getByRole('row').filter({ has: page.getByLabel('Max WebSocket connections') })
+  await reorderRow.waitFor()
+  const beforeOrder = await reorderRow.locator('.binding-name').allInnerTexts()
+  assert.equal(beforeOrder.length, 1)
+
+  await page.getByRole('button', { name: 'Add browser-ordered' }).waitFor()
+  await createProvider(page, `browser-ordered-${label}`)
+  await page.getByRole('button', { name: 'Credentials' }).click()
+  const renamedRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('cell', { name: editedName, exact: true }) })
+  await renamedRow.getByRole('button', { name: 'Edit' }).click()
+
+  const bindingRow = page.getByRole('row').filter({ has: page.getByLabel('Max WebSocket connections') })
+  await bindingRow.waitFor()
+  await page.getByRole('checkbox', { name: `Add browser-ordered-${label}` }).check()
+  await page.getByLabel('Default').selectOption({ label: `browser-ordered-${label}` })
+  await page.getByRole('button', { name: 'Save changes' }).click()
+
+  const boundRow = page
+    .getByRole('row')
+    .filter({ has: page.getByRole('cell', { name: editedName, exact: true }) })
+  await boundRow.waitFor()
+  // Both providers are bound, with the new default marked, in the edited order.
+  await boundRow
+    .getByRole('cell', { name: new RegExp(`${providerName}.*browser-ordered-${label} \(default\)`) })
+    .waitFor()
+
+  // Cancelling an edit discards the drafts and leaves the credential as stored.
+  await boundRow.getByRole('button', { name: 'Edit' }).click()
+  await page.getByRole('row').filter({ has: page.getByLabel('Max WebSocket connections') }).waitFor()
+  await page.getByLabel('Name').fill('discarded-name')
+  await page.getByRole('button', { name: 'Cancel' }).click()
+  await boundRow.getByRole('cell', { name: editedName, exact: true }).waitFor()
+  assert.equal(await page.getByText('discarded-name').count(), 0)
+
+  // The page offers no way to see or replace an issued plaintext: the credential
+  // is edited in place, and the only one-time secret remains the rotation one.
+  await boundRow.getByRole('cell', { name: /ts_/ }).waitFor()
+  assert.equal(await boundRow.locator('input[type="password"]').count(), 0)
+}
+
 async function runSuite(browser, origin, label) {
   const context = await browser.newContext()
   const page = await context.newPage()
@@ -327,6 +438,8 @@ async function runSuite(browser, origin, label) {
     await page.getByRole('heading', { name: 'Credentials' }).waitFor()
     assert.equal(await page.locator('.credential-card').count(), 0)
     assert.equal(await page.getByText(createdCredential).count(), 0)
+
+    await editCredentialInPlace(page, keyName, providerName, label)
 
     page.once('dialog', (dialog) => dialog.accept())
     await page

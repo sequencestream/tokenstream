@@ -3,6 +3,15 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 import { AdminApi, type ProviderHealthWrite, type ProviderStatus, type ProtocolType } from './api/client.ts'
 import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
+import {
+  changeSetFor,
+  editDraftFor,
+  moveProvider,
+  readExpiry,
+  removeProvider,
+  toggleProvider as toggleBoundProvider,
+  type CredentialEditDraft,
+} from './keys/edit.ts'
 import { emptyApiKeyPage, loadApiKeys, type ApiKeyPage } from './keys/list.ts'
 import { boundDraft, boundSummary, emptyBoundDrafts, readBounds, type BoundDrafts } from './limits/bounds.ts'
 import { emptyLogFilters, logFiltersChanged, type LogFilterValues } from './logs/filters.ts'
@@ -72,6 +81,12 @@ const keyForm = reactive({
   default_provider_id: null as number | null,
   bounds: emptyBoundDrafts(),
 })
+
+// The credential row the page is editing, and its draft. The draft is separate
+// from the list so abandoning an edit leaves the listed credential untouched.
+const editingKeyId = ref<number | null>(null)
+const keyEditDraft = reactive<CredentialEditDraft>(emptyCredentialEditDraft())
+const keyEditBounds = reactive({ ...emptyBoundDrafts() })
 
 const logPage = ref<LogPage>({ items: [], cursor: null, exhausted: true })
 
@@ -170,6 +185,7 @@ async function signOut() {
     keyPage.value = { ...emptyApiKeyPage }
     accountPage.value = { ...emptyAccountPage }
     cancelCreate()
+    cancelKeyEdit()
     dismissSecret()
     activeView.value = 'keys'
   })
@@ -416,6 +432,92 @@ async function toggleProviderBinding(providerId: number) {
   if (keyForm.default_provider_id !== null && !keyForm.provider_ids.includes(keyForm.default_provider_id)) {
     keyForm.default_provider_id = null
   }
+}
+
+/** A blank credential edit, used before any credential is chosen. */
+function emptyCredentialEditDraft(): CredentialEditDraft {
+  return {
+    name: '',
+    status: 'enabled',
+    expires_at: '',
+    provider_ids: [],
+    default_provider_id: null,
+    bounds: emptyBoundDrafts(),
+  }
+}
+
+/**
+ * Opens the inline edit for one credential.
+ *
+ * The stored bounds and provider order come back as drafts, so the operator
+ * starts from what is actually stored and a cancelled edit changes nothing.
+ */
+function beginKeyEdit(key: typeof keyPage.value.items[number]) {
+  editingKeyId.value = key.id
+  const draft = editDraftFor(key)
+  Object.assign(keyEditDraft, draft)
+  Object.assign(keyEditBounds, {
+    max_concurrent_requests: draft.bounds.max_concurrent_requests,
+    max_requests_per_second: draft.bounds.max_requests_per_second,
+    max_websockets: draft.bounds.max_websockets,
+  })
+  clearFeedback()
+}
+
+function cancelKeyEdit() {
+  editingKeyId.value = null
+  clearFeedback()
+}
+
+/** Adds or removes a provider from the edited set, keeping the default valid. */
+function toggleKeyProvider(providerId: number) {
+  const next = toggleBoundProvider(
+    keyEditDraft.provider_ids,
+    keyEditDraft.default_provider_id,
+    providerId,
+  )
+  keyEditDraft.provider_ids = next.provider_ids
+  keyEditDraft.default_provider_id = next.default_provider_id
+}
+
+/** Reorders the edited set, which is the credential's routing preference. */
+function moveKeyProvider(providerId: number, offset: number) {
+  keyEditDraft.provider_ids = moveProvider(keyEditDraft.provider_ids, providerId, offset)
+}
+
+/**
+ * Saves the edited credential in place.
+ *
+ * Bounds and the expiration are read before the request, so a zero or a past
+ * instant is reported here instead of costing a round trip. A failure keeps the
+ * edit open with its drafts intact so the operator can correct it.
+ */
+async function saveKey(id: number) {
+  const bounds = readBounds(keyEditBounds, CREDENTIAL_BOUND_FIELDS)
+  if ('error' in bounds) {
+    errorMessage.value = bounds.error
+    return
+  }
+  const expiry = readExpiry(keyEditDraft.expires_at)
+  if ('error' in expiry) {
+    errorMessage.value = expiry.error
+    return
+  }
+  if (keyEditDraft.provider_ids.length === 0) {
+    errorMessage.value = 'Bind at least one provider.'
+    return
+  }
+  if (keyEditDraft.name.trim() === '') {
+    errorMessage.value = 'Enter a name for this credential.'
+    return
+  }
+  await runAction(async () => {
+    await api.updateApiKey(id, changeSetFor(keyEditDraft, expiry.value, bounds.values))
+    editingKeyId.value = null
+    notice.value = 'Credential updated.'
+    // Reloading with the applied conditions keeps the list on one result set.
+    keyPage.value = await loadApiKeys(api, keyPage.value, true)
+  })
 }
 
 async function rotateKey(id: number, name: string) {
@@ -740,27 +842,114 @@ onMounted(restoreSession)
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="key in keyPage.items" :key="key.id">
-                  <td>{{ key.id }}</td>
-                  <td>{{ key.name }}</td>
-                  <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
-                  <td><span class="badge" :class="key.status">{{ key.status }}</span></td>
-                  <td class="fill">
-                    <span v-for="(id, index) in key.provider_ids" :key="id">
-                      {{ providerName(id) }}<span v-if="id === key.default_provider_id"> (default)</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
-                    </span>
-                  </td>
-                  <td>{{ boundSummary([['conc', key.max_concurrent_requests], ['rate', key.max_requests_per_second], ['WS', key.max_websockets]]) }}</td>
-                  <td><code>{{ key.key_id }}</code></td>
-                  <td>{{ formatDate(key.expires_at) }}</td>
-                  <td>{{ formatDate(key.created_at) }}</td>
-                  <td class="row-actions">
-                    <div class="actions">
-                      <button class="button ghost" :disabled="busy" @click="rotateKey(key.id, key.name)">Rotate credential</button>
-                      <button class="button danger" :disabled="busy" @click="deleteKey(key.id, key.name)">Delete</button>
-                    </div>
-                  </td>
-                </tr>
+                <template v-for="key in keyPage.items" :key="key.id">
+                  <tr v-if="editingKeyId === key.id">
+                    <td>{{ key.id }}</td>
+                    <td><input v-model="keyEditDraft.name" maxlength="128" required aria-label="Name" /></td>
+                    <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
+                    <td>
+                      <select v-model="keyEditDraft.status" aria-label="Status">
+                        <option value="enabled">Enabled</option>
+                        <option value="disabled">Disabled</option>
+                      </select>
+                    </td>
+                    <td class="fill">
+                      <div class="row-bindings">
+                        <div v-for="(id, index) in keyEditDraft.provider_ids" :key="id" class="binding-row">
+                          <span class="binding-name">
+                            {{ providerName(id) }}<span v-if="id === keyEditDraft.default_provider_id"> (default)</span>
+                          </span>
+                          <button
+                            class="button ghost"
+                            type="button"
+                            :disabled="index === 0"
+                            :aria-label="`Move ${providerName(id)} earlier`"
+                            @click="moveKeyProvider(id, -1)"
+                          >↑</button>
+                          <button
+                            class="button ghost"
+                            type="button"
+                            :disabled="index === keyEditDraft.provider_ids.length - 1"
+                            :aria-label="`Move ${providerName(id)} later`"
+                            @click="moveKeyProvider(id, 1)"
+                          >↓</button>
+                          <button
+                            class="button ghost"
+                            type="button"
+                            :aria-label="`Remove ${providerName(id)}`"
+                            @click="toggleKeyProvider(id)"
+                          >Remove</button>
+                        </div>
+                        <label v-for="provider in providers" :key="provider.id" v-show="!keyEditDraft.provider_ids.includes(provider.id)" class="binding">
+                          <input type="checkbox" :value="provider.id" @change="toggleKeyProvider(provider.id)" />
+                          Add {{ provider.name }}
+                        </label>
+                        <label class="binding">
+                          Default
+                          <select v-model.number="keyEditDraft.default_provider_id">
+                            <option :value="null">No default</option>
+                            <option v-for="id in keyEditDraft.provider_ids" :key="id" :value="id">{{ providerName(id) }}</option>
+                          </select>
+                        </label>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="row-bounds">
+                        <input
+                          v-model="keyEditBounds.max_concurrent_requests"
+                          inputmode="numeric"
+                          placeholder="unbounded"
+                          aria-label="Max concurrent requests"
+                        />
+                        <input
+                          v-model="keyEditBounds.max_requests_per_second"
+                          inputmode="numeric"
+                          placeholder="unbounded"
+                          aria-label="Max requests per second"
+                        />
+                        <input
+                          v-model="keyEditBounds.max_websockets"
+                          inputmode="numeric"
+                          placeholder="unbounded"
+                          aria-label="Max WebSocket connections"
+                        />
+                      </div>
+                    </td>
+                    <td><code>{{ key.key_id }}</code></td>
+                    <td>
+                      <input v-model="keyEditDraft.expires_at" type="datetime-local" aria-label="Expires" />
+                    </td>
+                    <td>{{ formatDate(key.created_at) }}</td>
+                    <td class="row-actions">
+                      <div class="actions">
+                        <button class="button primary" :disabled="busy" @click="saveKey(key.id)">Save changes</button>
+                        <button class="button ghost" type="button" @click="cancelKeyEdit">Cancel</button>
+                      </div>
+                    </td>
+                  </tr>
+                  <tr v-else>
+                    <td>{{ key.id }}</td>
+                    <td>{{ key.name }}</td>
+                    <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
+                    <td><span class="badge" :class="key.status">{{ key.status }}</span></td>
+                    <td class="fill">
+                      <span v-for="(id, index) in key.provider_ids" :key="id">
+                        {{ providerName(id) }}<span v-if="id === key.default_provider_id"> (default)</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
+                      </span>
+                    </td>
+                    <td>{{ boundSummary([['conc', key.max_concurrent_requests], ['rate', key.max_requests_per_second], ['WS', key.max_websockets]]) }}</td>
+                    <td><code>{{ key.key_id }}</code></td>
+                    <td>{{ formatDate(key.expires_at) }}</td>
+                    <td>{{ formatDate(key.created_at) }}</td>
+                    <td class="row-actions">
+                      <div class="actions">
+                        <button class="button ghost" @click="beginKeyEdit(key)">Edit</button>
+                        <button class="button ghost" :disabled="busy" @click="rotateKey(key.id, key.name)">Rotate credential</button>
+                        <button class="button danger" :disabled="busy" @click="deleteKey(key.id, key.name)">Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                </template>
               </tbody>
             </table>
           </div>
@@ -1344,6 +1533,14 @@ input:focus, select:focus {
 .bounds .section-note { grid-column: 1 / -1; margin: 0; }
 .row-bounds { display: grid; gap: var(--space-1); }
 .row-probe { display: grid; gap: var(--space-1); min-width: 10rem; }
+.row-bindings { display: grid; gap: var(--space-1); min-width: 14rem; }
+.binding-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-compact);
+}
+.binding-name { flex: 1; min-width: 0; }
+.binding-row .button { padding: 2px var(--space-compact); }
 .binding { display: inline-flex; align-items: center; gap: var(--space-1); margin: 0; }
 .binding input { width: auto; min-width: 0; }
 .badge {

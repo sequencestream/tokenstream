@@ -19,7 +19,7 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokenstream::DataPlaneService;
 use tokenstream::config::Config;
-use tokenstream::credentials::{CreateApiKeyRequest, CredentialService};
+use tokenstream::credentials::{CreateApiKeyRequest, CredentialService, UpdateApiKeyRequest};
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier, PasswordWork, SharedCipher};
 use tokenstream::domain::{
     ApiKeyStatus, CredentialAdmission, ProtocolType, ProviderAdmission, ProviderStatus, RequestId,
@@ -230,6 +230,11 @@ struct Deployment {
     address: SocketAddr,
     credential: String,
     upstream: CountingUpstream,
+    /// The service and identifier an in-flight edit needs, so a bound can be
+    /// changed while the gateway is serving and the change observed by the
+    /// traffic that is already admitted.
+    credentials: CredentialService<SqliteDatabase, Argon2GatewaySecretVerifier>,
+    key_id: tokenstream::domain::ApiKeyId,
     /// Held so the database directory outlives every request the gateway
     /// serves. A pool that is still open while its directory is gone reports
     /// the next new connection as an ordinary storage failure, which would
@@ -294,6 +299,7 @@ async fn deploy(
         .await
         .expect("issue credential");
     let credential = issued.credential().render();
+    let key_id = issued.api_key().api_key().id();
 
     let metrics = Metrics::default();
     // A one-slot log queue keeps metadata emission best-effort and
@@ -373,6 +379,8 @@ async fn deploy(
         address,
         credential,
         upstream,
+        credentials: accounts,
+        key_id,
         _directory: directory,
     }
 }
@@ -616,4 +624,331 @@ async fn an_unlimited_credential_and_provider_are_unaffected_by_the_layers() {
         assert_eq!(status, StatusCode::OK);
     }
     assert_eq!(deployment.upstream.received.load(Ordering::SeqCst), 8);
+}
+
+/// Waits until the upstream has received `expected` requests.
+///
+/// The upstream only counts what reached it, so this is how a case knows the
+/// work it started is genuinely in flight rather than merely dispatched.
+async fn wait_for_upstream(upstream: &CountingUpstream, expected: usize) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while upstream.received.load(Ordering::SeqCst) < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upstream received {} requests, expected {expected}",
+            upstream.received.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Narrows the credential's bounds while the gateway is serving.
+///
+/// An edit binds work that arrives after it and leaves already-admitted work
+/// holding the snapshot it froze at authentication, so tightening a bound never
+/// reaches back and terminates a stream or connection that is already running.
+/// The narrowed bound counts the work admitted under it, which is what "applies
+/// to new work only" means for a limit that is edited rather than configured once.
+#[tokio::test]
+async fn tightening_bounds_never_terminates_admitted_work_and_spares_the_new_limit() {
+    // Start wide so two exchanges and one connection are all admitted at once
+    // under the original bounds.
+    let deployment = deploy(
+        ProviderAdmission::default(),
+        CredentialAdmission::new(Some(8), None, Some(4)).expect("valid bounds"),
+    )
+    .await;
+
+    // Admit one long-lived connection and two concurrent exchanges under the
+    // original bounds.
+    let connection = tokio::spawn(upgrade_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    let first = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    let second = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    // Wait until the upstream has actually received all three, so the edit
+    // provably happens after they were admitted rather than before. Polling
+    // rather than sleeping keeps the case honest about how long credential
+    // verification takes on this machine.
+    wait_for_upstream(&deployment.upstream, 3).await;
+
+    // Narrow both bounds while that work is still running.
+    let current = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential before the edit");
+    deployment
+        .credentials
+        .update_api_key(
+            deployment.key_id,
+            &current,
+            UpdateApiKeyRequest::new().with_admission(
+                CredentialAdmission::new(Some(1), None, Some(1)).expect("valid bounds"),
+            ),
+        )
+        .await
+        .expect("narrow the bounds");
+
+    // Everything already admitted still completes: the edit did not reach back
+    // and tear down work that was already running.
+    let connection_status = connection.await.expect("connection task");
+    assert_eq!(connection_status.0, StatusCode::SWITCHING_PROTOCOLS);
+    let (first_status, _) = first.await.expect("first exchange task");
+    assert_eq!(first_status, StatusCode::OK);
+    let (second_status, _) = second.await.expect("second exchange task");
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(deployment.upstream.received.load(Ordering::SeqCst), 3);
+
+    // The narrowed connection bound is now in force for work admitted after the
+    // edit. Two connections are attempted at once; one is admitted and the other
+    // is refused, and the refusal happens before the upstream is contacted,
+    // which the unchanged count proves.
+    let (accepted, refused) = tokio::join!(
+        upgrade_responses(deployment.address, deployment.credential.clone()),
+        upgrade_responses(deployment.address, deployment.credential.clone()),
+    );
+    assert_eq!(
+        deployment.upstream.received.load(Ordering::SeqCst),
+        4,
+        "only the admitted connection reaches the upstream"
+    );
+    let statuses = [accepted.0, refused.0];
+    assert!(
+        statuses.contains(&StatusCode::SWITCHING_PROTOCOLS),
+        "one connection is admitted under the narrowed bound: {statuses:?}"
+    );
+    let refused_envelope = if refused.0 == StatusCode::SERVICE_UNAVAILABLE {
+        refused.1
+    } else {
+        accepted.1
+    };
+    assert!(
+        refused_envelope.contains("connection_limit_reached"),
+        "the refusal names the credential bound: {refused_envelope}"
+    );
+}
+
+/// A narrowed HTTP concurrency bound refuses work that exceeds it, before the
+/// upstream is contacted, and leaves already-running exchanges alone.
+#[tokio::test]
+async fn a_narrowed_concurrency_bound_refuses_the_excess_and_spares_the_running_ones() {
+    let deployment = deploy(
+        ProviderAdmission::default(),
+        CredentialAdmission::new(Some(8), None, None).expect("valid bounds"),
+    )
+    .await;
+
+    // Two exchanges are admitted and running under the original bounds.
+    let first = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    let second = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    wait_for_upstream(&deployment.upstream, 2).await;
+
+    // Narrow the concurrency bound to one while those two are still running.
+    let current = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential before the edit");
+    deployment
+        .credentials
+        .update_api_key(
+            deployment.key_id,
+            &current,
+            UpdateApiKeyRequest::new().with_admission(
+                CredentialAdmission::new(Some(1), None, None).expect("valid bounds"),
+            ),
+        )
+        .await
+        .expect("narrow the concurrency bound");
+
+    // Neither running exchange was disturbed by the edit.
+    let (first_status, _) = first.await.expect("first exchange task");
+    assert_eq!(first_status, StatusCode::OK);
+    let (second_status, _) = second.await.expect("second exchange task");
+    assert_eq!(second_status, StatusCode::OK);
+    assert_eq!(deployment.upstream.received.load(Ordering::SeqCst), 2);
+
+    // Work admitted after the edit is held to the narrowed bound: two
+    // concurrent exchanges are attempted, one is admitted and one is refused
+    // before the upstream is contacted.
+    let (accepted, refused) = tokio::join!(
+        post_responses(deployment.address, deployment.credential.clone()),
+        post_responses(deployment.address, deployment.credential.clone()),
+    );
+    assert_eq!(
+        deployment.upstream.received.load(Ordering::SeqCst),
+        3,
+        "only the admitted exchange reaches the upstream"
+    );
+    let statuses = [accepted.0, refused.0];
+    assert!(
+        statuses.contains(&StatusCode::OK),
+        "one exchange is admitted under the narrowed bound: {statuses:?}"
+    );
+    let refused_envelope = if refused.0 == StatusCode::SERVICE_UNAVAILABLE {
+        refused.1
+    } else {
+        accepted.1
+    };
+    assert!(
+        refused_envelope.contains("connection_limit_reached"),
+        "the refusal names the credential bound: {refused_envelope}"
+    );
+}
+
+/// Widening takes effect for work admitted afterwards, without disturbing the
+/// work that was already running.
+#[tokio::test]
+async fn widening_bounds_admits_work_the_old_bound_refused() {
+    // A concurrency bound of one refuses a second concurrent exchange, so the
+    // sequence below starts by proving the bound bites.
+    let deployment = deploy(
+        ProviderAdmission::default(),
+        CredentialAdmission::new(Some(1), None, None).expect("valid bounds"),
+    )
+    .await;
+
+    let in_flight = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    wait_for_upstream(&deployment.upstream, 1).await;
+
+    // While one exchange is running, the bound of one refuses the next.
+    let (status, _) = post_responses(deployment.address, deployment.credential.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    // Widen the bound while the first exchange is still running.
+    let current = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential before the edit");
+    deployment
+        .credentials
+        .update_api_key(
+            deployment.key_id,
+            &current,
+            UpdateApiKeyRequest::new().with_admission(
+                CredentialAdmission::new(Some(4), None, None).expect("valid bounds"),
+            ),
+        )
+        .await
+        .expect("widen the bound");
+
+    // The edit did not disturb the exchange that was already running.
+    let (in_flight_status, _) = in_flight.await.expect("in-flight exchange task");
+    assert_eq!(in_flight_status, StatusCode::OK);
+
+    // Work arriving after the widened edit is admitted, where the old bound of
+    // one would have refused a second concurrent exchange.
+    let concurrent = post_responses(deployment.address, deployment.credential.clone());
+    let (status, _) = concurrent.await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Clearing every bound releases the credential entirely: after the edit the
+/// same request the old bound refused is admitted.
+#[tokio::test]
+async fn clearing_every_bound_admits_work_the_old_bound_refused() {
+    let deployment = deploy(
+        ProviderAdmission::default(),
+        CredentialAdmission::new(Some(1), None, None).expect("valid bounds"),
+    )
+    .await;
+
+    let in_flight = tokio::spawn(post_responses(
+        deployment.address,
+        deployment.credential.clone(),
+    ));
+    wait_for_upstream(&deployment.upstream, 1).await;
+    let (status, _) = post_responses(deployment.address, deployment.credential.clone()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let current = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential before the edit");
+    deployment
+        .credentials
+        .update_api_key(
+            deployment.key_id,
+            &current,
+            UpdateApiKeyRequest::new().with_admission(CredentialAdmission::default()),
+        )
+        .await
+        .expect("clear every bound");
+
+    // The running exchange finished unaffected, and the credential is now
+    // unbounded, so the same request that was just refused is admitted.
+    let (in_flight_status, _) = in_flight.await.expect("in-flight exchange task");
+    assert_eq!(in_flight_status, StatusCode::OK);
+    let (status, _) = post_responses(deployment.address, deployment.credential.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Editing a credential does not rotate it: the same plaintext keeps working
+/// afterwards, so no client has to be reconfigured after an edit.
+#[tokio::test]
+async fn an_edited_credential_keeps_working_without_being_reissued() {
+    let deployment = deploy(
+        ProviderAdmission::default(),
+        CredentialAdmission::new(Some(2), None, Some(2)).expect("valid bounds"),
+    )
+    .await;
+    let before = deployment.upstream.received.load(Ordering::SeqCst);
+
+    let current = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential before the edit");
+    let key_id_before = current.api_key().key_id().clone();
+    deployment
+        .credentials
+        .update_api_key(
+            deployment.key_id,
+            &current,
+            UpdateApiKeyRequest::new()
+                .with_name("edited-in-flight".to_owned())
+                .with_admission(
+                    CredentialAdmission::new(Some(1), Some(1), Some(1)).expect("valid bounds"),
+                ),
+        )
+        .await
+        .expect("edit the credential");
+
+    let after = deployment
+        .credentials
+        .get_api_key(deployment.key_id)
+        .await
+        .expect("read the credential after the edit");
+    assert_eq!(
+        after.api_key().key_id(),
+        &key_id_before,
+        "the identifier stands"
+    );
+
+    // The very same plaintext still authenticates and reaches the upstream.
+    let (status, _) = post_responses(deployment.address, deployment.credential.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        deployment.upstream.received.load(Ordering::SeqCst),
+        before + 1
+    );
 }

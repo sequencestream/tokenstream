@@ -55,6 +55,13 @@ sequenceDiagram
             opt Regular user names another account
                 C-->>B: 403
             end
+            B->>C: Edit an issued credential
+            C->>K: CSRF-checked write, owner-checked
+            K-->>C: Redacted credential, never a plaintext
+            C-->>B: no-store JSON
+            opt Edit names an invalid configuration
+                C-->>B: 400, nothing written
+            end
             opt Administrator edits a provider
                 C->>P: CSRF-checked write
                 P-->>C: Redacted provider
@@ -89,6 +96,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - The operational exposition is an administrator surface. It is served only to an authenticated administrator, is not cacheable, and is served at no data-plane path.
 - Disabling an account stops its new data-plane traffic immediately; already admitted streams keep running.
 - A credential's plaintext is returned exactly once, at creation and at rotation, to whichever account owns it.
+- An issued credential is edited in place through the same owner-checked path as its creation, and an edit neither returns a plaintext nor changes the key identifier or the secret.
 - Control-plane hashing and database work use the reserved control-plane budgets so a burst of sign-ins or rotations cannot consume data-plane verification capacity ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)).
 - Hashed page assets may cache long-lived. The entry document does not, so a replaced binary is picked up on the next navigation.
 
@@ -115,6 +123,10 @@ Name each role once and reuse those names. A new surface does not introduce a se
 - Each view has a small page title and one muted sentence. The title names the view; it is not a hero.
 - A scan of many rows uses a table that stretches with the page. Filters sit in one compact toolbar row with the table they control. A create form or one-time credential uses a card.
 - Each provider is one table row and shows every non-secret field.
+- Each credential is one table row and shows its name, status, ordered provider bindings with the default marked, its own bounds, and its key identifier. Its inline edit expands into that same row rather than a separate page, presenting the name, status, expiration, ordered provider set with per-provider reordering, the default provider, and the three bounds.
+- An inline edit previews the stored configuration as its starting point and can be abandoned, which discards the draft and leaves the row exactly as stored. Bounds and the expiration are checked in the page before a request is sent, so an impossible value is reported without a round trip.
+- Removing a provider that is currently the default clears the default in the same step rather than submitting a value the credential would refuse.
+- An inline edit offers no way to read or replace an issued plaintext; the only plaintext a credential ever shows is the one returned once by creation or rotation.
 - The provider create form stays closed until the operator opens it with New provider. Cancel or a successful create closes it again.
 - Forms are compact field grids. A primary submit is content-sized, not stretched across leftover columns. On the narrow chrome breakpoint, a submit may fill the row.
 - Sign-in is a centered, narrow card under the same chrome. It does not use a split marketing layout.
