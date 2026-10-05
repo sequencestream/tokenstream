@@ -1,5 +1,0 @@
-{
-  "mcpServers": {
-    "c3": { "url": "http://127.0.0.1:4000/internal/automation-mcp/v1?token=904ab22e-43a3-4b17-b361-5fb2bd44363a" }
-  }
-}
