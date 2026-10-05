@@ -34,8 +34,9 @@ test('the page submits exactly the fields the credential edit accepts', () => {
   draft.bounds.max_requests_per_second = ''
   draft.bounds.max_websockets = ''
   const expiry = readExpiry(draft.expires_at)
+  assert.equal('error' in expiry, false)
 
-  const payload = changeSetFor(draft, expiry.value, {
+  const payload = changeSetFor(draft, (expiry as { value: string | null }).value, {
     max_concurrent_requests: Number(draft.bounds.max_concurrent_requests),
     max_requests_per_second: null,
     max_websockets: null,
