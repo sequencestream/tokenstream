@@ -10,6 +10,10 @@ One process runs two permanently separate planes ([ADR 0002](../adr/0002-dual-pl
 
 The data directory is `~/.tokenstream` unless overridden. SQLite defaults to a file there. Listeners default to loopback ports 3300 and 3301. A missing master key is generated once into that directory. A missing administrator secret uses a documented default password whose hash is stored there. Environment values override files and compiled defaults.
 
+After the complete configuration has been merged and validated, and before database work or listener binding, the process installs exactly one global diagnostic subscriber. Process diagnostics are single-line JSON on standard error. The top-level envelope contains `timestamp`, `level`, `target`, and `fields`; `fields` always contains a stable event name and constant message. An immutable admission rule accepts only the closed set of audited Tokenstream targets, events, messages, and context fields. `TOKENSTREAM_LOG_FILTER` selects verbosity within that safe set using tracing filter-directive syntax, defaults to `info`, follows the normal environment-over-overlay-over-default priority, and takes effect on restart. A directive naming a dependency or unknown target cannot admit its events. An empty, non-Unicode, or invalid directive fails startup before binding. A second or conflicting global subscriber is an initialization failure rather than permission to continue with an unknown output contract.
+
+Configuration and diagnostic-installation failures use the same JSON envelope through a minimal pre-subscriber writer. Later startup failures use closed stage and error categories instead of rendering arbitrary error chains. Standard output carries no ordinary diagnostics. Its only process-created record is the isolated one-time bootstrap credential: when the configured administrator hash cannot yield a plaintext and no plaintext was supplied, a generated password is output only if the bootstrap account was actually created. Default and explicitly supplied passwords are not output. Account creation and output delivery cannot form one atomic transaction; if the account commits and standard-output delivery fails, startup fails but the password cannot be replayed automatically.
+
 Every accumulator this process owns is bounded and fail-closed ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)). Admission never queues. Data-plane and control-plane hashing budgets are independent under a process-wide ceiling. Authentication lookups may reserve pooled database connections. Idle HTTP sockets to an origin are capped and expire.
 
 Startup is all-or-nothing: invalid settings, a bad master key, a non-Argon2id administrator hash, failed migrations, or a missing compiled administration page mean neither listener binds.
@@ -26,6 +30,7 @@ sequenceDiagram
     participant L as LogWriter
 
     Op->>P: Start with environment, overlay, and defaults
+    P->>P: Validate settings and install JSON diagnostics
     alt Settings, secrets, migrations, or compiled page invalid
         P-->>Op: Exit before bind
     else Valid
@@ -70,6 +75,8 @@ The compiled administration page is served from the control-plane listener so th
 ## Failures and bounds
 
 - Startup fails closed. There is no half-bound process.
+- Invalid diagnostic filters and subscriber conflicts fail before either listener binds. Diagnostic failures never echo the rejected filter or an underlying error string.
+- A failed one-time credential write fails startup after account creation; the committed account and failed output cannot be rolled back atomically.
 - A full connection limit rejects new work immediately.
 - Database access uses a bounded pool with explicit execution deadlines for authentication, administration, and log batches.
 - Remaining queued log events dropped when the flush is aborted increment the dropped-log metric.

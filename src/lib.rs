@@ -26,6 +26,7 @@ pub mod auth;
 pub mod config;
 pub mod credentials;
 pub mod crypto;
+pub mod diagnostics;
 pub mod domain;
 pub mod events;
 pub mod local_state;

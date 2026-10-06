@@ -332,8 +332,11 @@ impl SubscriberWarning {
             .last
             .is_none_or(|previous| now.duration_since(previous) >= WARNING_INTERVAL)
         {
-            eprintln!(
-                "Tokenstream event subscriber {name} failed to handle a batch; retry and isolation are bounded"
+            tracing::warn!(
+                target: "tokenstream::events",
+                event = "event_subscriber_batch_failed",
+                message = "An event subscriber failed to handle a batch; retry and isolation are bounded.",
+                subscriber = name.as_str(),
             );
             self.last = Some(now);
         }
@@ -694,5 +697,19 @@ mod tests {
             .await
             .expect("the worker finishes its final partial batch and exits")
             .expect("worker exits after the bus closes");
+    }
+
+    #[test]
+    fn subscriber_warning_is_structured_safe_and_rate_limited() {
+        let output = crate::diagnostics::capture_for_test(|| {
+            let mut warning = SubscriberWarning::new();
+            warning.report(SubscriberName::RequestLog);
+            warning.report(SubscriberName::RequestLog);
+        });
+        assert_eq!(output.lines().count(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("subscriber diagnostic");
+        assert_eq!(event["fields"]["event"], "event_subscriber_batch_failed");
+        assert_eq!(event["fields"]["subscriber"], "request_log");
     }
 }

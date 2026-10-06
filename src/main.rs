@@ -1,32 +1,89 @@
+use std::fmt;
+
 use tokenstream::admin::AdminApi;
-use tokenstream::config::Config;
+use tokenstream::config::{Config, ConfigError};
 use tokenstream::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
+use tokenstream::diagnostics::{ConfigFailure, StartupErrorKind, StartupStage};
 use tokenstream::proxy::admission::{AdmissionControl, ProxyLimits};
 use tokenstream::proxy::gateway::Gateway;
 use tokenstream::telemetry::Metrics;
 
+#[derive(Clone, Copy, Debug)]
+struct StartupFailure {
+    stage: StartupStage,
+    error_kind: StartupErrorKind,
+}
+
+impl StartupFailure {
+    const fn new(stage: StartupStage, error_kind: StartupErrorKind) -> Self {
+        Self { stage, error_kind }
+    }
+}
+
+impl fmt::Display for StartupFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Tokenstream startup failed")
+    }
+}
+
+impl std::error::Error for StartupFailure {}
+
 #[tokio::main]
 async fn main() {
-    if let Err(error) = run().await {
-        eprintln!("Tokenstream failed to start: {error}");
+    let config = match Config::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            write_config_failure(&error);
+            std::process::exit(1);
+        }
+    };
+    if tokenstream::diagnostics::install(config.log_filter()).is_err() {
+        let _ = tokenstream::diagnostics::write_fatal(
+            StartupStage::DiagnosticInitialization,
+            StartupErrorKind::SubscriberUnavailable,
+            None,
+        );
+        std::process::exit(1);
+    }
+    if let Err(failure) = run(config).await {
+        let _ = tokenstream::diagnostics::write_fatal(failure.stage, failure.error_kind, None);
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::from_env()?;
-    let data_address = config.data_listen_addr();
-    let control_address = config.admin_listen_addr();
-    eprintln!(
-        "Tokenstream starting data plane on http://{data_address} and control plane on http://{control_address}"
+fn write_config_failure(error: &ConfigError) {
+    let (kind, setting, requirement) = match error {
+        ConfigError::Missing { name } => (StartupErrorKind::MissingSetting, *name, None),
+        ConfigError::Invalid { name, requirement } => {
+            (StartupErrorKind::InvalidSetting, *name, Some(*requirement))
+        }
+    };
+    let _ = tokenstream::diagnostics::write_fatal(
+        StartupStage::Configuration,
+        kind,
+        Some(ConfigFailure::sanitized(setting, requirement)),
     );
-    if let Some(data_dir) = config.data_dir() {
-        eprintln!("Data directory {}", data_dir.display());
-    }
+}
+
+async fn run(config: Config) -> Result<(), StartupFailure> {
+    tracing::info!(
+        target: "tokenstream::process",
+        event = "process_starting",
+        message = "Tokenstream is starting.",
+        data_address = config.data_listen_addr().to_string().as_str(),
+        control_address = config.admin_listen_addr().to_string().as_str(),
+    );
+    tracing::info!(
+        target: "tokenstream::process",
+        event = "data_directory_resolved",
+        message = "The process data directory is ready.",
+        configured = config.data_dir().is_some(),
+    );
     if config.uses_default_admin_password() {
-        eprintln!(
-            "Default administrator password is {}; change it from the administration page.",
-            tokenstream::local_state::DEFAULT_ADMIN_PASSWORD
+        tracing::warn!(
+            target: "tokenstream::process",
+            event = "default_admin_password_enabled",
+            message = "The documented default administrator password is enabled and should be changed.",
         );
     }
     let database = tokenstream::persistence::Database::connect_with_bounds(
@@ -40,11 +97,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             log_timeout: config.log_db_timeout(),
         },
     )
-    .await?;
-    // Migrations run before anything reads or writes a row. The bootstrap
-    // account below depends on the tables this process is about to create, so
-    // an upgrade and a fresh deployment follow the same path.
-    tokenstream::MigrationRunner::run(&database).await?;
+    .await
+    .map_err(|_| {
+        StartupFailure::new(
+            StartupStage::DatabaseConnection,
+            StartupErrorKind::StorageUnavailable,
+        )
+    })?;
+    tokenstream::MigrationRunner::run(&database)
+        .await
+        .map_err(|_| {
+            StartupFailure::new(StartupStage::Migration, StartupErrorKind::MigrationFailed)
+        })?;
     let metrics = Metrics::default();
     let admission =
         AdmissionControl::with_metrics(ProxyLimits::from_config(&config), metrics.clone());
@@ -60,19 +124,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let admin_password_work =
         tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
     let cipher = SharedCipher::new(config.master_key().expose());
-    // The bootstrap account is created from the password this process was
-    // configured with. The plaintext is resolved once, here, and is never
-    // persisted: it comes from the environment when the operator supplied one,
-    // and otherwise from the documented default when the configured hash is
-    // still that default's. A hash whose plaintext is genuinely unknown — a
-    // hash supplied directly — gets a generated password shown once, because a
-    // hash cannot be reversed and a guessed password would be worse.
+    let generated_password = std::env::var("TOKENSTREAM_ADMIN_PASSWORD").is_err()
+        && !config.uses_default_admin_password();
     let bootstrap_password = match std::env::var("TOKENSTREAM_ADMIN_PASSWORD") {
         Ok(password) => password,
         Err(_) if config.uses_default_admin_password() => {
             tokenstream::local_state::DEFAULT_ADMIN_PASSWORD.to_owned()
         }
-        Err(_) => tokenstream::local_state::generate_admin_password()?,
+        Err(_) => tokenstream::local_state::generate_admin_password().map_err(|_| {
+            StartupFailure::new(
+                StartupStage::Bootstrap,
+                StartupErrorKind::CredentialGenerationFailed,
+            )
+        })?,
     };
     let admin_api = AdminApi::new(
         database.clone(),
@@ -83,25 +147,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_runtime(&config, admin_password_work)
     .with_metrics(metrics.clone());
-    // The compiled page is confirmed before either listener binds, so a
-    // deployment never comes up claiming to serve a page it cannot serve.
-    admin_api.verify_assets()?;
-    // The first account is created from the configured administrator
-    // credentials before the control plane starts serving, so a fresh
-    // deployment can sign in immediately and an upgraded one adopts the
-    // credentials it already has without operator action.
+    admin_api.verify_assets().map_err(|_| {
+        StartupFailure::new(
+            StartupStage::AdministrationAssets,
+            StartupErrorKind::AssetsUnavailable,
+        )
+    })?;
     if admin_api
         .ensure_bootstrap_account(config.bootstrap_account_name(), &bootstrap_password)
-        .await?
+        .await
+        .map_err(|_| {
+            StartupFailure::new(
+                StartupStage::Bootstrap,
+                StartupErrorKind::AccountCreationFailed,
+            )
+        })?
     {
-        eprintln!(
-            "Created bootstrap account {}; change its password from the administration page.",
-            config.bootstrap_account_name()
+        tracing::info!(
+            target: "tokenstream::process",
+            event = "bootstrap_account_created",
+            message = "The bootstrap administrator account was created.",
         );
-        if !config.uses_default_admin_password()
-            && std::env::var("TOKENSTREAM_ADMIN_PASSWORD").is_err()
-        {
-            eprintln!("Bootstrap account password: {bootstrap_password}");
+        if generated_password {
+            tokenstream::diagnostics::write_bootstrap_password(&bootstrap_password).map_err(
+                |_| {
+                    StartupFailure::new(
+                        StartupStage::Bootstrap,
+                        StartupErrorKind::CredentialDeliveryFailed,
+                    )
+                },
+            )?;
+            tracing::info!(
+                target: "tokenstream::process",
+                event = "bootstrap_credential_delivered",
+                message = "The generated bootstrap credential was delivered on standard output.",
+            );
         }
     }
     let gateway = Gateway::with_shared_cipher(
@@ -112,9 +192,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_password_work,
         cipher,
     );
-    // The prober is constructed from the same repository and the same upstream
-    // connect deadline as the data plane, so a probe costs the same bounded
-    // connect a request would and never opens a connection policy of its own.
     let health = tokenstream::providers::health::HealthProber::new(
         database.clone(),
         config.upstream_connect_timeout(),
@@ -135,6 +212,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.log_flush_timeout(),
         health,
     )
-    .await?;
+    .await
+    .map_err(|_| {
+        StartupFailure::new(
+            StartupStage::Runtime,
+            StartupErrorKind::ListenerOrRuntimeFailed,
+        )
+    })?;
     Ok(())
 }

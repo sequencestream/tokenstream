@@ -566,6 +566,12 @@ async fn settings_table_lists_and_updates_live_password() {
             .iter()
             .any(|item| item["name"] == "TOKENSTREAM_DATA_LISTEN_ADDR")
     );
+    assert!(items.iter().any(|item| {
+        item["name"] == "TOKENSTREAM_LOG_FILTER"
+            && item["value"] == "info"
+            && item["secret"] == false
+            && item["restart_required"] == true
+    }));
     assert!(
         items
             .iter()
@@ -577,14 +583,15 @@ async fn settings_table_lists_and_updates_live_password() {
             .all(|item| item["name"] != "TOKENSTREAM_ADMIN_STATIC_ROOT")
     );
 
-    let (status, _, _) = send(
+    let (status, _, updated) = send(
         &api,
         request(
             Method::PATCH,
             "/admin/api/settings",
             json!({
                 "TOKENSTREAM_ADMIN_PASSWORD": "new-admin-password",
-                "TOKENSTREAM_ADMIN_SESSION_TTL_MS": "120000"
+                "TOKENSTREAM_ADMIN_SESSION_TTL_MS": "120000",
+                "TOKENSTREAM_LOG_FILTER": "tokenstream::process=debug,tokenstream::persistence=warn"
             }),
             Some(&cookie),
             Some(&csrf),
@@ -592,6 +599,17 @@ async fn settings_table_lists_and_updates_live_password() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let log_filter = updated["items"]
+        .as_array()
+        .expect("updated settings")
+        .iter()
+        .find(|item| item["name"] == "TOKENSTREAM_LOG_FILTER")
+        .expect("process diagnostic filter");
+    assert_eq!(
+        log_filter["value"],
+        "tokenstream::process=debug,tokenstream::persistence=warn"
+    );
+    assert_eq!(log_filter["pending_restart"], true);
 
     let (status, _, _) = send(
         &api,

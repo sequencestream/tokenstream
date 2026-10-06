@@ -88,6 +88,7 @@ impl fmt::Debug for BootstrapAccount {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    log_filter: String,
     data_listen_addr: SocketAddr,
     admin_listen_addr: SocketAddr,
     database_url: DatabaseUrl,
@@ -212,6 +213,14 @@ impl Config {
         persist_master: &mut Option<String>,
         persist_hash: &mut Option<String>,
     ) -> Result<Self, ConfigError> {
+        let log_filter = optional(&mut get, "TOKENSTREAM_LOG_FILTER")?
+            .unwrap_or_else(|| crate::diagnostics::DEFAULT_FILTER.to_owned());
+        if !crate::diagnostics::validate_filter(&log_filter) {
+            return Err(ConfigError::Invalid {
+                name: "TOKENSTREAM_LOG_FILTER",
+                requirement: "must be a valid tracing filter directive",
+            });
+        }
         let data_listen_addr: std::net::SocketAddr = parse_optional_value(
             &mut get,
             "TOKENSTREAM_DATA_LISTEN_ADDR",
@@ -469,6 +478,7 @@ impl Config {
             parse_optional_flag(&mut get, "TOKENSTREAM_DEVELOPMENT_MODE", loopback_listeners)?;
 
         Ok(Self {
+            log_filter,
             data_listen_addr,
             admin_listen_addr,
             database_url,
@@ -547,6 +557,10 @@ impl Config {
     }
     pub fn data_listen_addr(&self) -> SocketAddr {
         self.data_listen_addr
+    }
+
+    pub fn log_filter(&self) -> &str {
+        &self.log_filter
     }
 
     pub fn admin_listen_addr(&self) -> SocketAddr {
@@ -663,6 +677,7 @@ impl Config {
 
     pub fn to_env_map(&self) -> std::collections::HashMap<String, String> {
         let mut values = std::collections::HashMap::from([
+            ("TOKENSTREAM_LOG_FILTER".to_owned(), self.log_filter.clone()),
             (
                 "TOKENSTREAM_DATA_LISTEN_ADDR".to_owned(),
                 self.data_listen_addr.to_string(),
@@ -1123,6 +1138,7 @@ mod tests {
     fn loads_every_required_setting() {
         let config = load(&valid_values()).expect("valid configuration");
 
+        assert_eq!(config.log_filter(), "info");
         assert_eq!(config.data_listen_addr().port(), 3000);
         assert_eq!(config.admin_listen_addr().port(), 3001);
         assert_eq!(config.database_url().expose(), "sqlite://tokenstream.db");
@@ -1155,6 +1171,7 @@ mod tests {
     #[test]
     fn absent_settings_use_compiled_defaults() {
         let config = load(&HashMap::new()).expect("defaulted configuration");
+        assert_eq!(config.log_filter(), "info");
         assert_eq!(config.data_listen_addr().port(), 3300);
         assert_eq!(config.admin_listen_addr().port(), 3301);
         assert_eq!(config.database_url().expose(), "sqlite::memory:");
@@ -1192,6 +1209,7 @@ mod tests {
             ("TOKENSTREAM_UPSTREAM_CONNECT_TIMEOUT_MS", "secret-timeout"),
             ("TOKENSTREAM_MAX_PROXY_CONNECTIONS", "secret-count"),
             ("TOKENSTREAM_DEVELOPMENT_MODE", "secret-mode"),
+            ("TOKENSTREAM_LOG_FILTER", "secret filter ["),
         ] {
             let mut values = valid_values();
             values.insert(name, invalid.into());
@@ -1199,6 +1217,21 @@ mod tests {
             assert!(rendered.contains(name));
             assert!(!rendered.contains(invalid));
         }
+    }
+
+    #[test]
+    fn accepts_explicit_process_diagnostic_filter() {
+        let mut values = valid_values();
+        values.insert(
+            "TOKENSTREAM_LOG_FILTER",
+            "tokenstream=debug,sqlx=warn".into(),
+        );
+        let config = load(&values).expect("valid configuration");
+        assert_eq!(config.log_filter(), "tokenstream=debug,sqlx=warn");
+        assert_eq!(
+            config.to_env_map()["TOKENSTREAM_LOG_FILTER"],
+            "tokenstream=debug,sqlx=warn"
+        );
     }
 
     #[test]

@@ -33,6 +33,12 @@ pub struct SettingSpec {
 pub fn setting_catalog() -> &'static [SettingSpec] {
     &[
         SettingSpec {
+            name: "TOKENSTREAM_LOG_FILTER",
+            label: "Process diagnostic filter",
+            restart_required: true,
+            secret: false,
+        },
+        SettingSpec {
             name: "TOKENSTREAM_DATA_LISTEN_ADDR",
             label: "Data-plane listen address",
             restart_required: true,

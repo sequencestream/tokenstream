@@ -21,8 +21,8 @@ use super::{
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
     ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
     RequestLogRepository, RequestLogRow, RequestLogStarted, account_status_value, admission_count,
-    api_key_status_value, health_name, probe_columns, protocol_value, role_value, status_value,
-    timed, transport_value,
+    api_key_status_value, diagnostic_error_kind, health_name, probe_columns, protocol_value,
+    role_value, status_value, timed, transport_value,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -34,8 +34,8 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres
 /// timeout. A rollback releases the connection immediately.
 const BINDING_WRITE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Names the backend in a persistence failure, so the log says which one failed.
-const LABEL: &str = "PostgreSQL";
+const WRITE_OPERATION: crate::diagnostics::RepositoryOperation =
+    crate::diagnostics::RepositoryOperation::WriteQuery;
 
 #[derive(Clone, Debug)]
 pub struct PostgresDatabase {
@@ -128,7 +128,7 @@ impl PostgresDatabase {
     }
 
     async fn write_log_batch_inner(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         for event in events {
             match event {
                 LogEvent::Started(event) => {
@@ -148,7 +148,7 @@ impl PostgresDatabase {
                     .bind(to_epoch_micros(event.start_time()))
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|error| map_write_error(error, LABEL))?;
+                    .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
                 }
                 LogEvent::Completed(event) => {
                     sqlx::query(
@@ -162,11 +162,11 @@ impl PostgresDatabase {
                     .bind(event.request_id().as_str())
                     .execute(&mut *transaction)
                     .await
-                    .map_err(map_storage_error)?;
+                    .map_err(map_write_storage_error)?;
                 }
             }
         }
-        transaction.commit().await.map_err(map_storage_error)
+        transaction.commit().await.map_err(map_transaction_error)
     }
 }
 
@@ -211,7 +211,7 @@ impl ProviderRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(ProviderRow::into_provider)
         .transpose()
     }
@@ -235,7 +235,7 @@ impl ProviderRepository for PostgresDatabase {
             .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         let has_more = rows.len() > request.limit();
         rows.truncate(request.limit());
         let items = rows
@@ -281,7 +281,7 @@ impl ProviderRepository for PostgresDatabase {
             .fetch_one(&self.shared),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .into_provider()
     }
 
@@ -373,7 +373,7 @@ impl ProviderRepository for PostgresDatabase {
                 .fetch_optional(&self.shared),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .ok_or(RepositoryError::NotFound)?
         .into_provider()
     }
@@ -390,7 +390,7 @@ impl ProviderRepository for PostgresDatabase {
             if is_provider_reference_violation(&error) {
                 RepositoryError::ProviderInUse
             } else {
-                map_storage_error(error)
+                map_write_storage_error(error)
             }
         })?;
         if result.rows_affected() == 0 {
@@ -426,7 +426,7 @@ impl ProviderRepository for PostgresDatabase {
                 .execute(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_write_storage_error)?;
         if result.rows_affected() == 0 {
             // Either the provider is gone or its state moved under this caller.
             // Either way the expectation no longer holds, and reporting the
@@ -461,7 +461,7 @@ impl RequestLogRepository for PostgresDatabase {
             .execute(&self.shared),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?;
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
         Ok(())
     }
 
@@ -480,7 +480,7 @@ impl RequestLogRepository for PostgresDatabase {
             .execute(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_write_storage_error)?;
         Ok(())
     }
 
@@ -529,7 +529,7 @@ impl RequestLogRepository for PostgresDatabase {
                 .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         let has_more = rows.len() > query.limit();
         rows.truncate(query.limit());
         let items = rows
@@ -552,7 +552,7 @@ impl AccountRepository for PostgresDatabase {
             .fetch_optional(&self.auth),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(AccountRow::into_account)
         .transpose()
     }
@@ -569,7 +569,7 @@ impl AccountRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(AccountRow::into_account)
         .transpose()
     }
@@ -586,7 +586,7 @@ impl AccountRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(AccountRow::into_account)
         .transpose()
     }
@@ -609,7 +609,7 @@ impl AccountRepository for PostgresDatabase {
             .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         let has_more = rows.len() > request.limit();
         rows.truncate(request.limit());
         let items = rows
@@ -628,7 +628,7 @@ impl AccountRepository for PostgresDatabase {
     /// keeps working across the upgrade. The staging table is cleared in the
     /// same transaction, so the conversion happens exactly once.
     async fn create(&self, account: NewAccount) -> Result<Account, RepositoryError> {
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, AccountRow>(
@@ -645,13 +645,13 @@ impl AccountRepository for PostgresDatabase {
             .fetch_one(&mut *transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .into_account()?;
 
         if account.is_bootstrap() {
             adopt_legacy_keys(&mut transaction, created.id()).await?;
         }
-        transaction.commit().await.map_err(map_storage_error)?;
+        transaction.commit().await.map_err(map_transaction_error)?;
         Ok(created)
     }
 
@@ -696,7 +696,7 @@ impl AccountRepository for PostgresDatabase {
                 .fetch_optional(&self.shared),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .ok_or(RepositoryError::NotFound)?
         .into_account()
     }
@@ -713,7 +713,7 @@ impl AccountRepository for PostgresDatabase {
             if is_foreign_key_violation(&error) {
                 RepositoryError::InUse
             } else {
-                map_storage_error(error)
+                map_write_storage_error(error)
             }
         })?;
         if result.rows_affected() == 0 {
@@ -729,7 +729,7 @@ impl AccountRepository for PostgresDatabase {
             sqlx::query_scalar("SELECT COUNT(*) FROM ts_account").fetch_one(&self.shared),
         )
         .await
-        .map_err(map_storage_error)
+        .map_err(map_read_error)
     }
 }
 
@@ -751,7 +751,7 @@ impl ApiKeyRepository for PostgresDatabase {
             .fetch_optional(&self.auth),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(ApiKeyRow::into_api_key)
         .transpose()?;
         let Some(api_key) = row else {
@@ -778,7 +778,7 @@ impl ApiKeyRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(ApiKeyRow::into_api_key)
         .transpose()?;
         let Some(api_key) = row else {
@@ -815,7 +815,7 @@ impl ApiKeyRepository for PostgresDatabase {
                 .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         let has_more = rows.len() > request.limit();
         rows.truncate(request.limit());
         let mut items = Vec::with_capacity(rows.len());
@@ -828,7 +828,7 @@ impl ApiKeyRepository for PostgresDatabase {
     }
 
     async fn create(&self, api_key: NewApiKey) -> Result<ApiKeyWithBindings, RepositoryError> {
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ApiKeyRow>(
@@ -860,10 +860,10 @@ impl ApiKeyRepository for PostgresDatabase {
             .fetch_one(&mut *transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .into_api_key()?;
         write_bindings(&mut transaction, created.id(), api_key.provider_ids()).await?;
-        transaction.commit().await.map_err(map_storage_error)?;
+        transaction.commit().await.map_err(map_transaction_error)?;
         let bindings = self.bindings_for(created.id()).await?;
         Ok(ApiKeyWithBindings::new(created, bindings))
     }
@@ -880,7 +880,7 @@ impl ApiKeyRepository for PostgresDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         if let Some(provider_ids) = update.provider_ids() {
             timed(
                 self.admin_timeout,
@@ -889,7 +889,7 @@ impl ApiKeyRepository for PostgresDatabase {
                     .execute(&mut *transaction),
             )
             .await
-            .map_err(|error| map_write_error(error, LABEL))?;
+            .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
             write_bindings(&mut transaction, id, provider_ids).await?;
         }
         let mut builder = QueryBuilder::<Postgres>::new("UPDATE ts_api_key SET ");
@@ -944,10 +944,10 @@ impl ApiKeyRepository for PostgresDatabase {
                 .fetch_optional(&mut *transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .ok_or(RepositoryError::NotFound)?
         .into_api_key()?;
-        transaction.commit().await.map_err(map_storage_error)?;
+        transaction.commit().await.map_err(map_transaction_error)?;
         let bindings = self.bindings_for(id).await?;
         Ok(ApiKeyWithBindings::new(updated, bindings))
     }
@@ -975,7 +975,7 @@ impl ApiKeyRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .ok_or(RepositoryError::NotFound)?
         .into_api_key()?;
         let bindings = self.bindings_for(id).await?;
@@ -994,7 +994,7 @@ impl ApiKeyRepository for PostgresDatabase {
             if is_foreign_key_violation(&error) {
                 RepositoryError::InUse
             } else {
-                map_storage_error(error)
+                map_write_storage_error(error)
             }
         })?;
         if result.rows_affected() == 0 {
@@ -1019,7 +1019,7 @@ impl ModelAliasRepository for PostgresDatabase {
             .fetch_optional(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?
+        .map_err(map_read_error)?
         .map(ModelAliasRow::into_alias)
         .transpose()?;
         let Some(alias) = alias else {
@@ -1055,7 +1055,7 @@ impl ModelAliasRepository for PostgresDatabase {
                 .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         let has_more = rows.len() > request.limit();
         rows.truncate(request.limit());
         let mut items = Vec::with_capacity(rows.len());
@@ -1071,7 +1071,7 @@ impl ModelAliasRepository for PostgresDatabase {
         &self,
         alias: NewModelAlias,
     ) -> Result<ModelAliasWithTargets, RepositoryError> {
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ModelAliasRow>(
@@ -1085,7 +1085,7 @@ impl ModelAliasRepository for PostgresDatabase {
             .fetch_one(&mut *transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?
         .into_alias()?;
         let targets = write_model_alias_targets(
             &mut transaction,
@@ -1094,7 +1094,7 @@ impl ModelAliasRepository for PostgresDatabase {
             self.admin_timeout,
         )
         .await?;
-        transaction.commit().await.map_err(map_storage_error)?;
+        transaction.commit().await.map_err(map_transaction_error)?;
         Ok(ModelAliasWithTargets::new(created, targets))
     }
 
@@ -1106,7 +1106,7 @@ impl ModelAliasRepository for PostgresDatabase {
         if update.is_empty() {
             return Err(RepositoryError::NoFieldsToUpdate);
         }
-        let mut transaction = self.shared.begin().await.map_err(map_storage_error)?;
+        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         let updated = match update.name() {
             Some(name) => timed(
                 self.admin_timeout,
@@ -1119,7 +1119,7 @@ impl ModelAliasRepository for PostgresDatabase {
                 .fetch_optional(&mut *transaction),
             )
             .await
-            .map_err(|error| map_write_error(error, LABEL))?,
+            .map_err(|error| map_write_error(error, WRITE_OPERATION))?,
             None => timed(
                 self.admin_timeout,
                 sqlx::query_as::<_, ModelAliasRow>(
@@ -1129,7 +1129,7 @@ impl ModelAliasRepository for PostgresDatabase {
                 .fetch_optional(&mut *transaction),
             )
             .await
-            .map_err(map_storage_error)?,
+            .map_err(map_read_error)?,
         }
         .ok_or(RepositoryError::NotFound)?
         .into_alias()?;
@@ -1141,7 +1141,7 @@ impl ModelAliasRepository for PostgresDatabase {
                     .execute(&mut *transaction),
             )
             .await
-            .map_err(map_storage_error)?;
+            .map_err(map_write_storage_error)?;
             write_model_alias_targets(&mut transaction, id, targets, self.admin_timeout).await?
         } else {
             let rows = timed(
@@ -1154,12 +1154,12 @@ impl ModelAliasRepository for PostgresDatabase {
                 .fetch_all(&mut *transaction),
             )
             .await
-            .map_err(map_storage_error)?;
+            .map_err(map_read_error)?;
             rows.into_iter()
                 .map(ModelAliasTargetRow::into_target)
                 .collect::<Result<Vec<_>, _>>()?
         };
-        transaction.commit().await.map_err(map_storage_error)?;
+        transaction.commit().await.map_err(map_transaction_error)?;
         Ok(ModelAliasWithTargets::new(updated, targets))
     }
 
@@ -1171,7 +1171,7 @@ impl ModelAliasRepository for PostgresDatabase {
                 .execute(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_write_storage_error)?;
         if result.rows_affected() == 0 {
             Err(RepositoryError::NotFound)
         } else {
@@ -1195,7 +1195,7 @@ impl PostgresDatabase {
             .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         rows.into_iter()
             .map(ModelAliasTargetRow::into_target)
             .collect()
@@ -1224,7 +1224,7 @@ async fn write_model_alias_targets(
             .execute(&mut **transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?;
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
         stored.push(ModelAliasTarget::new(
             *provider_id,
             upstream_model.clone(),
@@ -1249,7 +1249,7 @@ impl PostgresDatabase {
             .fetch_all(&self.shared),
         )
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
         rows.into_iter()
             .map(ApiKeyBindingRow::into_binding)
             .collect()
@@ -1279,7 +1279,7 @@ async fn write_bindings(
             .execute(&mut **transaction),
         )
         .await
-        .map_err(|error| map_write_error(error, LABEL))?;
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
     }
     Ok(())
 }
@@ -1297,7 +1297,7 @@ async fn adopt_legacy_keys(
     let staged = sqlx::query("SELECT provider_id, key_id, secret_hash FROM ts_legacy_gateway_key")
         .fetch_all(&mut **transaction)
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_read_error)?;
     for row in staged {
         let provider_id: i64 = row.get("provider_id");
         let key_id: String = row.get("key_id");
@@ -1318,7 +1318,7 @@ async fn adopt_legacy_keys(
         .bind(to_epoch_micros(chrono::Utc::now()))
         .fetch_one(&mut **transaction)
         .await
-        .map_err(|error| map_write_error(error, LABEL))?;
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
         let api_key_id: i64 = created.get("id");
         sqlx::query(
             "INSERT INTO ts_api_key_provider (api_key_id, provider_id, position)
@@ -1328,16 +1328,19 @@ async fn adopt_legacy_keys(
         .bind(provider_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|error| map_write_error(error, LABEL))?;
+        .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
     }
     sqlx::query("DELETE FROM ts_legacy_gateway_key")
         .execute(&mut **transaction)
         .await
-        .map_err(map_storage_error)?;
+        .map_err(map_write_storage_error)?;
     Ok(())
 }
 
-fn map_write_error(error: sqlx::Error, label: &str) -> RepositoryError {
+fn map_write_error(
+    error: sqlx::Error,
+    operation: crate::diagnostics::RepositoryOperation,
+) -> RepositoryError {
     if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else if error
@@ -1348,14 +1351,11 @@ fn map_write_error(error: sqlx::Error, label: &str) -> RepositoryError {
     } else if is_foreign_key_violation(&error) {
         RepositoryError::NotFound
     } else {
-        // A generic failure would send an operator to the wrong place: the
-        // database's own message names the constraint or the column that
-        // rejected the write, so it is reported rather than discarded.
-        if let Some(database_error) = error.as_database_error() {
-            eprintln!("{label} write failed: {database_error}");
-        } else {
-            eprintln!("{label} write failed: {error}");
-        }
+        crate::diagnostics::repository_operation_failed(
+            crate::diagnostics::RepositoryBackend::Postgresql,
+            operation,
+            diagnostic_error_kind(&error),
+        );
         RepositoryError::Storage
     }
 }
@@ -1376,16 +1376,32 @@ fn is_provider_reference_violation(error: &sqlx::Error) -> bool {
             == Some("23001")
 }
 
-fn map_storage_error(error: sqlx::Error) -> RepositoryError {
+fn map_storage_error(
+    error: sqlx::Error,
+    operation: crate::diagnostics::RepositoryOperation,
+) -> RepositoryError {
     if is_timeout_error(&error) {
         RepositoryError::Timeout
     } else {
-        // A read that fails without a classified code would otherwise become a
-        // silent 500. The database's own message names the table, column, or
-        // constraint, so it is reported rather than discarded.
-        eprintln!("{LABEL} storage operation failed: {error}");
+        crate::diagnostics::repository_operation_failed(
+            crate::diagnostics::RepositoryBackend::Postgresql,
+            operation,
+            diagnostic_error_kind(&error),
+        );
         RepositoryError::Storage
     }
+}
+
+fn map_read_error(error: sqlx::Error) -> RepositoryError {
+    map_storage_error(error, crate::diagnostics::RepositoryOperation::ReadQuery)
+}
+
+fn map_write_storage_error(error: sqlx::Error) -> RepositoryError {
+    map_storage_error(error, crate::diagnostics::RepositoryOperation::WriteQuery)
+}
+
+fn map_transaction_error(error: sqlx::Error) -> RepositoryError {
+    map_storage_error(error, crate::diagnostics::RepositoryOperation::Transaction)
 }
 
 fn is_timeout_error(error: &sqlx::Error) -> bool {
@@ -1395,4 +1411,36 @@ fn is_timeout_error(error: &sqlx::Error) -> bool {
             .and_then(sqlx::error::DatabaseError::code)
             .as_deref()
             == Some("57014")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_storage_errors_keep_their_call_boundary_operation_without_rendering_text() {
+        let secret = "postgres://user:password@host/db?payload=postgres";
+        for (mapper, operation) in [
+            (
+                map_read_error as fn(sqlx::Error) -> RepositoryError,
+                "read_query",
+            ),
+            (map_write_storage_error, "write_query"),
+            (map_transaction_error, "transaction"),
+        ] {
+            let output = crate::diagnostics::capture_for_test(|| {
+                assert_eq!(
+                    mapper(sqlx::Error::Protocol(secret.to_owned())),
+                    RepositoryError::Storage
+                );
+            });
+            let event: serde_json::Value =
+                serde_json::from_str(output.trim()).expect("repository diagnostic");
+            assert_eq!(event["fields"]["event"], "repository_operation_failed");
+            assert_eq!(event["fields"]["backend"], "postgresql");
+            assert_eq!(event["fields"]["operation"], operation);
+            assert_eq!(event["fields"]["error_kind"], "protocol");
+            assert!(!output.contains(secret));
+        }
+    }
 }

@@ -2364,11 +2364,14 @@ fn invalid_input(message: &'static str) -> Response<ApiBody> {
     api_error(StatusCode::BAD_REQUEST, "invalid_request", message)
 }
 
-fn internal_error(source: impl std::fmt::Display) -> Response<ApiBody> {
-    // The caller receives a generic envelope so a storage message, path, or
-    // query never leaves the process. The cause is written to the process
-    // standard error stream, which is the operator console.
-    eprintln!("Tokenstream administration request failed: {source}");
+fn internal_error(_source: impl std::fmt::Display) -> Response<ApiBody> {
+    tracing::error!(
+        target: "tokenstream::admin",
+        event = "administration_request_failed",
+        message = "An administration request failed internally.",
+        operation = "request",
+        error_kind = "internal",
+    );
     api_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "internal_error",
@@ -2395,4 +2398,24 @@ fn method_not_allowed() -> Response<ApiBody> {
         "method_not_allowed",
         "Method not allowed.",
     )
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn internal_error_does_not_render_hostile_source() {
+        let secret = "Authorization: Bearer admin-secret?payload=admin";
+        let output = crate::diagnostics::capture_for_test(|| {
+            let response = internal_error(secret);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        });
+        let event: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("administration diagnostic");
+        assert_eq!(event["fields"]["event"], "administration_request_failed");
+        assert_eq!(event["fields"]["operation"], "request");
+        assert_eq!(event["fields"]["error_kind"], "internal");
+        assert!(!output.contains(secret));
+    }
 }

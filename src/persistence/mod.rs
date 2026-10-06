@@ -1220,6 +1220,27 @@ pub enum RepositoryError {
     Timeout,
 }
 
+pub(crate) fn diagnostic_error_kind(
+    error: &sqlx::Error,
+) -> crate::diagnostics::RepositoryErrorKind {
+    use crate::diagnostics::RepositoryErrorKind;
+
+    match error {
+        sqlx::Error::Database(_) => RepositoryErrorKind::Database,
+        sqlx::Error::Protocol(_) => RepositoryErrorKind::Protocol,
+        sqlx::Error::Io(_) => RepositoryErrorKind::Io,
+        sqlx::Error::Tls(_) => RepositoryErrorKind::Tls,
+        sqlx::Error::ColumnDecode { .. }
+        | sqlx::Error::Decode(_)
+        | sqlx::Error::ColumnIndexOutOfBounds { .. }
+        | sqlx::Error::ColumnNotFound(_)
+        | sqlx::Error::TypeNotFound { .. } => RepositoryErrorKind::Decode,
+        sqlx::Error::PoolClosed => RepositoryErrorKind::PoolClosed,
+        sqlx::Error::WorkerCrashed => RepositoryErrorKind::WorkerCrashed,
+        _ => RepositoryErrorKind::Unknown,
+    }
+}
+
 impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
@@ -1675,8 +1696,8 @@ struct ProviderRow {
     probe_interval_ms: Option<i64>,
     probe_timeout_ms: Option<i64>,
     probe_failure_threshold: Option<i64>,
-    max_concurrent_requests: Option<i64>,
-    max_requests_per_second: Option<i64>,
+    max_concurrent_requests: Option<i32>,
+    max_requests_per_second: Option<i32>,
     created_at: i64,
 }
 
@@ -1812,11 +1833,12 @@ pub(crate) fn parse_health(value: &str) -> Result<ProviderHealthState, Repositor
 /// Storage refuses a zero bound on both engines, so a stored zero would mean the
 /// table was written outside this process; it is rejected as invalid stored data
 /// rather than silently read as unbounded.
-fn admission_bound(value: Option<i64>) -> Result<Option<u32>, RepositoryError> {
+fn admission_bound(value: Option<i32>) -> Result<Option<u32>, RepositoryError> {
     match value {
         None => Ok(None),
         Some(value) => {
-            let bound = u32::try_from(value).map_err(|_| RepositoryError::InvalidStoredData)?;
+            let widened = i64::from(value);
+            let bound = u32::try_from(widened).map_err(|_| RepositoryError::InvalidStoredData)?;
             if bound == 0 || bound > MAX_ADMISSION_BOUND {
                 return Err(RepositoryError::InvalidStoredData);
             }
@@ -1871,9 +1893,9 @@ pub(crate) struct ApiKeyRow {
     pub(crate) status: String,
     pub(crate) default_provider_id: Option<i64>,
     pub(crate) expires_at: Option<i64>,
-    pub(crate) max_concurrent_requests: Option<i64>,
-    pub(crate) max_requests_per_second: Option<i64>,
-    pub(crate) max_websockets: Option<i64>,
+    pub(crate) max_concurrent_requests: Option<i32>,
+    pub(crate) max_requests_per_second: Option<i32>,
+    pub(crate) max_websockets: Option<i32>,
     pub(crate) created_at: i64,
 }
 
@@ -1983,9 +2005,15 @@ struct RequestLogRow {
 
 impl RequestLogRow {
     fn into_request_log(self) -> Result<RequestLog, RepositoryError> {
-        let row_id = self.id;
-        self.try_into_request_log().map_err(|reason| {
-            eprintln!("request log {row_id} has invalid stored data: {reason}");
+        self.try_into_request_log().map_err(|_reason| {
+            tracing::error!(
+                target: "tokenstream::persistence",
+                event = "invalid_request_log_row",
+                message = "A stored request-log row contains invalid data.",
+                backend = crate::diagnostics::RepositoryBackend::Generic.as_str(),
+                operation = crate::diagnostics::RepositoryOperation::DecodeRequestLog.as_str(),
+                error_kind = crate::diagnostics::RepositoryErrorKind::InvalidStoredData.as_str(),
+            );
             RepositoryError::InvalidStoredData
         })
     }
@@ -2092,6 +2120,103 @@ fn status_value(status: ProviderStatus) -> &'static str {
 /// An unbounded dimension is stored as `NULL` rather than as a sentinel large
 /// number, so "no limit" and "a very large limit" are never the same row and a
 /// later read cannot mistake one for the other.
-pub(crate) fn admission_count(bound: AdmissionBound) -> Option<i64> {
-    bound.get().map(i64::from)
+pub(crate) fn admission_count(bound: AdmissionBound) -> Option<i32> {
+    bound.get().map(|value| {
+        i32::try_from(value).expect("the compiled admission maximum fits PostgreSQL INTEGER")
+    })
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    fn assert_next_mapper(source: &str, anchor: &str, mapper: &str) {
+        let suffix = source
+            .rsplit_once(anchor)
+            .unwrap_or_else(|| panic!("missing audited SQL call-site anchor: {anchor}"))
+            .1;
+        let mapping = suffix
+            .split_once(".map_err(")
+            .unwrap_or_else(|| panic!("missing error mapper after: {anchor}"))
+            .1;
+        assert!(
+            mapping.starts_with(mapper),
+            "{anchor} must use {mapper}, found {}",
+            mapping.lines().next().unwrap_or_default()
+        );
+    }
+
+    fn assert_every_transaction_boundary_is_classified(source: &str) {
+        for boundary in ["self.shared.begin().await", "transaction.commit().await"] {
+            let mut remainder = source;
+            let mut count = 0;
+            while let Some((_, suffix)) = remainder.split_once(boundary) {
+                let line = suffix.lines().next().unwrap_or_default();
+                assert!(
+                    line.starts_with(".map_err(map_transaction_error)"),
+                    "{boundary} must use the transaction mapper: {line}"
+                );
+                remainder = suffix;
+                count += 1;
+            }
+            assert!(count > 0, "expected audited {boundary} call sites");
+        }
+    }
+
+    #[test]
+    fn repository_sql_call_sites_keep_read_write_and_transaction_classification() {
+        for (backend, source, alias_placeholder) in [
+            ("sqlite", include_str!("sqlite.rs"), "?"),
+            ("postgresql", include_str!("postgres.rs"), "$1"),
+        ] {
+            assert_next_mapper(
+                source,
+                &format!(
+                    "SELECT id, account_id, name, created_at FROM ts_model_alias WHERE id = {alias_placeholder}"
+                ),
+                "map_read_error",
+            );
+            assert_next_mapper(
+                source,
+                "UPDATE ts_request_log\n                         SET status_code",
+                "map_write_storage_error",
+            );
+            assert_every_transaction_boundary_is_classified(source);
+            assert!(
+                source.contains("fn map_storage_error("),
+                "{backend} must keep the shared closed operation classifier"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_request_log_row_emits_only_closed_context() {
+        let secret = "Bearer row-secret?payload=row";
+        let row = RequestLogRow {
+            id: 1,
+            request_id: secret.to_owned(),
+            account_id: 1,
+            api_key_id: 1,
+            provider_id: 1,
+            protocol_type: "hostile".to_owned(),
+            transport_type: "http".to_owned(),
+            path: secret.to_owned(),
+            status_code: None,
+            start_time: 1,
+            end_time: None,
+            error_msg: None,
+        };
+        let output = crate::diagnostics::capture_for_test(|| {
+            assert!(matches!(
+                row.into_request_log(),
+                Err(RepositoryError::InvalidStoredData)
+            ));
+        });
+        let event: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("invalid-row diagnostic");
+        assert_eq!(event["fields"]["event"], "invalid_request_log_row");
+        assert_eq!(event["fields"]["backend"], "database");
+        assert_eq!(event["fields"]["operation"], "decode_request_log");
+        assert!(!output.contains(secret));
+    }
 }

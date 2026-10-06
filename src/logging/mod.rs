@@ -176,7 +176,12 @@ fn warn_rate_limited() {
     };
     let now = Instant::now();
     if last.is_none_or(|previous| now.duration_since(previous) >= WARNING_INTERVAL) {
-        eprintln!("Tokenstream request-log batch write failed; retry and isolation are bounded");
+        tracing::warn!(
+            target: "tokenstream::logging",
+            event = "request_log_batch_failed",
+            message = "A request-log batch write failed; retry and isolation are bounded.",
+            subscriber = "request_log",
+        );
         *last = Some(now);
     }
 }
@@ -433,4 +438,22 @@ where
     let status = response.status();
     let (parts, body) = response.into_parts();
     Response::from_parts(parts, LoggedBody::new(body, lifecycle, status))
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn request_log_warning_is_structured_and_rate_limited() {
+        let output = crate::diagnostics::capture_for_test(|| {
+            warn_rate_limited();
+            warn_rate_limited();
+        });
+        assert_eq!(output.lines().count(), 1);
+        let event: serde_json::Value =
+            serde_json::from_str(output.trim()).expect("request-log diagnostic");
+        assert_eq!(event["fields"]["event"], "request_log_batch_failed");
+        assert_eq!(event["fields"]["subscriber"], "request_log");
+    }
 }

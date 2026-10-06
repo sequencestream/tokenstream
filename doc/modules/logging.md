@@ -6,6 +6,8 @@ Record transport-layer metadata for proxy work without blocking the request path
 
 ## Design
 
+This module owns persisted request logs only. Process diagnostics are a separate single-line JSON stream on standard error and never enter the lifecycle event bus, its subscriber queues, or the request-log database. Background subscriber and repository warnings use the process diagnostic contract, with stable events and audited categories rather than database messages or arbitrary error text. A non-configurable safety boundary excludes database-driver and other dependency events even when an operator verbosity directive names those targets. This separation does not change the request-log projection, bounded retry, isolation, or drop behavior below.
+
 Logging is best-effort ([ADR 0005](../adr/0005-best-effort-metadata-logging.md)) and is implemented as
 one subscriber on the [event bus](./events.md) ([ADR 0016](../adr/0016-metadata-event-bus.md)). This
 design covers only the durable side: how a dequeued slice of lifecycle events becomes request-log
