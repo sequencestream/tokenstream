@@ -239,7 +239,7 @@ async function createAccount(page, name) {
  * a default change, a bound change, and a cleared bound, and checks that the
  * list shows each one afterwards.
  */
-async function editCredentialInPlace(page, keyName, providerName, label) {
+async function editCredentialInPlace(page, keyName, providerName, label, issuedCredential) {
   const row = page
     .getByRole('row')
     .filter({ has: page.getByRole('cell', { name: keyName, exact: true }) })
@@ -334,7 +334,7 @@ async function editCredentialInPlace(page, keyName, providerName, label) {
   await boundRow.waitFor()
   // Both providers are bound, with the new default marked, in the edited order.
   await boundRow
-    .getByRole('cell', { name: new RegExp(`${providerName}.*browser-ordered-${label} \(default\)`) })
+    .getByRole('cell', { name: new RegExp(`${providerName}.*browser-ordered-${label} \\(default\\)`) })
     .waitFor()
 
   // Cancelling an edit discards the drafts and leaves the credential as stored.
@@ -348,8 +348,10 @@ async function editCredentialInPlace(page, keyName, providerName, label) {
 
   // The page offers no way to see or replace an issued plaintext: the credential
   // is edited in place, and the only one-time secret remains the rotation one.
-  await boundRow.getByRole('cell', { name: /ts_/ }).waitFor()
+  const issuedKeyId = issuedCredential.split('.', 1)[0]
+  await boundRow.getByRole('cell', { name: issuedKeyId, exact: true }).waitFor()
   assert.equal(await boundRow.locator('input[type="password"]').count(), 0)
+  return editedName
 }
 
 async function runSuite(browser, origin, label) {
@@ -449,15 +451,21 @@ async function runSuite(browser, origin, label) {
     assert.equal(await page.locator('.credential-card').count(), 0)
     assert.equal(await page.getByText(createdCredential).count(), 0)
 
-    await editCredentialInPlace(page, keyName, providerName, label)
+    const editedKeyName = await editCredentialInPlace(
+      page,
+      keyName,
+      providerName,
+      label,
+      createdCredential,
+    )
 
     page.once('dialog', (dialog) => dialog.accept())
     await page
       .getByRole('row')
-      .filter({ has: page.getByRole('cell', { name: keyName, exact: true }) })
+      .filter({ has: page.getByRole('cell', { name: editedKeyName, exact: true }) })
       .getByRole('button', { name: 'Rotate credential' })
       .click()
-    await page.getByRole('heading', { name: `New credential for ${keyName}` }).waitFor()
+    await page.getByRole('heading', { name: `New credential for ${editedKeyName}` }).waitFor()
     const rotatedCredential = (await page.locator('.credential-card code').innerText()).trim()
     assert.notEqual(rotatedCredential, createdCredential)
     assert.deepEqual(await storedCredentialTraces(page, rotatedCredential), {
