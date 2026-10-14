@@ -236,6 +236,7 @@ fn discover_module(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_children(
     root: &Path,
     owner_file: &Path,
@@ -501,6 +502,7 @@ fn suspicious_internal_path(segments: &[String], modules: &BTreeSet<String>) -> 
             .any(|module| module == first || module.starts_with(&format!("{first}.")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn inspect_use(
     module: &SourceModule,
     item: &ItemUse,
