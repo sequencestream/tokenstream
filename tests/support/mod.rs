@@ -104,8 +104,17 @@ pub fn provider_id(value: i64) -> ProviderId {
 }
 
 /// A timestamp a test can use as a credential expiration.
+///
+/// Storage keeps instants at microsecond resolution, so this value is already
+/// the instant a round trip will read back.
 pub fn later() -> chrono::DateTime<Utc> {
-    Utc::now() + chrono::Duration::hours(1)
+    stored_instant(Utc::now() + chrono::Duration::hours(1))
+}
+
+/// Drops sub-microsecond precision so an instant matches stored credential time.
+pub fn stored_instant(value: chrono::DateTime<Utc>) -> chrono::DateTime<Utc> {
+    chrono::DateTime::from_timestamp_micros(value.timestamp_micros())
+        .expect("representable instant")
 }
 
 use chrono::{DateTime, Utc};
