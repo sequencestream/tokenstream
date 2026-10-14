@@ -466,12 +466,13 @@ async fn a_credential_over_its_concurrency_bound_is_refused_before_the_upstream(
     .await;
 
     // The two exchanges overlap, so the second finds the first still in flight
-    // and the bound decides rather than the upstream's completion.
+    // and the bound decides rather than the upstream's completion. Waiting for
+    // the upstream starts the hold, which outlasts the second credential check.
     let first = tokio::spawn(post_responses(
         deployment.address,
         deployment.credential.clone(),
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    wait_for_upstream(&deployment.upstream, 1).await;
     let (status, envelope) =
         post_responses(deployment.address, deployment.credential.clone()).await;
 
@@ -547,7 +548,7 @@ async fn a_provider_over_its_concurrency_bound_refuses_its_own_traffic() {
         deployment.address,
         deployment.credential.clone(),
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    wait_for_upstream(&deployment.upstream, 1).await;
     let (second, envelope) =
         post_responses(deployment.address, deployment.credential.clone()).await;
     assert_eq!(second, StatusCode::SERVICE_UNAVAILABLE);
