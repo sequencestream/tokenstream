@@ -3,39 +3,24 @@
 //! This module owns the durable side only: how a dequeued slice of lifecycle
 //! events becomes request-log rows. The bus, the emit path, the queue bounds,
 //! the bounded retry, and the isolation of an unwritable event live in
-//! [`crate::events`]. The emit discipline this writer inherits is
-//! ADR 0005; the fan-out it sits on is ADR 0016.
+//! [`crate::events`].
 //!
 //! Events contain transport metadata only. A payload is never stored.
 
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
-use hyper::body::{Body, Frame, SizeHint};
-use hyper::{Response, StatusCode};
-
-use crate::domain::{ProviderSnapshot, RequestId};
 use crate::events::{
-    Admitted, BusBuilder, EventBus, Finished, LifecycleEvent, Subscriber, SubscriberOutcome,
-    SubscriberReadiness, SubscriberStore, UpstreamObserved,
+    BusBuilder, EventBus, LifecycleEvent, Subscriber, SubscriberOutcome, SubscriberReadiness,
+    SubscriberStore,
 };
 use crate::persistence::{Database, RepositoryError, RequestLogCompleted, RequestLogStarted};
-use crate::routing::ResolvedRoute;
-use crate::telemetry::{
-    ActiveRequestGuard, ExchangeOutcome, Metrics, ProxyFailureCategory, SubscriberName,
-};
+use crate::telemetry::{Metrics, SubscriberName};
 
 const WARNING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One metadata-only lifecycle event as the storage layer sees it.
-#[derive(Clone, Debug)]
-pub enum LogEvent {
-    Started(RequestLogStarted),
-    Completed(RequestLogCompleted),
-}
+pub use crate::persistence::RequestLogWrite as LogEvent;
 
 /// Storage boundary used only by the background worker.
 pub trait LogStore: Send + Sync + 'static {
@@ -209,235 +194,6 @@ where
     pub fn dropped_events(&self) -> u64 {
         self.subscriber.dropped_events()
     }
-}
-
-/// One request or connection lifecycle whose completion is emitted at most once.
-pub struct RequestLogLifecycle {
-    bus: EventBus,
-    metrics: Metrics,
-    request_id: Option<RequestId>,
-    transport: Option<crate::domain::TransportType>,
-    started: Instant,
-    active: Option<ActiveRequestGuard>,
-}
-
-impl RequestLogLifecycle {
-    pub fn start(
-        bus: EventBus,
-        metrics: Metrics,
-        request_id: RequestId,
-        snapshot: &ProviderSnapshot,
-        route: &ResolvedRoute,
-    ) -> Self {
-        let transport = route.transport();
-        // The admitted point is emitted here, after every admission layer has
-        // granted, so a rejected request never produces one.
-        let _ = bus.emit(LifecycleEvent::Admitted(Admitted {
-            request_id: request_id.clone(),
-            account_id: snapshot.account_id(),
-            api_key_id: snapshot.api_key_id(),
-            provider_id: snapshot.id(),
-            protocol_type: snapshot.protocol_type(),
-            transport_type: transport,
-            path: route.path().to_owned(),
-            observed_at: Utc::now(),
-        }));
-        Self {
-            bus,
-            metrics,
-            request_id: Some(request_id),
-            transport: Some(transport),
-            started: Instant::now(),
-            active: None,
-        }
-    }
-
-    pub fn observe_http(mut self) -> Self {
-        self.active = Some(self.metrics.start_http());
-        self
-    }
-
-    pub fn observe_websocket(mut self) -> Self {
-        self.active = Some(self.metrics.start_websocket());
-        self
-    }
-
-    /// Emits the upstream-observed point, which is the moment an upstream
-    /// status or a handshake outcome arrived.
-    pub fn observe_upstream(&mut self, status: Option<StatusCode>) {
-        let Some(request_id) = self.request_id.clone() else {
-            return;
-        };
-        let _ = self
-            .bus
-            .emit(LifecycleEvent::UpstreamObserved(UpstreamObserved {
-                request_id,
-                status_code: status.map(|status| status.as_u16()),
-                observed_at: Utc::now(),
-            }));
-    }
-
-    /// Emits the finished point, at most once for this lifecycle.
-    ///
-    /// The elapsed time is measured from admission, so it covers the whole
-    /// exchange including the streamed body rather than only the headers.
-    pub fn complete(&mut self, status: Option<StatusCode>, error: Option<&'static str>) {
-        let (Some(request_id), Some(transport)) = (self.request_id.take(), self.transport.take())
-        else {
-            return;
-        };
-        let outcome = error.and_then(failure_category);
-        let elapsed = self.started.elapsed();
-        let _ = self.bus.emit(LifecycleEvent::Finished(Finished {
-            request_id,
-            status_code: status.map(|status| status.as_u16()),
-            transport_type: transport,
-            outcome,
-            elapsed,
-            finished_at: Utc::now(),
-        }));
-        // The operational result is recorded here, at the same point and from
-        // the same member that the terminal event carries, so a metric and a
-        // request record cannot drift apart. An exchange with no upstream
-        // response and no gateway-originated failure is a success: nothing went
-        // wrong, and the status is not a label this process may read.
-        let recorded = match outcome {
-            Some(category) => {
-                self.metrics.record_failure(category);
-                ExchangeOutcome::failure(transport, category)
-            }
-            None => ExchangeOutcome::success(transport),
-        };
-        self.metrics.record_exchange(recorded, elapsed);
-        self.active.take();
-    }
-}
-
-fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
-    Some(match error {
-        "invalid_gateway_credential" => ProxyFailureCategory::InvalidGatewayCredential,
-        "provider_disabled" => ProxyFailureCategory::ProviderDisabled,
-        "account_disabled" => ProxyFailureCategory::AccountDisabled,
-        "key_expired" => ProxyFailureCategory::KeyExpired,
-        "no_provider_selected" => ProxyFailureCategory::NoProviderSelected,
-        "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
-        "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
-        "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,
-        "upstream_timeout" | "idle_timeout" => ProxyFailureCategory::UpstreamTimeout,
-        "connection_limit_reached" => ProxyFailureCategory::ConnectionLimitReached,
-        "resource_exhausted" => ProxyFailureCategory::ResourceExhausted,
-        "internal_error" => ProxyFailureCategory::InternalError,
-        "stream_failed" => ProxyFailureCategory::StreamFailed,
-        "downstream_cancelled" => ProxyFailureCategory::DownstreamCancelled,
-        "message_too_large" => ProxyFailureCategory::MessageTooLarge,
-        "relay_failed" => ProxyFailureCategory::RelayFailed,
-        _ => return None,
-    })
-}
-
-/// Response-body observer that completes an HTTP lifecycle on EOF, failure, or cancellation.
-pub struct LoggedBody<B> {
-    inner: Option<B>,
-    lifecycle: RequestLogLifecycle,
-    status: StatusCode,
-    finished: bool,
-}
-
-impl<B> LoggedBody<B>
-where
-    B: Body,
-{
-    pub fn new(inner: B, lifecycle: RequestLogLifecycle, status: StatusCode) -> Self {
-        let finished = inner.is_end_stream();
-        let mut body = Self {
-            inner: Some(inner),
-            lifecycle,
-            status,
-            finished: false,
-        };
-        if finished {
-            body.finish(None);
-        }
-        body
-    }
-
-    fn finish(&mut self, error: Option<&'static str>) {
-        if !self.finished {
-            self.finished = true;
-            drop(self.inner.take());
-            self.lifecycle.complete(Some(self.status), error);
-        }
-    }
-}
-
-impl<B> Body for LoggedBody<B>
-where
-    B: Body + Unpin,
-{
-    type Data = B::Data;
-    type Error = B::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let Some(inner) = this.inner.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match Pin::new(inner).poll_frame(context) {
-            Poll::Ready(None) => {
-                this.finish(None);
-                Poll::Ready(None)
-            }
-            Poll::Ready(Some(Err(error))) => {
-                this.finish(Some("stream_failed"));
-                Poll::Ready(Some(Err(error)))
-            }
-            Poll::Ready(Some(Ok(frame))) => {
-                if this.inner.as_ref().is_some_and(Body::is_end_stream) {
-                    this.finish(None);
-                }
-                Poll::Ready(Some(Ok(frame)))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.finished || self.inner.as_ref().is_none_or(Body::is_end_stream)
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.as_ref().map(Body::size_hint).unwrap_or_else(|| {
-            let mut hint = SizeHint::new();
-            hint.set_exact(0);
-            hint
-        })
-    }
-}
-
-impl<B> Drop for LoggedBody<B> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            drop(self.inner.take());
-            self.lifecycle
-                .complete(Some(self.status), Some("downstream_cancelled"));
-        }
-    }
-}
-
-pub fn observe_response<B>(
-    response: Response<B>,
-    lifecycle: RequestLogLifecycle,
-) -> Response<LoggedBody<B>>
-where
-    B: Body,
-{
-    let status = response.status();
-    let (parts, body) = response.into_parts();
-    Response::from_parts(parts, LoggedBody::new(body, lifecycle, status))
 }
 
 #[cfg(test)]

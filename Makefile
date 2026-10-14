@@ -1,6 +1,6 @@
 # Developer shortcuts. Run `make` or `make help` to list targets.
 
-.PHONY: help lint fmt fmt-check clippy \
+.PHONY: help lint fmt fmt-check clippy arch-check \
   web-deps web-check web-test web-build \
   test test-unit test-web test-compat \
   build package gate ci run clean
@@ -13,6 +13,7 @@ help:
 	@echo "  fmt          Apply rustfmt"
 	@echo "  fmt-check    rustfmt --check"
 	@echo "  clippy       Clippy with warnings denied"
+	@echo "  arch-check   Production Rust module boundary checks"
 	@echo "  web-check    Administration page typecheck"
 	@echo ""
 	@echo "Test"
@@ -41,6 +42,9 @@ fmt-check:
 
 clippy:
 	cargo clippy --locked --all-targets -- -D warnings
+
+arch-check:
+	cargo test --locked --test architecture -- --ignored
 
 web-deps:
 	npm --prefix web ci
@@ -81,6 +85,7 @@ ci:
 	npm --prefix web run build
 	cargo fmt --check
 	cargo clippy --locked --all-targets -- -D warnings
+	$(MAKE) arch-check
 	cargo test --locked
 
 gate:

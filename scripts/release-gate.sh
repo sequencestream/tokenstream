@@ -38,6 +38,7 @@ export TOKENSTREAM_SKIP_FRONTEND_BUILD=1
 stage "format and static analysis"
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
+make arch-check
 
 if [ -z "${TOKENSTREAM_TEST_POSTGRES_URL:-}" ]; then
   stage "ephemeral PostgreSQL"

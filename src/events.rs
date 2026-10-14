@@ -12,14 +12,23 @@
 //! serialization format: there is no wire form to leak.
 
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use hyper::body::{Body, Frame, SizeHint};
+use hyper::{Response, StatusCode};
 use tokio::sync::mpsc;
 
-use crate::domain::{AccountId, ApiKeyId, ProtocolType, ProviderId, RequestId, TransportType};
-use crate::telemetry::{Metrics, ProxyFailureCategory, SubscriberCounters};
+use crate::domain::{
+    AccountId, ApiKeyId, ProtocolType, ProviderId, ProviderSnapshot, RequestId, TransportType,
+};
+use crate::routing::ResolvedRoute;
+use crate::telemetry::{
+    ActiveRequestGuard, ExchangeOutcome, Metrics, ProxyFailureCategory, SubscriberCounters,
+};
 
 const MAX_CONSUME_ATTEMPTS: usize = 3;
 const CONSUME_RETRY_DELAY: Duration = Duration::from_millis(10);
@@ -94,6 +103,224 @@ pub struct Finished {
     pub outcome: Option<ProxyFailureCategory>,
     pub elapsed: Duration,
     pub finished_at: DateTime<Utc>,
+}
+
+/// One request or connection lifecycle whose completion is emitted at most once.
+pub struct RequestLifecycle {
+    bus: EventBus,
+    metrics: Metrics,
+    request_id: Option<RequestId>,
+    transport: Option<TransportType>,
+    started: std::time::Instant,
+    active: Option<ActiveRequestGuard>,
+}
+
+impl RequestLifecycle {
+    pub fn start(
+        bus: EventBus,
+        metrics: Metrics,
+        request_id: RequestId,
+        snapshot: &ProviderSnapshot,
+        route: &ResolvedRoute,
+    ) -> Self {
+        let transport = route.transport();
+        let _ = bus.emit(LifecycleEvent::Admitted(Admitted {
+            request_id: request_id.clone(),
+            account_id: snapshot.account_id(),
+            api_key_id: snapshot.api_key_id(),
+            provider_id: snapshot.id(),
+            protocol_type: snapshot.protocol_type(),
+            transport_type: transport,
+            path: route.path().to_owned(),
+            observed_at: Utc::now(),
+        }));
+        Self {
+            bus,
+            metrics,
+            request_id: Some(request_id),
+            transport: Some(transport),
+            started: std::time::Instant::now(),
+            active: None,
+        }
+    }
+
+    pub fn observe_http(mut self) -> Self {
+        self.active = Some(self.metrics.start_http());
+        self
+    }
+
+    pub fn observe_websocket(mut self) -> Self {
+        self.active = Some(self.metrics.start_websocket());
+        self
+    }
+
+    /// Emits the upstream-observed point when a status or handshake outcome arrives.
+    pub fn observe_upstream(&mut self, status: Option<StatusCode>) {
+        let Some(request_id) = self.request_id.clone() else {
+            return;
+        };
+        let _ = self
+            .bus
+            .emit(LifecycleEvent::UpstreamObserved(UpstreamObserved {
+                request_id,
+                status_code: status.map(|status| status.as_u16()),
+                observed_at: Utc::now(),
+            }));
+    }
+
+    /// Emits the finished point at most once and records the matching metric.
+    pub fn complete(&mut self, status: Option<StatusCode>, error: Option<&'static str>) {
+        let (Some(request_id), Some(transport)) = (self.request_id.take(), self.transport.take())
+        else {
+            return;
+        };
+        let outcome = error.and_then(failure_category);
+        let elapsed = self.started.elapsed();
+        let _ = self.bus.emit(LifecycleEvent::Finished(Finished {
+            request_id,
+            status_code: status.map(|status| status.as_u16()),
+            transport_type: transport,
+            outcome,
+            elapsed,
+            finished_at: Utc::now(),
+        }));
+        let recorded = match outcome {
+            Some(category) => {
+                self.metrics.record_failure(category);
+                ExchangeOutcome::failure(transport, category)
+            }
+            None => ExchangeOutcome::success(transport),
+        };
+        self.metrics.record_exchange(recorded, elapsed);
+        self.active.take();
+    }
+}
+
+fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
+    Some(match error {
+        "invalid_gateway_credential" => ProxyFailureCategory::InvalidGatewayCredential,
+        "provider_disabled" => ProxyFailureCategory::ProviderDisabled,
+        "account_disabled" => ProxyFailureCategory::AccountDisabled,
+        "key_expired" => ProxyFailureCategory::KeyExpired,
+        "no_provider_selected" => ProxyFailureCategory::NoProviderSelected,
+        "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
+        "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
+        "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,
+        "upstream_timeout" | "idle_timeout" => ProxyFailureCategory::UpstreamTimeout,
+        "connection_limit_reached" => ProxyFailureCategory::ConnectionLimitReached,
+        "resource_exhausted" => ProxyFailureCategory::ResourceExhausted,
+        "internal_error" => ProxyFailureCategory::InternalError,
+        "stream_failed" => ProxyFailureCategory::StreamFailed,
+        "downstream_cancelled" => ProxyFailureCategory::DownstreamCancelled,
+        "message_too_large" => ProxyFailureCategory::MessageTooLarge,
+        "relay_failed" => ProxyFailureCategory::RelayFailed,
+        _ => return None,
+    })
+}
+
+/// Response-body observer that completes a lifecycle on EOF, failure, or cancellation.
+pub struct ObservedBody<B> {
+    inner: Option<B>,
+    lifecycle: RequestLifecycle,
+    status: StatusCode,
+    finished: bool,
+}
+
+impl<B> ObservedBody<B>
+where
+    B: Body,
+{
+    pub fn new(inner: B, lifecycle: RequestLifecycle, status: StatusCode) -> Self {
+        let finished = inner.is_end_stream();
+        let mut body = Self {
+            inner: Some(inner),
+            lifecycle,
+            status,
+            finished: false,
+        };
+        if finished {
+            body.finish(None);
+        }
+        body
+    }
+
+    fn finish(&mut self, error: Option<&'static str>) {
+        if !self.finished {
+            self.finished = true;
+            drop(self.inner.take());
+            self.lifecycle.complete(Some(self.status), error);
+        }
+    }
+}
+
+impl<B> Body for ObservedBody<B>
+where
+    B: Body + Unpin,
+{
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let Some(inner) = this.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match Pin::new(inner).poll_frame(context) {
+            Poll::Ready(None) => {
+                this.finish(None);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(Err(error))) => {
+                this.finish(Some("stream_failed"));
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) => {
+                if this.inner.as_ref().is_some_and(Body::is_end_stream) {
+                    this.finish(None);
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.finished || self.inner.as_ref().is_none_or(Body::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.as_ref().map(Body::size_hint).unwrap_or_else(|| {
+            let mut hint = SizeHint::new();
+            hint.set_exact(0);
+            hint
+        })
+    }
+}
+
+impl<B> Drop for ObservedBody<B> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            drop(self.inner.take());
+            self.lifecycle
+                .complete(Some(self.status), Some("downstream_cancelled"));
+        }
+    }
+}
+
+pub fn observe_response<B>(
+    response: Response<B>,
+    lifecycle: RequestLifecycle,
+) -> Response<ObservedBody<B>>
+where
+    B: Body,
+{
+    let status = response.status();
+    let (parts, body) = response.into_parts();
+    Response::from_parts(parts, ObservedBody::new(body, lifecycle, status))
 }
 
 pub use crate::telemetry::SubscriberName;

@@ -1045,6 +1045,13 @@ impl RequestLogCompleted {
     }
 }
 
+/// One request-log mutation written as part of a storage batch.
+#[derive(Clone, Debug)]
+pub enum RequestLogWrite {
+    Started(RequestLogStarted),
+    Completed(RequestLogCompleted),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RequestLogQuery {
     after_id: Option<RequestLogCursor>,

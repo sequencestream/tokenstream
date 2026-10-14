@@ -49,8 +49,7 @@ use tower_service::Service;
 
 use crate::config::Config;
 use crate::domain::{ProviderSnapshot, RequestId};
-use crate::events::EventBus;
-use crate::logging::RequestLogLifecycle;
+use crate::events::{EventBus, RequestLifecycle};
 use crate::proxy::admission::ProxyLimits;
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
@@ -321,9 +320,8 @@ impl WebSocketProxy {
         metrics: Metrics,
         request_id: RequestId,
     ) -> Result<Handshake, GatewayError> {
-        let mut lifecycle =
-            RequestLogLifecycle::start(events, metrics, request_id, snapshot, route)
-                .observe_websocket();
+        let mut lifecycle = RequestLifecycle::start(events, metrics, request_id, snapshot, route)
+            .observe_websocket();
         let handshake = match self
             .handshake(snapshot, route, query, downstream_peer, request)
             .await

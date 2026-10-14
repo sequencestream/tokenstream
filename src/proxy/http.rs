@@ -37,8 +37,7 @@ use tokio::time::{Instant, Sleep, timeout};
 
 use crate::config::Config;
 use crate::domain::{ProviderSnapshot, RequestId};
-use crate::events::EventBus;
-use crate::logging::{LoggedBody, RequestLogLifecycle, observe_response};
+use crate::events::{EventBus, ObservedBody, RequestLifecycle, observe_response};
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
@@ -209,9 +208,9 @@ where
         events: EventBus,
         metrics: Metrics,
         request_id: RequestId,
-    ) -> Result<Response<LoggedBody<IdleTimeoutBody<Incoming>>>, GatewayError> {
+    ) -> Result<Response<ObservedBody<IdleTimeoutBody<Incoming>>>, GatewayError> {
         let mut lifecycle =
-            RequestLogLifecycle::start(events, metrics, request_id, snapshot, route).observe_http();
+            RequestLifecycle::start(events, metrics, request_id, snapshot, route).observe_http();
         match self
             .forward(snapshot, route, query, downstream_peer, request)
             .await

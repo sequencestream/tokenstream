@@ -4,14 +4,6 @@ use std::time::Duration;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Executor, PgPool, Postgres, QueryBuilder, Row};
 
-use crate::MigrationRunner;
-use crate::domain::{
-    Account, AccountId, ApiKeyBinding, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, ModelAliasId,
-    ModelAliasTarget, ModelAliasWithTargets, PasswordHash, Provider, ProviderHealthState,
-    ProviderId,
-};
-use crate::logging::LogEvent;
-
 use super::time::to_epoch_micros;
 use super::{
     AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
@@ -20,9 +12,15 @@ use super::{
     ModelAliasRow, ModelAliasTargetRow, ModelAliasUpdate, NewAccount, NewApiKey, NewModelAlias,
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
     ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
-    RequestLogRepository, RequestLogRow, RequestLogStarted, account_status_value, admission_count,
-    api_key_status_value, diagnostic_error_kind, health_name, probe_columns, protocol_value,
-    role_value, status_value, timed, transport_value,
+    RequestLogRepository, RequestLogRow, RequestLogStarted, RequestLogWrite, account_status_value,
+    admission_count, api_key_status_value, diagnostic_error_kind, health_name, probe_columns,
+    protocol_value, role_value, status_value, timed, transport_value,
+};
+use crate::MigrationRunner;
+use crate::domain::{
+    Account, AccountId, ApiKeyBinding, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, ModelAliasId,
+    ModelAliasTarget, ModelAliasWithTargets, PasswordHash, Provider, ProviderHealthState,
+    ProviderId,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
@@ -120,18 +118,24 @@ impl PostgresDatabase {
     }
 
     /// Persists one logger batch atomically so retry never observes a partial batch.
-    pub(crate) async fn write_log_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+    pub(crate) async fn write_log_batch(
+        &self,
+        events: &[RequestLogWrite],
+    ) -> Result<(), RepositoryError> {
         match tokio::time::timeout(self.log_timeout, self.write_log_batch_inner(events)).await {
             Ok(result) => result,
             Err(_) => Err(RepositoryError::Timeout),
         }
     }
 
-    async fn write_log_batch_inner(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+    async fn write_log_batch_inner(
+        &self,
+        events: &[RequestLogWrite],
+    ) -> Result<(), RepositoryError> {
         let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         for event in events {
             match event {
-                LogEvent::Started(event) => {
+                RequestLogWrite::Started(event) => {
                     sqlx::query(
                         "INSERT INTO ts_request_log (
                              request_id, account_id, api_key_id, provider_id, protocol_type,
@@ -150,7 +154,7 @@ impl PostgresDatabase {
                     .await
                     .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
                 }
-                LogEvent::Completed(event) => {
+                RequestLogWrite::Completed(event) => {
                     sqlx::query(
                         "UPDATE ts_request_log
                          SET status_code = $1, end_time = $2, error_msg = $3
@@ -387,7 +391,7 @@ impl ProviderRepository for PostgresDatabase {
         )
         .await
         .map_err(|error| {
-            if is_provider_reference_violation(&error) {
+            if is_reference_violation(&error) {
                 RepositoryError::ProviderInUse
             } else {
                 map_write_storage_error(error)
@@ -710,7 +714,7 @@ impl AccountRepository for PostgresDatabase {
         )
         .await
         .map_err(|error| {
-            if is_foreign_key_violation(&error) {
+            if is_reference_violation(&error) {
                 RepositoryError::InUse
             } else {
                 map_write_storage_error(error)
@@ -991,7 +995,7 @@ impl ApiKeyRepository for PostgresDatabase {
         )
         .await
         .map_err(|error| {
-            if is_foreign_key_violation(&error) {
+            if is_reference_violation(&error) {
                 RepositoryError::InUse
             } else {
                 map_write_storage_error(error)
@@ -1367,13 +1371,18 @@ fn is_foreign_key_violation(error: &sqlx::Error) -> bool {
     })
 }
 
-fn is_provider_reference_violation(error: &sqlx::Error) -> bool {
+fn is_reference_violation(error: &sqlx::Error) -> bool {
     is_foreign_key_violation(error)
-        || error
-            .as_database_error()
-            .and_then(sqlx::error::DatabaseError::code)
-            .as_deref()
-            == Some("23001")
+        || is_reference_violation_code(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+        )
+}
+
+fn is_reference_violation_code(code: Option<&str>) -> bool {
+    matches!(code, Some("23001" | "23503"))
 }
 
 fn map_storage_error(
@@ -1398,6 +1407,19 @@ fn map_read_error(error: sqlx::Error) -> RepositoryError {
 
 fn map_write_storage_error(error: sqlx::Error) -> RepositoryError {
     map_storage_error(error, crate::diagnostics::RepositoryOperation::WriteQuery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_reference_violation_code;
+
+    #[test]
+    fn postgres_restrict_and_foreign_key_codes_are_reference_violations() {
+        assert!(is_reference_violation_code(Some("23001")));
+        assert!(is_reference_violation_code(Some("23503")));
+        assert!(!is_reference_violation_code(Some("23505")));
+        assert!(!is_reference_violation_code(None));
+    }
 }
 
 fn map_transaction_error(error: sqlx::Error) -> RepositoryError {
