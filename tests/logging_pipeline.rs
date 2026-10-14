@@ -53,7 +53,7 @@ impl LogStore for RecordingStore {
         self.attempts.fetch_add(1, Ordering::SeqCst);
         if self
             .failures_remaining
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
                 remaining.checked_sub(1)
             })
             .is_ok()
