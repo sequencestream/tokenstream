@@ -14,8 +14,7 @@ use crate::auth::GatewayAuthenticator;
 use crate::config::Config;
 use crate::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
 use crate::domain::{ProviderSnapshot, RequestId, TransportType};
-use crate::events::EventBus;
-use crate::logging::{RequestLogLifecycle, observe_response};
+use crate::events::{EventBus, RequestLifecycle, observe_response};
 use crate::persistence::Database;
 use crate::proxy::admission::{AdmissionPermit, ProxyLimits};
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
@@ -180,7 +179,7 @@ impl Gateway {
                 None,
             ));
         }
-        let mut lifecycle = RequestLogLifecycle::start(
+        let mut lifecycle = RequestLifecycle::start(
             self.events.clone(),
             self.metrics.clone(),
             id,

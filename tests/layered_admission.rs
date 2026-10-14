@@ -53,9 +53,11 @@ struct CountingUpstream {
 /// How long an upstream holds each response before completing it.
 ///
 /// A concurrency bound is about work in flight, so the upstream has to keep an
-/// exchange open for the bound to mean anything. A short hold would let every
-/// request finish before the next one arrives and the bound would never fire.
-const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
+/// exchange open for the bound to mean anything. The request that arrives after
+/// the upstream has been contacted still has to verify its credential, and that
+/// verification is slow when the runner is busy. The hold has to outlast it, or
+/// the first exchange finishes and the bound never fires.
+const HOLD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long an admitted upstream socket is held open before it is closed.
 ///
@@ -464,12 +466,13 @@ async fn a_credential_over_its_concurrency_bound_is_refused_before_the_upstream(
     .await;
 
     // The two exchanges overlap, so the second finds the first still in flight
-    // and the bound decides rather than the upstream's completion.
+    // and the bound decides rather than the upstream's completion. Waiting for
+    // the upstream starts the hold, which outlasts the second credential check.
     let first = tokio::spawn(post_responses(
         deployment.address,
         deployment.credential.clone(),
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    wait_for_upstream(&deployment.upstream, 1).await;
     let (status, envelope) =
         post_responses(deployment.address, deployment.credential.clone()).await;
 
@@ -545,7 +548,7 @@ async fn a_provider_over_its_concurrency_bound_refuses_its_own_traffic() {
         deployment.address,
         deployment.credential.clone(),
     ));
-    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    wait_for_upstream(&deployment.upstream, 1).await;
     let (second, envelope) =
         post_responses(deployment.address, deployment.credential.clone()).await;
     assert_eq!(second, StatusCode::SERVICE_UNAVAILABLE);
@@ -708,32 +711,34 @@ async fn tightening_bounds_never_terminates_admitted_work_and_spares_the_new_lim
     assert_eq!(deployment.upstream.received.load(Ordering::SeqCst), 3);
 
     // The narrowed connection bound is now in force for work admitted after the
-    // edit. Two connections are attempted at once; one is admitted and the other
-    // is refused, and the refusal happens before the upstream is contacted,
-    // which the unchanged count proves.
-    let (accepted, refused) = tokio::join!(
-        upgrade_responses(deployment.address, deployment.credential.clone()),
-        upgrade_responses(deployment.address, deployment.credential.clone()),
+    // edit. The first socket stays open, so the second attempt meets a credential
+    // that is already at its connection bound, and the refusal happens before
+    // the upstream is contacted.
+    let mut held = TcpStream::connect(deployment.address)
+        .await
+        .expect("connect gateway");
+    held.write_all(upgrade_request(&deployment.credential).as_bytes())
+        .await
+        .expect("send upgrade");
+    let mut head = [0_u8; 1024];
+    let read = held.read(&mut head).await.expect("read upgrade head");
+    assert!(
+        String::from_utf8_lossy(&head[..read]).starts_with("HTTP/1.1 101"),
+        "one connection is admitted under the narrowed bound"
     );
+    let (status, envelope) =
+        upgrade_responses(deployment.address, deployment.credential.clone()).await;
     assert_eq!(
         deployment.upstream.received.load(Ordering::SeqCst),
         4,
         "only the admitted connection reaches the upstream"
     );
-    let statuses = [accepted.0, refused.0];
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{envelope}");
     assert!(
-        statuses.contains(&StatusCode::SWITCHING_PROTOCOLS),
-        "one connection is admitted under the narrowed bound: {statuses:?}"
+        envelope.contains("connection_limit_reached"),
+        "the refusal names the credential bound: {envelope}"
     );
-    let refused_envelope = if refused.0 == StatusCode::SERVICE_UNAVAILABLE {
-        refused.1
-    } else {
-        accepted.1
-    };
-    assert!(
-        refused_envelope.contains("connection_limit_reached"),
-        "the refusal names the credential bound: {refused_envelope}"
-    );
+    drop(held);
 }
 
 /// A narrowed HTTP concurrency bound refuses work that exceeds it, before the

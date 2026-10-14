@@ -21,7 +21,7 @@ use tokenstream::persistence::{
 use url::Url;
 
 mod support;
-use support::{ensure_bootstrap, key_id, unique_value};
+use support::{ensure_bootstrap, key_id, stored_instant, unique_value};
 
 async fn issue_provider<R: ProviderRepository>(
     repository: &R,
@@ -102,7 +102,7 @@ where
     let id = stored.api_key().id();
     assert_eq!(stored_provider_ids(&stored), providers);
 
-    let expires_at = Utc::now() + Duration::hours(6);
+    let expires_at = stored_instant(Utc::now() + Duration::hours(6));
     let admission = CredentialAdmission::new(Some(2), Some(3), Some(4)).expect("positive bounds");
     let updated = ApiKeyRepository::update(
         repository,

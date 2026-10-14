@@ -5,13 +5,6 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::MigrationRunner;
-use crate::domain::{
-    Account, AccountId, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, ModelAliasId, ModelAliasTarget,
-    ModelAliasWithTargets, PasswordHash, Provider, ProviderHealthState, ProviderId,
-};
-use crate::logging::LogEvent;
-
 use super::time::to_epoch_micros;
 use super::{
     AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
@@ -20,9 +13,14 @@ use super::{
     ModelAliasRow, ModelAliasTargetRow, ModelAliasUpdate, NewAccount, NewApiKey, NewModelAlias,
     NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
     ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
-    RequestLogRepository, RequestLogRow, RequestLogStarted, account_status_value, admission_count,
-    api_key_status_value, diagnostic_error_kind, health_name, probe_columns, protocol_value,
-    role_value, status_value, timed, transport_value,
+    RequestLogRepository, RequestLogRow, RequestLogStarted, RequestLogWrite, account_status_value,
+    admission_count, api_key_status_value, diagnostic_error_kind, health_name, probe_columns,
+    protocol_value, role_value, status_value, timed, transport_value,
+};
+use crate::MigrationRunner;
+use crate::domain::{
+    Account, AccountId, ApiKeyId, ApiKeyWithBindings, GatewayKeyId, ModelAliasId, ModelAliasTarget,
+    ModelAliasWithTargets, PasswordHash, Provider, ProviderHealthState, ProviderId,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -120,18 +118,24 @@ impl SqliteDatabase {
     }
 
     /// Persists one logger batch atomically so retry never observes a partial batch.
-    pub(crate) async fn write_log_batch(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+    pub(crate) async fn write_log_batch(
+        &self,
+        events: &[RequestLogWrite],
+    ) -> Result<(), RepositoryError> {
         match tokio::time::timeout(self.log_timeout, self.write_log_batch_inner(events)).await {
             Ok(result) => result,
             Err(_) => Err(RepositoryError::Timeout),
         }
     }
 
-    async fn write_log_batch_inner(&self, events: &[LogEvent]) -> Result<(), RepositoryError> {
+    async fn write_log_batch_inner(
+        &self,
+        events: &[RequestLogWrite],
+    ) -> Result<(), RepositoryError> {
         let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
         for event in events {
             match event {
-                LogEvent::Started(event) => {
+                RequestLogWrite::Started(event) => {
                     sqlx::query(
                         "INSERT INTO ts_request_log (
                              request_id, account_id, api_key_id, provider_id, protocol_type,
@@ -150,7 +154,7 @@ impl SqliteDatabase {
                     .await
                     .map_err(|error| map_write_error(error, WRITE_OPERATION))?;
                 }
-                LogEvent::Completed(event) => {
+                RequestLogWrite::Completed(event) => {
                     sqlx::query(
                         "UPDATE ts_request_log
                          SET status_code = ?, end_time = ?, error_msg = ?

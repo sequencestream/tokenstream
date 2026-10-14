@@ -72,5 +72,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Architecture boundaries
+        run: make arch-check
+
       - name: Test
         run: cargo test --locked

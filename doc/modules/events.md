@@ -44,6 +44,11 @@ point from that same member, so a metric and a request record can never disagree
 ended. The mapping from a member to a coarse classification belongs to the
 [observability design](./observability.md) and is not restated here.
 
+Lifecycle ownership also ends here. The event boundary owns admission, upstream-observation, terminal
+completion, and streamed-response cancellation observation. A consumer receives completed facts and
+cannot provide lifecycle state back to the proxy. This keeps adding, removing, or failing a consumer
+from changing the forwarding dependency graph.
+
 Subscribing happens before either listener binds, and a bus handed to a proxy task is sealed by
 construction: only a builder that is still being composed can add a subscriber. The emit path
 therefore reads a fixed collection of bounded channels and allocates nothing. The bus holds no
@@ -101,6 +106,8 @@ point produces no row of its own.
   finished event unless the process is stopped first.
 - The finished point is emitted at most once for a request, and its elapsed time is measured from
   admission, so it covers the whole exchange and not only its headers.
+- Proxy forwarding depends on lifecycle publication only; it never depends on a subscriber or on a
+  consumer's storage projection.
 
 ## Failures and bounds
 

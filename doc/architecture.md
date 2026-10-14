@@ -411,6 +411,8 @@ Module designs live under [`modules/`](./modules/). Each document is the living 
 
 Key forks among alternatives are recorded as architecture decision records under [`adr/`](./adr/). A new architectural fork gets an ADR before this document changes. A repair that only enforces an existing decision belongs in the relevant module design.
 
+Production modules have a closed, version-controlled classification and mechanically enforced dependency boundaries. A new, moved, or renamed module must be classified explicitly; an unclassified module, a source outside the declared module tree, an ambiguous internal dependency, or a forbidden dependency fails closed. The enforcement protects the component boundaries in this document rather than imposing a universal layer hierarchy: authentication may use persistence to create a snapshot, and composition may construct concrete services, while proxy forwarding remains independent of administration, request-log consumers, persistence implementations, and application-payload parsing. Lifecycle publication belongs to the event boundary; consumers project those facts without becoming dependencies of the proxy.
+
 | Module | Document | Role |
 | --- | --- | --- |
 | Decisions | [`adr/`](./adr/) | Why the current rules were chosen among alternatives |
@@ -439,10 +441,11 @@ Transparency and safety are proven by tests, not assumed:
 - Observability tests demonstrate that a refused request is recorded once as a rejection naming the layer that refused, that a completed exchange is recorded once under its transport and coarse result, that latency percentiles are derivable from bounded buckets over the whole exchange, and that the exposition carries no credential, account, provider, path, or query string and is refused to a regular account.
 - A version-controlled manifest of pinned client and SDK versions, run against a controllable mock upstream, is the release compatibility gate; external live services are never the CI correctness dependency.
 - Administration page reachability, sign-in, session restoration, credential handling, expiry, and sign-out are accepted through real browser interaction; a successful page build is never the release substitute for that interaction.
+- Architecture checks discover the complete production module tree, reject unclassified or orphaned sources and unsupported internal path forms, and enforce the dependency directions above with deterministic diagnostics. They run locally, in continuous integration, and in the release gate.
 
 A change is complete only when these layers pass:
 
-1. **Unit tests:** credential parsing, hash verification, encryption round trips and tamper rejection, URI joining, route matrix, hop-by-hop header removal, redaction, cursor encoding, and state transitions.
+1. **Architecture and unit tests:** production module discovery and dependency boundaries, credential parsing, hash verification, encryption round trips and tamper rejection, URI joining, route matrix, hop-by-hop header removal, redaction, cursor encoding, and state transitions.
 2. **Repository tests:** migrations and identical behavioral tests against SQLite and PostgreSQL, including uniqueness and delete restrictions.
 3. **HTTP contract tests:** byte-preserving request and response streams, unknown JSON fields, arbitrary chunk fragmentation, SSE splits, backpressure, cancellation, upstream errors, query preservation, credential replacement, and layered admission rejection before upstream contact.
 4. **WebSocket contract tests:** successful and rejected handshakes, text/binary/fragmented messages, ping/pong, simultaneous traffic, close codes, abrupt disconnects, message bounds, and close propagation.
