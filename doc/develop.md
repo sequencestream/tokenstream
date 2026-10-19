@@ -1,82 +1,210 @@
 # Development
 
-Requires Rust 1.97 or newer and Node.js 22 or newer. The process exposes independent data-plane and control-plane listeners, each with its own health endpoint and closed-by-default authentication boundary. The control-plane listener also serves the compiled administration page, so the page and its API share one origin and the session cookie and CSRF protection work without exceptions.
+## Prerequisites
 
-Design constraints and public contracts are in the [architecture document](./architecture.md). Module procedures are under [modules](./modules/).
+| Tool | Version / requirement |
+| --- | --- |
+| Rust | 1.97+ |
+| Node.js | 22+ |
+| PostgreSQL | Required for dual-backend tests; the release gate can provision a temporary server using local PostgreSQL tools or Docker |
 
-## Build
-
-Compile a release binary that includes the administration page:
-
-```sh
-make build
-```
-
-The release binary is `target/release/tokenstream`. The administration page is compiled into that binary. `make` lists the other local shortcuts (lint, tests, the CI-equivalent check, and the release gate).
+Run commands from the repository root unless stated otherwise.
 
 ## Local development
 
-Every setting has a compiled default, so the gateway starts with no Tokenstream-specific environment. Listeners bind `127.0.0.1:3300` and `127.0.0.1:3301`. SQLite, the generated master key, and the administrator password hash live under `~/.tokenstream` unless `TOKENSTREAM_DATA_DIR` is set. The default administrator password is `tokenstream`; change it from the administration page after sign-in. Loopback listeners default development mode to on so a plaintext local origin can keep a session cookie.
+1. Start the gateway in terminal 1. No Tokenstream environment variables are required.
 
-Run the gateway and the administration development server in separate terminals:
+   ```sh
+   cargo run --locked
+   ```
+
+2. Start the administration development server in terminal 2.
+
+   ```sh
+   cd web
+   npm ci
+   npm run dev
+   ```
+
+3. Open the page URL printed by the development server. Sign in and change the default password.
+
+   | Item | Default |
+   | --- | --- |
+   | Administrator name | `admin` |
+   | Administrator password | `tokenstream` |
+   | Data plane | `http://127.0.0.1:3300` |
+   | Control plane / compiled administration page | `http://127.0.0.1:3301` |
+   | Data directory | `~/.tokenstream` (SQLite, master key, administrator password hash) |
+
+4. Check both listeners.
+
+   ```sh
+   curl --fail http://127.0.0.1:3300/healthz
+   curl --fail http://127.0.0.1:3301/healthz
+   ```
+
+Stop the gateway with `Ctrl+C`. Both listeners stop accepting connections; active work drains up to the configured timeout.
+
+The development server proxies `/admin/api`, `/healthz`, and `/metrics` to the control plane. To use a different control-plane address, run this from `web`:
 
 ```sh
-cargo run --locked
+TOKENSTREAM_ADMIN_PROXY_TARGET=http://127.0.0.1:4301 npm run dev
 ```
-
-```sh
-cd web && npm ci && npm run dev
-```
-
-The data-plane and control-plane health endpoints are `http://127.0.0.1:3300/healthz` and `http://127.0.0.1:3301/healthz`. The administration development server prints the local address of the page. In development that server serves the page and proxies the administration API, health, and metrics paths to the control plane, so the page issues same-origin requests and needs no separate origin configuration; set `TOKENSTREAM_ADMIN_PROXY_TARGET` when the control plane is not on `http://127.0.0.1:3301`. Environment values override files and defaults. `TOKENSTREAM_DEVELOPMENT_MODE=false` is required when the control plane is not a plaintext loopback origin. Startup migrations finish before either listener binds, and the compiled administration page is confirmed to be present before either listener binds. On shutdown, both listeners stop accepting immediately and active connections drain only up to the configured timeout.
-
-Process diagnostics are single-line JSON on standard error. Each record has `timestamp`, `level`, `target`, and `fields`, and `fields` contains stable `event` and `message` values plus any audited context. `TOKENSTREAM_LOG_FILTER` controls verbosity within the audited Tokenstream diagnostic set with tracing filter-directive syntax; it defaults to `info`, may be set in the operator overlay, is overridden by the environment, and takes effect on restart. Examples are `warn` and `tokenstream::process=debug,tokenstream::persistence=warn`. Dependency and unknown targets remain excluded even if a directive names them. Empty or invalid directives fail startup before either listener binds without echoing the rejected value.
-
-Standard output is reserved for a generated bootstrap password when one is needed and the bootstrap account is created for the first time. That output is one JSON credential record. It does not recur on restart, and neither the documented default password nor an explicitly supplied password is printed. Capture standard output securely on a first production start; standard error remains safe for ordinary diagnostic collection.
 
 ## Settings
 
-Password hashing and verification run on independent, non-queueing data-plane and control-plane budgets whose sizes sum to at most `TOKENSTREAM_PASSWORD_MAX_CONCURRENCY`. The control plane reserves `TOKENSTREAM_ADMIN_PASSWORD_CONCURRENCY` slots (default 1) and the data plane receives the remainder, so a burst of sign-ins or credential rotations cannot consume gateway verification capacity. Admission never queues: when a plane's budget is exhausted the request is rejected with `503 resource_exhausted`, and a request that is cancelled while its computation runs keeps holding capacity until that computation finishes, so slow hashing cannot block traffic that is already streaming. The [request lifecycle event bus](./modules/events.md) fixes its subscriber set before either listener binds, and each subscriber's queue is bounded independently: `TOKENSTREAM_LOG_QUEUE_CAPACITY` bounds the request-log subscriber's own queue, and a saturated or stopped subscriber drops only its own copy of an event while the proxy result is unchanged. Authentication lookups may reserve `TOKENSTREAM_AUTH_DATABASE_CONNECTIONS` pooled connections inside `TOKENSTREAM_DATABASE_MAX_CONNECTIONS`. Authentication queries, administration statements, and log batches each have their own execution deadline (`TOKENSTREAM_AUTH_DB_TIMEOUT_MS`, `TOKENSTREAM_ADMIN_DB_TIMEOUT_MS`, `TOKENSTREAM_LOG_DB_TIMEOUT_MS`); a deadline cancels the operation, rolls back an open transaction, and returns the connection to the pool without delaying proxy streaming. `TOKENSTREAM_DATA_MAX_CONNECTIONS` and `TOKENSTREAM_ADMIN_MAX_CONNECTIONS` bound the accepted connections of each plane; the data plane defaults to the proxy capacity plus an overload-rejection margin and never accepts a value below it. Idle HTTP connections to an upstream origin are capped by `TOKENSTREAM_UPSTREAM_IDLE_PER_HOST` (default 8; 0 disables reuse) and reaped after `TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS`, so a changing endpoint cannot retain sockets indefinitely. Each request still looks up its credential and replaces the upstream authentication header; a cancelled or failed exchange is never retried onto another connection. `TOKENSTREAM_HTTP_BUFFER_BYTES` also bounds each connection's actual read chunk and upstream read buffer, and `TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS` and `TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS` bound unfinished request headers and management bodies. Each of these settings, and every setting above, is defaulted or overridden and validated before the process listens. The master key is exactly 32 bytes encoded as 64 hexadecimal characters, and the administrator hash must use Argon2id. Secrets are accepted through the environment (or an environment populated by a secret manager) or as files in the data directory, never command-line flags. After sign-in, the administration page can change settings; the password and master key apply immediately, and bind-time settings apply on the next start.
+All settings have defaults. Environment values override saved settings and defaults. Sign in as an administrator and open Settings to view or change process settings.
 
-## Production launch
+### Common parameters
 
-After a release build:
+| Environment variable | Default / format | Purpose |
+| --- | --- | --- |
+| `TOKENSTREAM_DATA_DIR` | `~/.tokenstream` | Persistent local data |
+| `TOKENSTREAM_DATA_LISTEN_ADDR` | `127.0.0.1:3300` | Data-plane listener |
+| `TOKENSTREAM_ADMIN_LISTEN_ADDR` | `127.0.0.1:3301` | Control-plane listener |
+| `TOKENSTREAM_DATABASE_URL` | SQLite in the data directory | SQLite or PostgreSQL connection |
+| `TOKENSTREAM_BOOTSTRAP_ACCOUNT` | `admin` | Initial administrator name |
+| `TOKENSTREAM_ADMIN_PASSWORD` | `tokenstream` on first setup | Bootstrap password |
+| `TOKENSTREAM_ADMIN_PASSWORD_HASH` | Argon2id hash | Bootstrap password hash |
+| `TOKENSTREAM_MASTER_KEY` | Generated and saved on first setup; 64 hex characters (32 bytes) | Upstream-secret encryption |
+| `TOKENSTREAM_DEVELOPMENT_MODE` | `true` when both listeners use loopback | Allow a session cookie over local plaintext HTTP |
+| `TOKENSTREAM_ADMIN_SESSION_TTL_MS` | `900000` (15 minutes) | Session lifetime |
+| `TOKENSTREAM_LOG_FILTER` | `info`; e.g. `warn` or `tokenstream::process=debug,tokenstream::persistence=warn` | Process diagnostic verbosity; restart required |
+| `TOKENSTREAM_ADMIN_PROXY_TARGET` | `http://127.0.0.1:3301` | Development-server proxy target only |
+
+Example: change local ports and data directory.
 
 ```sh
-./target/release/tokenstream
+TOKENSTREAM_DATA_DIR="$HOME/.tokenstream-dev" \
+TOKENSTREAM_DATA_LISTEN_ADDR=127.0.0.1:4300 \
+TOKENSTREAM_ADMIN_LISTEN_ADDR=127.0.0.1:4301 \
+cargo run --locked
 ```
 
-The control-plane listener serves the administration page that was compiled into the binary: the entry document and its `assets/` files and nothing else, with a strict content security policy, `nosniff`, `no-referrer`, and no-store on the entry document so a replaced binary is picked up on the next navigation. Administration JSON responses, including errors and empty success bodies, also send `Cache-Control: no-store`; hashed page assets keep their own long-lived cache policy. In production, terminate TLS in front of the control plane and keep the page and the API on that one origin: the session cookie is `HttpOnly`, `SameSite=Strict`, and `Secure` in production. A development deployment over plaintext has no secure origin to hold the cookie on and drops only the `Secure` attribute; every other restriction stays. Sessions last 15 minutes unless `TOKENSTREAM_ADMIN_SESSION_TTL_MS` is set.
+- Supply secrets through environment variables, a secret manager, or files in the data directory; never through command-line flags.
+- Settings-page changes to the password and master key apply immediately. Bind-time settings apply after restart; the page marks settings that require one.
+- Invalid settings, secrets, migrations, or a missing compiled administration page prevent startup.
 
-GitHub Release archives contain the gateway binary alone; the compiled administration page is already inside it.
+### Resource limits and timeouts
+
+Keep defaults for local development. Change these only when tuning capacity; all are validated before startup. Timeout values are in milliseconds.
+
+| Parameter | Controls / constraint |
+| --- | --- |
+| `TOKENSTREAM_PASSWORD_MAX_CONCURRENCY` | Total password-work budget across both planes |
+| `TOKENSTREAM_ADMIN_PASSWORD_CONCURRENCY` | Control-plane reservation (default `1`); data plane gets the remainder |
+| `TOKENSTREAM_DATABASE_MAX_CONNECTIONS` | Database pool size |
+| `TOKENSTREAM_AUTH_DATABASE_CONNECTIONS` | Authentication reservation within that pool |
+| `TOKENSTREAM_AUTH_DB_TIMEOUT_MS` | Authentication query deadline |
+| `TOKENSTREAM_ADMIN_DB_TIMEOUT_MS` | Administration statement deadline |
+| `TOKENSTREAM_LOG_DB_TIMEOUT_MS` | Request-log batch deadline |
+| `TOKENSTREAM_MAX_PROXY_CONNECTIONS` | Proxy admission limit |
+| `TOKENSTREAM_DATA_MAX_CONNECTIONS` | Accepted data-plane connections; must exceed proxy capacity |
+| `TOKENSTREAM_ADMIN_MAX_CONNECTIONS` | Accepted control-plane connections |
+| `TOKENSTREAM_UPSTREAM_IDLE_PER_HOST` | Idle upstream connections per origin (default `8`; `0` disables reuse) |
+| `TOKENSTREAM_UPSTREAM_POOL_IDLE_TIMEOUT_MS` | Idle upstream connection lifetime |
+| `TOKENSTREAM_HTTP_BUFFER_BYTES` | HTTP read chunks and upstream read buffer |
+| `TOKENSTREAM_DOWNSTREAM_HEADER_TIMEOUT_MS` | Request-header deadline |
+| `TOKENSTREAM_ADMIN_BODY_TIMEOUT_MS` | Administration request-body deadline |
+| `TOKENSTREAM_LOG_QUEUE_CAPACITY` | Request-log subscriber queue size |
+
+Exhausted hashing capacity rejects new work with `503 resource_exhausted`; it does not queue. A full or stopped log subscriber drops its own events without changing the proxy result. See [Process](./modules/process.md), [Events](./modules/events.md), and [Logging](./modules/logging.md) for behavior and bounds.
+
+### Diagnostic output
+
+| Stream | Content | Handling |
+| --- | --- | --- |
+| Standard error | One JSON diagnostic per line: `timestamp`, `level`, `target`, `fields`; stable `event` and `message` in `fields` | Collect as process logs |
+| Standard output | One generated bootstrap-password record, only when needed and the account is first created | Capture securely on first production start |
+
+Default and explicitly supplied passwords are never printed. A generated password is not printed again on restart. Diagnostic filters select only audited Tokenstream events; dependency and unknown targets stay excluded. Empty or invalid filters prevent startup without echoing the value.
+
+## Build and production launch
+
+1. Build the release binary with the administration page included.
+
+   ```sh
+   make build
+   ```
+
+2. Configure production secrets and set `TOKENSTREAM_DEVELOPMENT_MODE=false`.
+3. Terminate TLS in front of the control plane. Keep the administration page and API on the same origin.
+4. Start the gateway.
+
+   ```sh
+   TOKENSTREAM_DEVELOPMENT_MODE=false ./target/release/tokenstream
+   ```
+
+The administration page is served by the control-plane listener. Production session cookies use `HttpOnly`, `SameSite=Strict`, and `Secure`. Administration JSON responses and the page entry document are not cached; hashed assets use long-lived caching.
 
 ## Verification
 
-Basic checks are `make ci`: formatting and strict static analysis, production-module architecture boundaries, the locked test suite, and the administration frontend typecheck, tests, and production build. Faster inner-loop targets are `make lint`, `make arch-check`, and `make test`. Dual-backend repository tests need a PostgreSQL server through `TOKENSTREAM_TEST_POSTGRES_URL`; absence is a failure, not a skip.
+### During development
 
-`make arch-check` runs the same repository-contained rule set used by CI and the release gate. It parses the complete production Rust module tree, including production conditional branches, and checks full syntax paths rather than only import lines. Module classifications are closed: new or renamed modules require an explicit classification, while orphaned production sources, duplicate classifications, ambiguous internal path forms, internal glob imports, module aliases, source inclusion, path overrides, forbidden component edges, and application-payload parsing dependencies in forwarding modules fail closed. Tests and test-only modules are outside the production graph. Diagnostics are sorted and use repository-relative locations, and the check requires no network, database, or external service. This is a conservative syntax-level boundary check, not compiler name resolution; the restricted internal path forms are what make uncertainty a failure instead of a silently missed edge. A single name is a binding in scope. An internal path is an explicit root, or a longer path whose first segment names a module, and either form must resolve to a classified module.
+| Command | Checks |
+| --- | --- |
+| `make` | List available commands |
+| `make lint` | Rust formatting, strict Clippy, frontend typecheck |
+| `make arch-check` | Production module classification and dependency boundaries; no external service required |
+| `make test` | Locked Rust test suite; PostgreSQL required |
+| `make test-web` | Administration frontend unit tests |
+| `make test-compat` | Pinned client compatibility |
+| `make ci` | Frontend dependency install, typecheck, tests and build; Rust formatting, Clippy, architecture checks and tests |
 
-The release gate runs the full verification set: formatting and strict static analysis, production-module architecture boundaries, the unit, repository, protocol, and security suites, a fast component load profile, a sustained mixed load profile measured against a real gateway process, the administration frontend checks and production build, real-browser administration acceptance against both the control-plane hosted page and the development-server proxy, the pinned client suite, and the pinned clients driven through a real gateway process. The gate provisions an ephemeral PostgreSQL server when one is not supplied through `TOKENSTREAM_TEST_POSTGRES_URL`, and fails rather than skipping when no server is available. A supplied server that is not reachable is a gate failure, not a reason to record the dual-backend layers as unexecuted, and the storage layers themselves report a missing server as a failure rather than skipping.
+Install frontend dependencies before individual lint or frontend test commands:
 
 ```sh
+npm --prefix web ci
+```
+
+For `make test` or `make ci`, supply a reachable PostgreSQL server:
+
+```sh
+export TOKENSTREAM_TEST_POSTGRES_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres'
+make ci
+```
+
+Missing or unreachable PostgreSQL fails verification; dual-backend tests are never skipped.
+
+### Before release
+
+Install the browser used by administration acceptance tests, then run the full gate:
+
+```sh
+npm --prefix web ci
+npm --prefix web exec -- playwright install chromium
 make gate
 ```
 
-The real-process stages start the compiled binary, configure providers through the administration API, and measure the gateway's own resource use:
+The gate uses `TOKENSTREAM_TEST_POSTGRES_URL` when set. Otherwise it provisions temporary PostgreSQL using local tools or Docker; absence of either fails the gate.
 
-- The gateway load profile drives documented default-hashing and declared-admission profiles through the formal listeners, samples success and rejection rates, latency percentiles, resident memory, and file descriptors, compares bounded HTTP connection reuse against no reuse, and exercises slow consumers, authentication pressure, logging saturation, a slow database, bounded capacity, and a storage fault.
-- The pinned-client gateway suite runs the pinned OpenAI and Anthropic SDKs and the pinned Codex CLI through the production entry points, including a WebSocket success path and the client's own fallback when the upstream refuses the handshake, and requires every route to be refused when no gateway is listening.
+The gate covers:
+
+- Formatting, strict static analysis, architecture boundaries, frontend checks and production build.
+- Unit, SQLite/PostgreSQL repository, HTTP/SSE, WebSocket, and security tests.
+- Component and real-process mixed load: latency, success/rejection rates, memory, file descriptors, connection reuse, slow consumers, authentication pressure, and storage faults.
+- Real-browser administration acceptance through both the hosted page and development proxy.
+- Pinned OpenAI and Anthropic SDKs and Codex CLI, both against a mock upstream and through the real gateway, including WebSocket and client-owned fallback.
+
+Full acceptance criteria: [Architecture verification](./architecture.md#12-verification).
 
 ## Continuous integration
 
-Pull requests and pushes run the CI workflow: formatting, Clippy, production-module architecture boundaries, the locked test suite (including dual-backend layers against PostgreSQL and real-browser administration acceptance), and the administration frontend checks and production build.
+Pull requests and pushes to `develop` or `main` run CI: frontend checks and build, formatting, Clippy, architecture checks, and the locked test suite, including PostgreSQL and browser acceptance.
 
 ## GitHub Release
 
-A GitHub Release is created from the Release workflow. Run it manually, enter a version such as `0.1.0`, and the workflow verifies the tree, builds the administration page once, and packages native binaries for:
+1. Run `make gate` and resolve failures.
+2. In GitHub, open **Actions → Release → Run workflow**.
+3. Select the branch and enter a new version, such as `0.1.0`. Enable `prerelease` if needed.
+4. Run the workflow. It verifies the tree, builds, tags `v<version>`, and publishes archives with SHA-256 checksums. Existing tags are rejected.
 
-- Linux amd64 and arm64
-- macOS amd64 and arm64
-- Windows amd64
+| Platform | Architectures |
+| --- | --- |
+| Linux | amd64, arm64 |
+| macOS | amd64, arm64 |
+| Windows | amd64 |
 
-Each archive contains the gateway binary, with the administration page compiled into it. The workflow tags `v<version>` from the selected branch and attaches the archives plus SHA-256 checksums. A version that is already tagged is rejected.
+Each archive contains one gateway binary with the administration page included.
+
+Design reference: [Architecture](./architecture.md), [module designs](./modules/), and [ADRs](./adr/).
