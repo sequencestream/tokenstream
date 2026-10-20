@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+# Stripping build-time dylibs can misalign LINKEDIT on macOS with Rust 1.97.
+[profile.release.build-override]
+strip = "none"
+
 [dependencies]
 aes-gcm = "0.10.3"
 argon2 = "0.5.3"
