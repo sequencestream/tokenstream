@@ -32,3 +32,7 @@ __pycache__
 
 # Local editor/agent MCP configuration (may embed local tokens)
 .cursor/mcp.json
+
+*.env
+
+
