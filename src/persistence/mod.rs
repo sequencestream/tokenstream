@@ -11,10 +11,10 @@ use crate::domain::{
     Account, AccountCursor, AccountId, AccountRole, AccountStatus, AdmissionBound, ApiKey,
     ApiKeyBinding, ApiKeyCursor, ApiKeyId, ApiKeyStatus, ApiKeyWithBindings, CredentialAdmission,
     EmptyOpaqueValueError, GatewayKeyId, MAX_ADMISSION_BOUND, ModelAlias, ModelAliasCursor,
-    ModelAliasId, ModelAliasTarget, ModelAliasWithTargets, PasswordHash, PositiveValueError,
-    ProtocolType, Provider, ProviderAdmission, ProviderCursor, ProviderHealthState, ProviderId,
-    ProviderProbe, ProviderStatus, RequestId, RequestLog, RequestLogCursor, RequestLogId,
-    SecretCiphertext, TransportType, validate_provider_probe,
+    ModelAliasId, ModelAliasTable, ModelAliasTarget, ModelAliasWithTargets, PasswordHash,
+    PositiveValueError, ProtocolType, Provider, ProviderAdmission, ProviderCursor,
+    ProviderHealthState, ProviderId, ProviderProbe, ProviderStatus, RequestId, RequestLog,
+    RequestLogCursor, RequestLogId, SecretCiphertext, TransportType, validate_provider_probe,
 };
 
 pub mod postgres;
@@ -36,6 +36,13 @@ pub const MAX_MODEL_ALIAS_PAGE_SIZE: usize = 100;
 /// must pick one provider out of an allowed set reads at most this many rows.
 pub const MAX_API_KEY_PROVIDERS: usize = 32;
 pub const MAX_MODEL_ALIAS_TARGETS: usize = 32;
+
+/// Largest number of aliases one account may own.
+///
+/// The cap is the bound on the table frozen into a request snapshot. A create
+/// past it fails, and a read that finds more than this fails closed instead of
+/// dropping names.
+pub const MAX_MODEL_ALIASES_PER_ACCOUNT: usize = 100;
 
 /// Longest a storage operation waits for a pooled connection before failing closed.
 ///
@@ -1221,6 +1228,8 @@ pub enum RepositoryError {
     /// A partial update named no writable field, so no statement was issued.
     NoFieldsToUpdate,
     InvalidStoredData,
+    /// An account already holds the maximum number of model aliases.
+    Limit,
     Storage,
     /// A pooled connection could not be acquired, or a query or transaction
     /// exceeded its execution deadline.
@@ -1258,6 +1267,7 @@ impl fmt::Display for RepositoryError {
             Self::NotFound => "referenced record was not found",
             Self::NoFieldsToUpdate => "the change set named no writable field",
             Self::InvalidStoredData => "stored data is invalid",
+            Self::Limit => "the account alias limit has been reached",
             Self::Storage => "storage operation failed",
             Self::Timeout => "storage operation timed out",
         };
@@ -1415,6 +1425,18 @@ pub trait ModelAliasRepository: Send + Sync {
     ) -> Result<ModelAliasWithTargets, RepositoryError>;
 
     async fn delete_model_alias(&self, id: ModelAliasId) -> Result<(), RepositoryError>;
+
+    /// Loads the alias names that matter for one account and one provider.
+    ///
+    /// Each row is the caller-facing name and, when this provider has a target,
+    /// that target's upstream model name. A name with no target for this
+    /// provider comes back without an upstream model. The result is bounded by
+    /// [`MAX_MODEL_ALIASES_PER_ACCOUNT`]; a larger stored set fails closed.
+    async fn model_alias_table(
+        &self,
+        account_id: AccountId,
+        provider_id: ProviderId,
+    ) -> Result<ModelAliasTable, RepositoryError>;
 }
 
 #[allow(async_fn_in_trait)]
@@ -1660,6 +1682,17 @@ impl ModelAliasRepository for Database {
         match self {
             Self::Sqlite(database) => database.delete_model_alias(id).await,
             Self::Postgres(database) => database.delete_model_alias(id).await,
+        }
+    }
+
+    async fn model_alias_table(
+        &self,
+        account_id: AccountId,
+        provider_id: ProviderId,
+    ) -> Result<ModelAliasTable, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.model_alias_table(account_id, provider_id).await,
+            Self::Postgres(database) => database.model_alias_table(account_id, provider_id).await,
         }
     }
 }
@@ -1969,6 +2002,34 @@ pub(crate) struct ModelAliasTargetRow {
     pub(crate) provider_id: i64,
     pub(crate) upstream_model: String,
     pub(crate) position: i64,
+}
+
+#[derive(FromRow)]
+pub(crate) struct AliasResolutionRow {
+    pub(crate) name: String,
+    pub(crate) upstream_model: Option<String>,
+}
+
+/// Builds the frozen alias table for one provider from a bounded read.
+///
+/// More rows than the account cap means the stored set escaped the write limit,
+/// so the read fails closed instead of silently dropping names. An empty
+/// upstream model is stored data this process would not have written.
+pub(crate) fn model_alias_table_from_rows(
+    rows: Vec<AliasResolutionRow>,
+) -> Result<ModelAliasTable, RepositoryError> {
+    if rows.len() > MAX_MODEL_ALIASES_PER_ACCOUNT {
+        return Err(RepositoryError::Limit);
+    }
+    let mut table = ModelAliasTable::default();
+    for row in rows {
+        match row.upstream_model {
+            Some(upstream) if !upstream.is_empty() => table.insert_available(row.name, upstream),
+            Some(_) => return Err(RepositoryError::InvalidStoredData),
+            None => table.insert_unavailable(row.name),
+        }
+    }
+    Ok(table)
 }
 
 impl ModelAliasTargetRow {

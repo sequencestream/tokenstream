@@ -19,7 +19,7 @@
 
 use crate::crypto::{PasswordWork, PasswordWorkError};
 use crate::persistence::{
-    AccountRepository, ApiKeyRepository, ProviderRepository, RepositoryError,
+    AccountRepository, ApiKeyRepository, ModelAliasRepository, ProviderRepository, RepositoryError,
 };
 use std::error::Error;
 use std::fmt;
@@ -144,7 +144,7 @@ where
     // provider it selects, so the hot path needs all three stores and nothing
     // else. Keeping them on one repository is what makes that a single
     // consistent read rather than three independently drifting ones.
-    R: ApiKeyRepository + AccountRepository + ProviderRepository,
+    R: ApiKeyRepository + AccountRepository + ProviderRepository + ModelAliasRepository,
     C: SecretCipher,
     V: GatewaySecretVerifier + 'static,
 {
@@ -242,10 +242,13 @@ where
             .cipher
             .decrypt(provider.upstream_api_key_ciphertext())
             .map_err(|_| GatewayAuthError::Unavailable)?;
+        let aliases = self.alias_table(account.id(), provider.id()).await?;
 
         // The admission bounds of both the credential and the selected provider
         // are frozen here, with the rest of the snapshot. A later limit edit
-        // applies to new work and cannot reach what is already admitted.
+        // applies to new work and cannot reach what is already admitted. The
+        // alias table is frozen the same way: it names models for the provider
+        // already chosen and does not choose that provider.
         Ok(Arc::new(
             ProviderSnapshot::new(
                 account.id(),
@@ -256,8 +259,29 @@ where
                 upstream_api_key,
             )
             .with_admission(provider.admission(), api_key.admission())
-            .with_health(provider.health()),
+            .with_health(provider.health())
+            .with_aliases(aliases),
         ))
+    }
+
+    /// Loads the alias names for the provider this request already resolved to.
+    ///
+    /// The read is on the authentication lookup path and fails closed with it.
+    /// An empty table means this account has no aliases.
+    async fn alias_table(
+        &self,
+        account_id: crate::domain::AccountId,
+        provider_id: ProviderId,
+    ) -> Result<crate::domain::ModelAliasTable, GatewayAuthError> {
+        match self
+            .repository
+            .model_alias_table(account_id, provider_id)
+            .await
+        {
+            Ok(table) => Ok(table),
+            Err(RepositoryError::Timeout) => Err(GatewayAuthError::Busy),
+            Err(_) => Err(GatewayAuthError::Unavailable),
+        }
     }
 
     /// Resolves the single provider this request reaches.

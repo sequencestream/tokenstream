@@ -8,8 +8,11 @@ use tokenstream::credentials::CredentialService;
 use tokenstream::credentials::{CreateApiKeyRequest, UpdateAccountRequest, UpdateApiKeyRequest};
 use tokenstream::crypto::{AesGcmCipher, Argon2GatewaySecretVerifier};
 use tokenstream::domain::{
-    AccountStatus, ApiKeyStatus, GATEWAY_SECRET_LENGTH, GatewayCredential, GatewayKeyId,
-    ProtocolType, ProviderHealthState, ProviderStatus, SecretString,
+    AccountStatus, AliasLookup, ApiKeyStatus, GATEWAY_SECRET_LENGTH, GatewayCredential,
+    GatewayKeyId, ProtocolType, ProviderHealthState, ProviderStatus, SecretString,
+};
+use tokenstream::model_aliases::{
+    CreateModelAliasRequest, ModelAliasService, ModelAliasTargetInput, UpdateModelAliasRequest,
 };
 use tokenstream::persistence::ProviderRepository;
 use tokenstream::persistence::sqlite::SqliteDatabase;
@@ -19,6 +22,7 @@ const MASTER_KEY: [u8; 32] = [0x5c; 32];
 const UPSTREAM_KEY: &str = "sk-upstream-secret-value";
 const ROTATED_UPSTREAM_KEY: &str = "sk-rotated-secret-value";
 
+#[path = "../support/mod.rs"]
 mod support;
 
 use support::{bootstrap_account, issue_api_key, render};
@@ -324,6 +328,117 @@ async fn snapshots_are_request_local_and_new_requests_observe_edits() {
         "https://api.updated.example/base"
     );
     assert_eq!(refreshed.upstream_api_key().expose(), ROTATED_UPSTREAM_KEY);
+}
+
+#[tokio::test]
+async fn a_snapshot_freezes_alias_names_for_the_selected_provider() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite_database(&directory.path().join("aliases.db")).await;
+    let service = service(database.clone());
+    let accounts = credentials(database.clone());
+    let aliases = ModelAliasService::new(database.clone());
+    let authenticator = authenticator(database);
+    let account = bootstrap_account(&accounts).await;
+
+    let first = service
+        .create(request(
+            "first",
+            ProtocolType::OpenAi,
+            "https://first.example/v1",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create first provider");
+    let second = service
+        .create(request(
+            "second",
+            ProtocolType::OpenAi,
+            "https://second.example/v1",
+            ProviderStatus::Enabled,
+        ))
+        .await
+        .expect("create second provider");
+    let issued = issue_api_key(&accounts, account.id(), vec![first.id(), second.id()]).await;
+    let credential = render(&issued);
+    let created = aliases
+        .create(CreateModelAliasRequest::new(
+            account.id(),
+            "coding".to_owned(),
+            vec![
+                ModelAliasTargetInput::new(first.id(), "gpt-5.2-codex".to_owned()),
+                ModelAliasTargetInput::new(second.id(), "claude-sonnet".to_owned()),
+            ],
+        ))
+        .await
+        .expect("create shared alias");
+    aliases
+        .create(CreateModelAliasRequest::new(
+            account.id(),
+            "writing".to_owned(),
+            vec![ModelAliasTargetInput::new(
+                second.id(),
+                "claude-opus".to_owned(),
+            )],
+        ))
+        .await
+        .expect("create alias without the first provider");
+
+    let snapshot = authenticator
+        .authenticate(&with_selection(&credential, first.id().get()))
+        .await
+        .expect("authenticate the first provider");
+    assert_eq!(
+        snapshot.aliases().lookup("coding"),
+        AliasLookup::Upstream("gpt-5.2-codex")
+    );
+    assert_eq!(
+        snapshot.aliases().lookup("writing"),
+        AliasLookup::Unavailable
+    );
+    assert_eq!(
+        snapshot.aliases().lookup("gpt-5.2-codex"),
+        AliasLookup::Passthrough
+    );
+    let rendered = format!("{snapshot:?}");
+    assert!(!rendered.contains("coding"));
+    assert!(!rendered.contains("gpt-5.2-codex"));
+    assert!(!rendered.contains("writing"));
+
+    aliases
+        .update(
+            created.alias().id(),
+            UpdateModelAliasRequest::new().with_targets(vec![
+                ModelAliasTargetInput::new(first.id(), "gpt-5.3-codex".to_owned()),
+                ModelAliasTargetInput::new(second.id(), "claude-sonnet".to_owned()),
+            ]),
+        )
+        .await
+        .expect("edit the alias after the snapshot");
+    assert_eq!(
+        snapshot.aliases().lookup("coding"),
+        AliasLookup::Upstream("gpt-5.2-codex")
+    );
+
+    let refreshed = authenticator
+        .authenticate(&with_selection(&credential, first.id().get()))
+        .await
+        .expect("authenticate after the edit");
+    assert_eq!(
+        refreshed.aliases().lookup("coding"),
+        AliasLookup::Upstream("gpt-5.3-codex")
+    );
+    let other = authenticator
+        .authenticate(&with_selection(&credential, second.id().get()))
+        .await
+        .expect("authenticate the second provider");
+    assert_eq!(
+        other.aliases().lookup("coding"),
+        AliasLookup::Upstream("claude-sonnet")
+    );
+    assert_eq!(
+        other.aliases().lookup("writing"),
+        AliasLookup::Upstream("claude-opus")
+    );
 }
 
 #[tokio::test]

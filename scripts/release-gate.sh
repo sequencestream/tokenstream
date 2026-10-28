@@ -1,6 +1,14 @@
 #!/bin/sh
 set -eu
 
+core_protocol_only=false
+core_failed=0
+case "${1:-}" in
+  "") ;;
+  --core-protocol) core_protocol_only=true ;;
+  *) echo "Usage: $0 [--core-protocol]" >&2; exit 2 ;;
+esac
+
 repository_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 temporary_postgres=""
 postgres_container=""
@@ -24,6 +32,19 @@ trap cleanup EXIT HUP INT TERM
 stage() {
   echo
   echo "==> $1"
+}
+
+run_checked() {
+  if "$@"; then
+    echo "==> CHECK PASSED"
+  else
+    check_status=$?
+    echo "==> CHECK FAILED"
+    if [ "$core_protocol_only" = false ]; then
+      exit "$check_status"
+    fi
+    core_failed=1
+  fi
 }
 
 cd "$repository_root"
@@ -100,21 +121,31 @@ if [ "$postgres_ready" != true ]; then
 fi
 
 stage "unit, repository, protocol, and security suites"
-cargo test --locked
+if [ "$core_protocol_only" = true ]; then
+  run_checked cargo test --locked --no-fail-fast -- --skip real_browser_accepts_hosted_and_proxied_administration_pages
+else
+  run_checked cargo test --locked
+fi
 
 stage "mixed HTTP/SSE and WebSocket component load profile"
-cargo test --locked --test release_load_profile \
+run_checked cargo test --locked --test release_load_profile \
   mixed_long_lived_transports_reach_stable_bounded_memory \
   -- --ignored --exact --nocapture
 
 stage "sustained mixed load against the real gateway process"
-cargo test --locked --test gateway_load -- --nocapture
+run_checked cargo test --locked --test gateway_load -- --nocapture
 
 stage "pinned client compatibility"
-npm --prefix compatibility ci --ignore-scripts
-npm --prefix compatibility test
+run_checked npm --prefix compatibility ci --ignore-scripts
+run_checked npm --prefix compatibility test
 
 stage "pinned clients through the production gateway"
-npm --prefix compatibility run test:gateway
+run_checked npm --prefix compatibility run test:gateway
 
-stage "release gate passed"
+[ "$core_failed" -eq 0 ] || exit 1
+
+if [ "$core_protocol_only" = true ]; then
+  stage "core protocol gate passed"
+else
+  stage "release gate passed"
+fi

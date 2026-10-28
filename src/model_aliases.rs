@@ -1,7 +1,8 @@
 //! Account-owned model alias configuration.
 //!
-//! Aliases are inert control-plane state. This module validates and persists
-//! them, but it has no dependency on authentication snapshots or proxying.
+//! Aliases are control-plane state. This module validates and persists them.
+//! The data plane reads a frozen projection through persistence and does not
+//! depend on this module.
 
 use std::collections::HashSet;
 use std::error::Error;
@@ -26,6 +27,7 @@ pub enum ModelAliasServiceError {
     AccountDisabled,
     ProviderNotFound,
     Conflict,
+    Limit,
     NotFound,
     NoFieldsToUpdate,
     Busy,
@@ -41,6 +43,7 @@ impl fmt::Display for ModelAliasServiceError {
             Self::AccountDisabled => "account is disabled",
             Self::ProviderNotFound => "provider was not found",
             Self::Conflict => "model alias name already exists for this account",
+            Self::Limit => "the account has reached its model alias limit",
             Self::NotFound => "model alias was not found",
             Self::NoFieldsToUpdate => "the edit named no writable field",
             Self::Busy => "model alias service has no spare capacity",
@@ -233,6 +236,7 @@ fn validate_text(raw: &str, max_len: usize) -> Option<String> {
 fn map_repository_error(error: RepositoryError) -> ModelAliasServiceError {
     match error {
         RepositoryError::Conflict => ModelAliasServiceError::Conflict,
+        RepositoryError::Limit => ModelAliasServiceError::Limit,
         RepositoryError::NotFound => ModelAliasServiceError::NotFound,
         RepositoryError::NoFieldsToUpdate => ModelAliasServiceError::NoFieldsToUpdate,
         RepositoryError::Timeout => ModelAliasServiceError::Busy,

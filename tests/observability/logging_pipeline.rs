@@ -20,6 +20,7 @@ use tokenstream::telemetry::{Metrics, SubscriberName};
 use tokio::sync::Mutex;
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{ensure_bootstrap, require_postgres_url};
 

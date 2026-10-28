@@ -203,6 +203,8 @@ fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
         "account_disabled" => ProxyFailureCategory::AccountDisabled,
         "key_expired" => ProxyFailureCategory::KeyExpired,
         "no_provider_selected" => ProxyFailureCategory::NoProviderSelected,
+        "model_alias_unavailable" => ProxyFailureCategory::ModelAliasUnavailable,
+        "invalid_model_field" => ProxyFailureCategory::InvalidModelField,
         "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
         "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
         "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,

@@ -11,7 +11,7 @@ fn production_process_relays_http_tls_and_websocket_and_drains_sessions() {
         .unwrap()
         .to_string();
     let output = std::process::Command::new("python3")
-        .arg("tests/support/production_gateway.py")
+        .arg("tests/process/production_gateway.py")
         .env("GATEWAY_BINARY", env!("CARGO_BIN_EXE_tokenstream"))
         .env("TEST_ADMIN_HASH", hash)
         .output()

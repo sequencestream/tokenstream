@@ -97,6 +97,7 @@ A plaintext development origin drops only the secure cookie attribute. HTTP-only
 - The page never receives upstream secrets, gateway secrets after initial creation, password hashes, encryption material, or master-key plaintext.
 - A half-edited filter form never combines one condition set with another set's cursor.
 - Provider deletion that is blocked by log, binding, or model-alias association returns `409` with `provider_in_use` and directs the administrator to disable.
+- Creating a model alias when the account already holds the maximum of 100 returns `409` with `model_alias_limit`.
 - Authorization is decided from the session before dispatch. A handler never decides whether the caller may reach it.
 - Only an administrator reads a provider's health state, edits its probe configuration, or enters and leaves maintenance.
 - A regular user reads and writes only its own credentials and model aliases, and sees only its own request logs.

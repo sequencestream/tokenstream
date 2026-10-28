@@ -86,6 +86,8 @@ sequenceDiagram
 
 A `101` is valid only when upgrade headers are present, the accept value appears exactly once and matches the handshake key, any selected subprotocol was offered by the client, and no extensions are negotiated. Reconstruction retains every allowed repeated end-to-end value.
 
+The client-to-upstream direction may apply a text replacement supplied by the caller of the relay. The relay does not decide what the replacement means. Binary frames, control frames, and the upstream-to-client direction are copied through. A replacement that fails closes the relay without forwarding that message.
+
 Ping, pong, fragmentation, and close are handled at the connection boundary. Exact frame boundaries need not be preserved. Oversized messages close under the configured policy with a sanitized log error.
 
 ## Invariants

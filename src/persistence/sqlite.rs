@@ -8,14 +8,15 @@ use sqlx::{Executor, QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use super::time::to_epoch_micros;
 use super::{
     AccountListRequest, AccountPage, AccountRepository, AccountRow, AccountUpdate,
-    ApiKeyBindingRow, ApiKeyListRequest, ApiKeyPage, ApiKeyRepository, ApiKeyRow, ApiKeyUpdate,
-    DatabaseBounds, HealthOutcome, ModelAliasListRequest, ModelAliasPage, ModelAliasRepository,
-    ModelAliasRow, ModelAliasTargetRow, ModelAliasUpdate, NewAccount, NewApiKey, NewModelAlias,
-    NewProvider, ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow,
-    ProviderUpdate, RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery,
-    RequestLogRepository, RequestLogRow, RequestLogStarted, RequestLogWrite, account_status_value,
-    admission_count, api_key_status_value, diagnostic_error_kind, health_name, probe_columns,
-    protocol_value, role_value, status_value, timed, transport_value,
+    AliasResolutionRow, ApiKeyBindingRow, ApiKeyListRequest, ApiKeyPage, ApiKeyRepository,
+    ApiKeyRow, ApiKeyUpdate, DatabaseBounds, HealthOutcome, MAX_MODEL_ALIASES_PER_ACCOUNT,
+    ModelAliasListRequest, ModelAliasPage, ModelAliasRepository, ModelAliasRow,
+    ModelAliasTargetRow, ModelAliasUpdate, NewAccount, NewApiKey, NewModelAlias, NewProvider,
+    ProviderListRequest, ProviderPage, ProviderRepository, ProviderRow, ProviderUpdate,
+    RepositoryError, RequestLogCompleted, RequestLogPage, RequestLogQuery, RequestLogRepository,
+    RequestLogRow, RequestLogStarted, RequestLogWrite, account_status_value, admission_count,
+    api_key_status_value, diagnostic_error_kind, health_name, model_alias_table_from_rows,
+    probe_columns, protocol_value, role_value, status_value, timed, transport_value,
 };
 use crate::MigrationRunner;
 use crate::domain::{
@@ -993,7 +994,24 @@ impl ModelAliasRepository for SqliteDatabase {
         &self,
         alias: NewModelAlias,
     ) -> Result<ModelAliasWithTargets, RepositoryError> {
-        let mut transaction = self.shared.begin().await.map_err(map_transaction_error)?;
+        // Immediate so two creates cannot both observe a count under the cap
+        // and then both insert. The second waits until the first commits.
+        let mut transaction = self
+            .shared
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(map_transaction_error)?;
+        let count: i64 = timed(
+            self.admin_timeout,
+            sqlx::query_scalar("SELECT COUNT(*) FROM ts_model_alias WHERE account_id = ?")
+                .bind(alias.account_id().get())
+                .fetch_one(&mut *transaction),
+        )
+        .await
+        .map_err(map_read_error)?;
+        if count >= i64::try_from(MAX_MODEL_ALIASES_PER_ACCOUNT).expect("alias cap fits in i64") {
+            return Err(RepositoryError::Limit);
+        }
         let created = timed(
             self.admin_timeout,
             sqlx::query_as::<_, ModelAliasRow>(
@@ -1099,6 +1117,37 @@ impl ModelAliasRepository for SqliteDatabase {
         } else {
             Ok(())
         }
+    }
+
+    async fn model_alias_table(
+        &self,
+        account_id: AccountId,
+        provider_id: ProviderId,
+    ) -> Result<crate::domain::ModelAliasTable, RepositoryError> {
+        let limit =
+            i64::try_from(MAX_MODEL_ALIASES_PER_ACCOUNT + 1).expect("alias cap fits in i64");
+        let rows = timed(
+            self.auth_timeout,
+            sqlx::query_as::<_, AliasResolutionRow>(
+                "SELECT a.name AS name,
+                        (
+                            SELECT t.upstream_model
+                            FROM ts_model_alias_target t
+                            WHERE t.model_alias_id = a.id AND t.provider_id = ?
+                        ) AS upstream_model
+                 FROM ts_model_alias a
+                 WHERE a.account_id = ?
+                 ORDER BY a.id ASC
+                 LIMIT ?",
+            )
+            .bind(provider_id.get())
+            .bind(account_id.get())
+            .bind(limit)
+            .fetch_all(&self.auth),
+        )
+        .await
+        .map_err(map_read_error)?;
+        model_alias_table_from_rows(rows)
     }
 }
 

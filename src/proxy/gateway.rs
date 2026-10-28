@@ -8,19 +8,23 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
-use hyper::{Request, Response};
+use hyper::header::{CONTENT_LENGTH, HeaderValue};
+use hyper::{HeaderMap, Request, Response};
 
 use crate::auth::GatewayAuthenticator;
 use crate::config::Config;
 use crate::crypto::{Argon2GatewaySecretVerifier, SharedCipher};
-use crate::domain::{ProviderSnapshot, RequestId, TransportType};
+use crate::domain::{
+    ModelAliasTable, ModelRewriteFailure, ProviderSnapshot, RequestId, TransportType,
+};
 use crate::events::{EventBus, RequestLifecycle, observe_response};
+use crate::model_rewrite::{PrepareError, prepare, rewrite_text};
 use crate::persistence::Database;
 use crate::proxy::admission::{AdmissionPermit, ProxyLimits};
 use crate::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use crate::proxy::http::HttpProxy;
 use crate::proxy::layered::{LayerRejection, LayeredAdmission, LayeredSlots};
-use crate::proxy::websocket::{RelayOutcome, WebSocketProxy};
+use crate::proxy::websocket::{ClientTextMap, RelayOutcome, WebSocketProxy};
 use crate::routing::resolve_route;
 use crate::telemetry::{
     ExchangeOutcome, Metrics, ProxyFailureCategory, RejectionLayer, RejectionReason,
@@ -29,6 +33,41 @@ use crate::telemetry::{
 pub type DataBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
 pub type Session = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub type Exchange = (Response<DataBody>, Option<Session>);
+
+fn rewrite_error(error: PrepareError) -> GatewayError {
+    match error {
+        PrepareError::Rewrite(ModelRewriteFailure::Unavailable) => {
+            GatewayError::ModelAliasUnavailable
+        }
+        PrepareError::Rewrite(ModelRewriteFailure::Invalid) => GatewayError::InvalidModelField,
+        PrepareError::Read => GatewayError::InternalError,
+    }
+}
+
+fn text_map(table: &ModelAliasTable) -> Option<ClientTextMap> {
+    if table.is_empty() {
+        None
+    } else {
+        let table = table.clone();
+        Some(Arc::new(move |text| {
+            rewrite_text(&table, text).map_err(ModelRewriteFailure::code)
+        }))
+    }
+}
+
+/// Drops the client's content length after a replacement changes the body size.
+///
+/// An exact remaining size is written back so the upstream still sees one
+/// length. An inexact body is left without a length and is sent in chunks.
+fn align_content_length(headers: &mut HeaderMap, hint: SizeHint) {
+    headers.remove(CONTENT_LENGTH);
+    let Some(exact) = hint.exact() else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&exact.to_string()) {
+        headers.insert(CONTENT_LENGTH, value);
+    }
+}
 
 pub fn boxed<B>(body: B) -> DataBody
 where
@@ -40,7 +79,7 @@ where
 
 pub struct Gateway {
     authenticator: GatewayAuthenticator<Database, SharedCipher, Argon2GatewaySecretVerifier>,
-    http: HttpProxy<Incoming>,
+    http: HttpProxy<crate::model_rewrite::RewrittenBody<Incoming>>,
     websocket: WebSocketProxy,
     events: EventBus,
     metrics: Metrics,
@@ -144,16 +183,22 @@ impl Gateway {
         let transport = route.transport();
         let query = request.uri().query().map(str::to_owned);
 
-        // Layered admission runs once the snapshot is frozen and the route is
-        // valid, and before any upstream is contacted. A rejection here costs
-        // one credential lookup and no network, and it releases everything an
-        // outer layer already took.
-        let slots = self
-            .admit_layers(&snapshot, transport)
-            .map_err(|error| (error, transport))?;
-        let slots = Arc::new(slots);
-
         if transport == TransportType::Http {
+            // Rewrite before admission so a model the selected provider cannot
+            // accept does not consume a rate slot, and before any upstream
+            // connection. An empty alias table does not read the body.
+            let (mut parts, body) = request.into_parts();
+            let rewritten = prepare(snapshot.aliases(), body)
+                .await
+                .map_err(|error| (rewrite_error(error), transport))?;
+            if rewritten.length_changed() {
+                align_content_length(&mut parts.headers, rewritten.size_hint());
+            }
+            let request = Request::from_parts(parts, rewritten);
+            let slots = Arc::new(
+                self.admit_layers(&snapshot, transport)
+                    .map_err(|error| (error, transport))?,
+            );
             let response = self
                 .http
                 .forward_logged(
@@ -179,6 +224,15 @@ impl Gateway {
                 None,
             ));
         }
+
+        // Layered admission runs once the snapshot is frozen and the route is
+        // valid, and before any upstream is contacted. A rejection here costs
+        // one credential lookup and no network, and it releases everything an
+        // outer layer already took.
+        let slots = self
+            .admit_layers(&snapshot, transport)
+            .map_err(|error| (error, transport))?;
+        let slots = Arc::new(slots);
         let mut lifecycle = RequestLifecycle::start(
             self.events.clone(),
             self.metrics.clone(),
@@ -189,7 +243,14 @@ impl Gateway {
         .observe_websocket();
         let (response, relay) = match self
             .websocket
-            .prepare(&snapshot, &route, query.as_deref(), peer, &mut request)
+            .prepare(
+                &snapshot,
+                &route,
+                query.as_deref(),
+                peer,
+                &mut request,
+                text_map(snapshot.aliases()),
+            )
             .await
         {
             Ok(prepared) => prepared,
@@ -222,6 +283,7 @@ impl Gateway {
                         RelayOutcome::MessageTooLarge => Some("message_too_large"),
                         RelayOutcome::IdleTimeout => Some("idle_timeout"),
                         RelayOutcome::Failed => Some("relay_failed"),
+                        RelayOutcome::ModelRejected(code) => Some(code),
                     };
                     lifecycle.complete(Some(status), error);
                 });

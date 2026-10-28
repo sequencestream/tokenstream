@@ -20,6 +20,7 @@ use tokenstream::persistence::{
 };
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{ensure_bootstrap, key_id, stored_instant, unique_value};
 

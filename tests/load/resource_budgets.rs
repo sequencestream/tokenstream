@@ -28,6 +28,7 @@ use tokenstream::telemetry::ProxyFailureCategory;
 use tokenstream::telemetry::{Metrics, SubscriberName};
 use tokio::sync::oneshot;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{bootstrap_account, require_postgres_url};
 

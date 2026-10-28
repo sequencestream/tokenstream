@@ -26,7 +26,7 @@ use crate::domain::{ProviderHealthState, TransportType};
 
 const LATENCY_BUCKETS_SECONDS: [f64; 10] =
     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0];
-const FAILURE_CATEGORY_COUNT: usize = 17;
+const FAILURE_CATEGORY_COUNT: usize = 19;
 const SUBSCRIBER_COUNT: usize = 1;
 const TRANSPORT_COUNT: usize = 2;
 const RESULT_COUNT: usize = 4;
@@ -351,6 +351,8 @@ pub enum ProxyFailureCategory {
     DownstreamCancelled,
     MessageTooLarge,
     RelayFailed,
+    ModelAliasUnavailable,
+    InvalidModelField,
 }
 
 impl ProxyFailureCategory {
@@ -372,6 +374,8 @@ impl ProxyFailureCategory {
         Self::DownstreamCancelled,
         Self::MessageTooLarge,
         Self::RelayFailed,
+        Self::ModelAliasUnavailable,
+        Self::InvalidModelField,
     ];
 
     const fn index(self) -> usize {
@@ -397,6 +401,8 @@ impl ProxyFailureCategory {
             Self::DownstreamCancelled => "downstream_cancelled",
             Self::MessageTooLarge => "message_too_large",
             Self::RelayFailed => "relay_failed",
+            Self::ModelAliasUnavailable => "model_alias_unavailable",
+            Self::InvalidModelField => "invalid_model_field",
         }
     }
 
@@ -422,6 +428,8 @@ impl ProxyFailureCategory {
             | Self::AccountDisabled
             | Self::KeyExpired
             | Self::NoProviderSelected
+            | Self::ModelAliasUnavailable
+            | Self::InvalidModelField
             | Self::UnsupportedRoute
             | Self::InvalidUpgrade
             | Self::ConnectionLimitReached

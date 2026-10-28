@@ -20,6 +20,7 @@ use tokenstream::domain::{
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::providers::{CreateProviderRequest, ProviderService};
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{bootstrap_account, later, provider_id, unique_value};
 

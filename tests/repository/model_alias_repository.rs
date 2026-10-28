@@ -3,17 +3,18 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
 use tokenstream::domain::{
-    AccountRole, AccountStatus, ModelAliasCursor, PasswordHash, ProtocolType, ProviderStatus,
-    SecretCiphertext,
+    AccountRole, AccountStatus, AliasLookup, ModelAliasCursor, PasswordHash, ProtocolType,
+    ProviderStatus, SecretCiphertext,
 };
 use tokenstream::persistence::postgres::PostgresDatabase;
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{
-    AccountRepository, ModelAliasListRequest, ModelAliasRepository, ModelAliasUpdate, NewAccount,
-    NewModelAlias, NewProvider, ProviderRepository, RepositoryError,
+    AccountRepository, MAX_MODEL_ALIASES_PER_ACCOUNT, ModelAliasListRequest, ModelAliasRepository,
+    ModelAliasUpdate, NewAccount, NewModelAlias, NewProvider, ProviderRepository, RepositoryError,
 };
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::require_postgres_url;
 
@@ -199,6 +200,109 @@ where
     AccountRepository::delete(repository, second_account.id())
         .await
         .expect("delete second account");
+}
+
+#[tokio::test]
+async fn an_account_alias_table_is_bounded_and_scoped_to_one_provider() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let database = sqlite(&directory.path().join("alias-cap.db")).await;
+    let prefix = unique("cap");
+    let account = AccountRepository::create(
+        &database,
+        NewAccount::new(
+            format!("{prefix}-account"),
+            PasswordHash::new("hash"),
+            AccountRole::User,
+            AccountStatus::Enabled,
+            false,
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect("account");
+    let selected = ProviderRepository::create(
+        &database,
+        NewProvider::new(
+            format!("{prefix}-selected"),
+            ProtocolType::OpenAi,
+            Url::parse("https://selected.example.com").expect("URL"),
+            SecretCiphertext::new("ciphertext"),
+            ProviderStatus::Enabled,
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect("selected provider");
+    let other = ProviderRepository::create(
+        &database,
+        NewProvider::new(
+            format!("{prefix}-other"),
+            ProtocolType::Anthropic,
+            Url::parse("https://other.example.com").expect("URL"),
+            SecretCiphertext::new("ciphertext"),
+            ProviderStatus::Enabled,
+            Utc::now(),
+        ),
+    )
+    .await
+    .expect("other provider");
+
+    database
+        .create_model_alias(NewModelAlias::new(
+            account.id(),
+            "coding".to_owned(),
+            vec![
+                (selected.id(), "gpt-5.2-codex".to_owned()),
+                (other.id(), "claude-sonnet".to_owned()),
+            ],
+            Utc::now(),
+        ))
+        .await
+        .expect("shared alias");
+    database
+        .create_model_alias(NewModelAlias::new(
+            account.id(),
+            "writing".to_owned(),
+            vec![(other.id(), "claude-opus".to_owned())],
+            Utc::now(),
+        ))
+        .await
+        .expect("alias without the selected provider");
+
+    let table = database
+        .model_alias_table(account.id(), selected.id())
+        .await
+        .expect("alias table");
+    assert_eq!(
+        table.lookup("coding"),
+        AliasLookup::Upstream("gpt-5.2-codex")
+    );
+    assert_eq!(table.lookup("writing"), AliasLookup::Unavailable);
+    assert_eq!(table.lookup("gpt-5.2-codex"), AliasLookup::Passthrough);
+
+    for index in 2..MAX_MODEL_ALIASES_PER_ACCOUNT {
+        database
+            .create_model_alias(NewModelAlias::new(
+                account.id(),
+                format!("alias-{index}"),
+                vec![(selected.id(), format!("upstream-{index}"))],
+                Utc::now(),
+            ))
+            .await
+            .expect("alias under the cap");
+    }
+    assert_eq!(
+        database
+            .create_model_alias(NewModelAlias::new(
+                account.id(),
+                "one-past-the-cap".to_owned(),
+                vec![(selected.id(), "overflow".to_owned())],
+                Utc::now(),
+            ))
+            .await
+            .expect_err("cap"),
+        RepositoryError::Limit
+    );
 }
 
 #[tokio::test]
