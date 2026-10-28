@@ -23,6 +23,7 @@ Entry point for agents and contributors. Defines the rules governing Tokenstream
 | Authentication | `doc/modules/authentication.md` | Gateway credential verification and snapshots |
 | Accounts and credentials | `doc/modules/credentials.md` | Account ownership, credential lifecycle, provider bindings |
 | Model aliases | `doc/modules/model-aliases.md` | Account-owned model alias configuration and target bounds |
+| Model rewrite | `doc/modules/model-rewrite.md` | Replacement of a caller-facing model name after provider selection |
 | Routing | `doc/modules/routing.md` | Route and transport allowlist decisions |
 | Proxy | `doc/modules/proxy.md` | HTTP/SSE streaming and WebSocket relay |
 | Providers | `doc/modules/providers.md` | Provider lifecycle and snapshot loading |
@@ -42,6 +43,8 @@ The core principles (payload transparency, loose upstream coupling, client-owned
 3. Verify behavior against `doc/architecture.md`, the relevant module designs under `doc/modules/`, and the relevant ADRs under `doc/adr/`.
 4. No doc↔code cross-references; keep docs self-consistent.
 5. Prefer editing existing files.
+6. Keep the architecture simple and elegant.
+7. Change a feature with the smallest modification that satisfies it.
 
 ## Verification
 

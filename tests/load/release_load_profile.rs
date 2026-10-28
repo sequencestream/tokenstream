@@ -212,7 +212,13 @@ async fn mixed_long_lived_transports_reach_stable_bounded_memory() {
         websocket_clients.push(upstream_client);
         let active = metrics.start_websocket();
         websocket_tasks.push(tokio::spawn(async move {
-            let outcome = relay(downstream_proxy, upstream_proxy, Duration::from_secs(10)).await;
+            let outcome = relay(
+                downstream_proxy,
+                upstream_proxy,
+                Duration::from_secs(10),
+                None,
+            )
+            .await;
             drop(active);
             outcome
         }));

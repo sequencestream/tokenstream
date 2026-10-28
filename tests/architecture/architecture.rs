@@ -37,6 +37,7 @@ const REPOSITORY_CLASSES: &[(&str, Class)] = &[
     ("local_state", Class::Assembly),
     ("logging", Class::Logging),
     ("model_aliases", Class::ControlPlane),
+    ("model_rewrite", Class::DataPlane),
     ("persistence", Class::Shared),
     ("persistence.postgres", Class::Shared),
     ("persistence.sqlite", Class::Shared),

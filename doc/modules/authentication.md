@@ -63,6 +63,8 @@ A credential carries an ordered set of allowed providers and an optional default
 
 The selector is read from the header map only. No branch of authentication reads the request body, deserializes anything, or looks for a model name; the allowed set is configuration, not payload ([ADR 0001](../adr/0001-transparent-proxy-core.md)). A credential bound to a single provider needs no selector at all.
 
+After the provider is resolved, authentication freezes that account's alias names for that one provider into the same snapshot ([ADR 0020](../adr/0020-model-alias-request-rewrite.md)). The read is bounded by the account alias cap and uses the same lookup deadline as the credential read. An empty result is an empty table. The table does not change which provider was selected, and authentication still does not read the body to find a model name.
+
 A selection naming a provider outside the allowed set is rejected as an unknown credential rather than silently falling back, so a misconfigured client fails visibly instead of reaching an unintended upstream.
 
 ## Invariants
@@ -71,7 +73,7 @@ A selection naming a provider outside the allowed set is rejected as an unknown 
 - Data-plane hashing does not borrow control-plane slots, and the reverse is also true.
 - Exhausted hashing, reserved-connection exhaustion, or a lookup deadline is `resource_exhausted`, not `internal_error`.
 - A disabled account, a disabled or expired credential, a rotated credential, an edited binding, and an isolated or maintained provider all fail new work only. Already admitted streams keep the snapshot they received, including the health state frozen at admission.
-- Routing and proxying consume the snapshot; they never re-read credential, account, or provider records for that exchange.
+- Routing and proxying consume the snapshot; they never re-read credential, account, provider, or alias records for that exchange.
 - The snapshot never carries a credential plaintext or secret hash.
 
 ## Failures and bounds

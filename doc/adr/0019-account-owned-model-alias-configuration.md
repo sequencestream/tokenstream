@@ -3,6 +3,10 @@
 - Status: Accepted
 - Date: 2026-10-05
 
+The ownership and target rules below stand. The data plane now resolves an alias after the provider
+is selected ([ADR 0020](./0020-model-alias-request-rewrite.md)); the paragraph that kept aliases out
+of the data plane is superseded by that decision.
+
 ## Context
 
 Accounts and account-owned credentials give every caller a stable owner, but a caller still has no

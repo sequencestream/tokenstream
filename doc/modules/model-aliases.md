@@ -2,8 +2,8 @@
 
 ## Purpose
 
-Own account-scoped names for equivalent provider-specific model names without changing data-plane
-traffic.
+Own account-scoped names for equivalent provider-specific model names. Applying a name to a
+request is defined by the [model-rewrite design](./model-rewrite.md).
 
 ## Design
 
@@ -21,9 +21,10 @@ An administrator manages aliases for any account. A regular user manages only al
 session account. Ownership is immutable: moving an alias between accounts would make its identity and
 authorization history ambiguous, so a caller creates a new alias instead.
 
-The resource is deliberately absent from the data plane. No credential binds to an alias, no request
-snapshot contains one, and no proxy component looks one up. Reading or rewriting a `model` field
-requires a separate adapter and a later architectural decision.
+No credential binds to an alias, and an alias does not select a provider. The stored rows stay on
+the control plane. A request may freeze a projection of those names for the provider it has already
+resolved; the projection and the rewrite are defined by the
+[model-rewrite design](./model-rewrite.md). The proxy core does not look an alias up.
 
 ## Core flows
 
@@ -57,7 +58,9 @@ sequenceDiagram
 - An alias write is atomic: readers see either the old complete target set or the new complete set.
 - Referenced accounts and providers cannot be deleted. Removing the alias or target is explicit.
 - A regular user can neither read nor mutate another account's aliases.
-- Alias configuration never appears in data-plane snapshots, lifecycle events, logs, or metrics.
+- An account holds at most 100 aliases. The cap is what keeps a frozen projection bounded.
+- Stored alias rows are not copied into lifecycle events, logs, or metrics. A frozen projection may
+  hold the caller-facing name and the upstream model name, and those strings are not emitted.
 - Target order has no routing or scheduling meaning.
 
 ## Failures and bounds
@@ -66,5 +69,6 @@ sequenceDiagram
 - Empty, oversized, or duplicate target sets fail before persistence.
 - An unknown or disabled owner, or an unknown provider, fails the write.
 - A same-account name collision fails with a conflict; the same name under another account succeeds.
+- Creating an alias when the account already holds 100 fails with a conflict and stores nothing.
 - Lists are bounded and use increasing identifier cursors.
 - An empty partial update is rejected rather than treated as success.

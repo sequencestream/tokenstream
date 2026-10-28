@@ -59,6 +59,14 @@ use crate::telemetry::Metrics;
 const WEBSOCKET_VERSION: &str = "13";
 const MESSAGE_TOO_LARGE_CODE: u16 = 1009;
 const MESSAGE_TOO_LARGE_REASON: &str = "message exceeds configured limit";
+const MODEL_REJECT_CODE: u16 = 1008;
+
+/// A caller-supplied replacement for client text messages.
+///
+/// The relay applies it and does not interpret the text. `Ok(None)` keeps the
+/// original message. `Err` is a stable error code chosen by the caller; the
+/// relay uses that code as the close reason and does not inspect it.
+pub type ClientTextMap = Arc<dyn Fn(&str) -> Result<Option<String>, &'static str> + Send + Sync>;
 
 pub type RelayFuture = std::pin::Pin<Box<dyn std::future::Future<Output = RelayOutcome> + Send>>;
 
@@ -107,6 +115,10 @@ pub enum RelayOutcome {
     IdleTimeout,
     /// A transport or protocol error terminated the connection.
     Failed,
+    /// A caller-supplied text replacement refused the message.
+    ///
+    /// The string is a stable gateway error code and carries no payload.
+    ModelRejected(&'static str),
 }
 
 /// The WebSocket data-plane implementation and its immutable limits.
@@ -169,9 +181,10 @@ impl WebSocketProxy {
         query: Option<&str>,
         downstream_peer: SocketAddr,
         request: &mut Request<Incoming>,
+        text_map: Option<ClientTextMap>,
     ) -> Result<Handshake, GatewayError> {
         let (response, relay) = self
-            .prepare(snapshot, route, query, downstream_peer, request)
+            .prepare(snapshot, route, query, downstream_peer, request, text_map)
             .await?;
         Ok(Handshake {
             response,
@@ -187,6 +200,7 @@ impl WebSocketProxy {
         query: Option<&str>,
         downstream_peer: SocketAddr,
         request: &mut Request<Incoming>,
+        text_map: Option<ClientTextMap>,
     ) -> Result<(Response<HandshakeBody>, Option<RelayFuture>), GatewayError> {
         let downstream_key = single_header(request.headers(), SEC_WEBSOCKET_KEY)
             .ok_or(GatewayError::InvalidUpgrade)?
@@ -301,6 +315,7 @@ impl WebSocketProxy {
             upstream_connection,
             self.config,
             self.idle_timeout,
+            text_map,
         ));
         Ok((response, Some(relay)))
     }
@@ -316,6 +331,7 @@ impl WebSocketProxy {
         query: Option<&str>,
         downstream_peer: SocketAddr,
         request: &mut Request<Incoming>,
+        text_map: Option<ClientTextMap>,
         events: EventBus,
         metrics: Metrics,
         request_id: RequestId,
@@ -323,7 +339,7 @@ impl WebSocketProxy {
         let mut lifecycle = RequestLifecycle::start(events, metrics, request_id, snapshot, route)
             .observe_websocket();
         let handshake = match self
-            .handshake(snapshot, route, query, downstream_peer, request)
+            .handshake(snapshot, route, query, downstream_peer, request, text_map)
             .await
         {
             Ok(handshake) => handshake,
@@ -349,6 +365,7 @@ impl WebSocketProxy {
                     RelayOutcome::MessageTooLarge => Some("message_too_large"),
                     RelayOutcome::IdleTimeout => Some("idle_timeout"),
                     RelayOutcome::Failed => Some("relay_failed"),
+                    RelayOutcome::ModelRejected(code) => Some(code),
                 };
                 lifecycle.complete(Some(status), error);
                 outcome
@@ -485,6 +502,7 @@ async fn run_after_upgrade(
     >,
     config: WebSocketConfig,
     idle_timeout: Duration,
+    text_map: Option<ClientTextMap>,
 ) -> RelayOutcome {
     // Both handshakes finish independently, so neither peer waits on the other.
     // A downstream client that never completes its upgrade leaves the upstream
@@ -524,7 +542,7 @@ async fn run_after_upgrade(
         Some(config),
     )
     .await;
-    relay(downstream, upstream, idle_timeout).await
+    relay(downstream, upstream, idle_timeout, text_map).await
 }
 
 /// A socket preceded by bytes that were read past the handshake head.
@@ -717,6 +735,7 @@ pub async fn relay<D, U>(
     downstream: WebSocketStream<D>,
     upstream: WebSocketStream<U>,
     idle_timeout: Duration,
+    text_map: Option<ClientTextMap>,
 ) -> RelayOutcome
 where
     D: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -732,6 +751,7 @@ where
         idle_timeout,
         Arc::clone(&close_seen),
         activity.clone(),
+        text_map,
     );
     let upstream_to_downstream = relay_direction(
         upstream_read,
@@ -739,6 +759,7 @@ where
         idle_timeout,
         close_seen,
         activity,
+        None,
     );
     let idle = idle_deadline(activity_rx, idle_timeout);
     tokio::pin!(downstream_to_upstream, upstream_to_downstream, idle);
@@ -749,12 +770,34 @@ where
     }
 }
 
+enum TextDecision {
+    Keep,
+    Replace(String),
+    Reject(&'static str),
+}
+
+/// Applies a caller-supplied text replacement without the relay knowing why.
+fn rewrite_client_text(text_map: &Option<ClientTextMap>, message: &Message) -> TextDecision {
+    let Some(map) = text_map else {
+        return TextDecision::Keep;
+    };
+    let Message::Text(text) = message else {
+        return TextDecision::Keep;
+    };
+    match map(text.as_str()) {
+        Ok(None) => TextDecision::Keep,
+        Ok(Some(rewritten)) => TextDecision::Replace(rewritten),
+        Err(failure) => TextDecision::Reject(failure),
+    }
+}
+
 async fn relay_direction<R, W>(
     mut source: R,
     mut destination: W,
     idle_timeout: Duration,
     close_seen: Arc<AtomicBool>,
     activity: watch::Sender<u64>,
+    text_map: Option<ClientTextMap>,
 ) -> RelayOutcome
 where
     R: Stream<Item = Result<Message, WebSocketError>> + Unpin,
@@ -780,6 +823,14 @@ where
             }
             Some(Err(_)) => return RelayOutcome::Failed,
             Some(Ok(message)) => message,
+        };
+        let message = match rewrite_client_text(&text_map, &message) {
+            TextDecision::Keep => message,
+            TextDecision::Replace(rewritten) => Message::Text(rewritten.into()),
+            TextDecision::Reject(code) => {
+                let _ = close_sink(&mut destination, MODEL_REJECT_CODE, code, idle_timeout).await;
+                return RelayOutcome::ModelRejected(code);
+            }
         };
         activity.send_modify(|generation| *generation = generation.wrapping_add(1));
         let closed = message.is_close();

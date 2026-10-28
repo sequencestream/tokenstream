@@ -32,6 +32,7 @@ pub mod events;
 pub mod local_state;
 pub mod logging;
 pub mod model_aliases;
+pub mod model_rewrite;
 pub mod persistence;
 pub mod providers;
 pub mod proxy;

@@ -19,7 +19,9 @@ classification** has exactly four members: success, gateway failure, upstream fa
 cancellation.
 
 That classification is a total function over the fine failure-category set a request record and a
-gateway error already use, and is deliberately not the same set. The fine set is right for one row
+gateway error already use, and is deliberately not the same set. A model alias that cannot be
+applied to the selected provider, and a model field that cannot be rewritten unambiguously, are
+both gateway failures. The fine set is right for one row
 describing one exchange, where exactness is free. It is wrong for a metric, where the label is repeated
 across a time series and must be readable at a glance. The coarse set is what a threshold is written
 against; the fine set is what an investigation reads. Because the mapping is total, a rate over a coarse

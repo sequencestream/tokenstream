@@ -51,6 +51,10 @@ pub enum GatewayError {
     KeyExpired,
     /// The credential selected no provider and carries no default binding.
     NoProviderSelected,
+    /// The caller-facing name is an alias with no target for the selected provider.
+    ModelAliasUnavailable,
+    /// The top-level model field cannot be rewritten unambiguously.
+    InvalidModelField,
     /// The resolved provider is isolated or in a maintenance window.
     ProviderUnhealthy,
     /// The provider cannot serve the requested method, path, or transport.
@@ -79,6 +83,8 @@ impl GatewayError {
             Self::AccountDisabled => "account_disabled",
             Self::KeyExpired => "key_expired",
             Self::NoProviderSelected => "no_provider_selected",
+            Self::ModelAliasUnavailable => "model_alias_unavailable",
+            Self::InvalidModelField => "invalid_model_field",
             Self::UnsupportedRoute => "unsupported_route",
             Self::InvalidUpgrade => "invalid_upgrade",
             Self::UpstreamConnectFailed => "upstream_connect_failed",
@@ -98,6 +104,8 @@ impl GatewayError {
             Self::AccountDisabled => StatusCode::FORBIDDEN,
             Self::KeyExpired => StatusCode::UNAUTHORIZED,
             Self::NoProviderSelected => StatusCode::BAD_REQUEST,
+            Self::ModelAliasUnavailable => StatusCode::BAD_REQUEST,
+            Self::InvalidModelField => StatusCode::BAD_REQUEST,
             Self::UnsupportedRoute => StatusCode::NOT_FOUND,
             Self::InvalidUpgrade => StatusCode::BAD_REQUEST,
             Self::UpstreamConnectFailed => StatusCode::BAD_GATEWAY,
@@ -124,6 +132,8 @@ impl GatewayError {
             Self::AccountDisabled => ProxyFailureCategory::AccountDisabled,
             Self::KeyExpired => ProxyFailureCategory::KeyExpired,
             Self::NoProviderSelected => ProxyFailureCategory::NoProviderSelected,
+            Self::ModelAliasUnavailable => ProxyFailureCategory::ModelAliasUnavailable,
+            Self::InvalidModelField => ProxyFailureCategory::InvalidModelField,
             Self::UnsupportedRoute => ProxyFailureCategory::UnsupportedRoute,
             Self::InvalidUpgrade => ProxyFailureCategory::InvalidUpgrade,
             Self::UpstreamConnectFailed => ProxyFailureCategory::UpstreamConnectFailed,
@@ -145,6 +155,10 @@ impl GatewayError {
             Self::AccountDisabled => "The account is disabled.",
             Self::KeyExpired => "The gateway credential has expired.",
             Self::NoProviderSelected => "No provider is selected for this credential.",
+            Self::ModelAliasUnavailable => {
+                "The model alias is not available for the selected provider."
+            }
+            Self::InvalidModelField => "The model field cannot be rewritten.",
             Self::UnsupportedRoute => "The requested route is not available for this provider.",
             Self::InvalidUpgrade => "The requested WebSocket upgrade is not valid.",
             Self::UpstreamConnectFailed => "The upstream connection failed.",
@@ -261,6 +275,8 @@ mod tests {
             (GatewayError::AccountDisabled, 403),
             (GatewayError::KeyExpired, 401),
             (GatewayError::NoProviderSelected, 400),
+            (GatewayError::ModelAliasUnavailable, 400),
+            (GatewayError::InvalidModelField, 400),
             (GatewayError::UnsupportedRoute, 404),
             (GatewayError::InvalidUpgrade, 400),
             (GatewayError::UpstreamConnectFailed, 502),
@@ -292,6 +308,8 @@ mod tests {
             GatewayError::AccountDisabled,
             GatewayError::KeyExpired,
             GatewayError::NoProviderSelected,
+            GatewayError::ModelAliasUnavailable,
+            GatewayError::InvalidModelField,
             GatewayError::UnsupportedRoute,
             GatewayError::InvalidUpgrade,
             GatewayError::UpstreamConnectFailed,

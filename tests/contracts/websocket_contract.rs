@@ -25,7 +25,7 @@ use tokenstream::persistence::RepositoryError;
 use tokenstream::proxy::admission::ProxyLimits;
 use tokenstream::proxy::error::{ERROR_CONTENT_TYPE, GatewayError};
 use tokenstream::proxy::http::HttpProxy;
-use tokenstream::proxy::websocket::{RejectionBody, WebSocketProxy};
+use tokenstream::proxy::websocket::{ClientTextMap, RejectionBody, WebSocketProxy};
 use tokenstream::proxy::websocket::{RelayOutcome, relay};
 use tokenstream::routing::resolve_route;
 use tokenstream::telemetry::Metrics;
@@ -129,7 +129,14 @@ async fn spawn_gateway(upstream: SocketAddr) -> (SocketAddr, tokio::task::JoinHa
                 };
                 let query = request.uri().query().map(str::to_owned);
                 let response: Response<UnsyncBoxBody<Bytes, io::Error>> = match proxy
-                    .handshake(&snapshot, &route, query.as_deref(), peer, &mut request)
+                    .handshake(
+                        &snapshot,
+                        &route,
+                        query.as_deref(),
+                        peer,
+                        &mut request,
+                        None,
+                    )
                     .await
                 {
                     Ok(handshake) => boxed_handshake(handshake.into_response()),
@@ -505,6 +512,7 @@ async fn a_client_owned_http_fallback_is_a_second_independent_request() {
                                     query.as_deref(),
                                     peer,
                                     &mut request,
+                                    None,
                                     events,
                                     metrics,
                                     request_id.clone(),
@@ -641,6 +649,7 @@ async fn relay_preserves_simultaneous_messages_fragmentation_controls_and_close(
         downstream_proxy,
         upstream_proxy,
         Duration::from_secs(2),
+        None,
     ));
 
     let down_send = downstream_client.send(Message::text("toward upstream"));
@@ -727,6 +736,7 @@ async fn an_oversized_reassembled_message_closes_with_code_1009() {
         downstream_proxy,
         upstream_proxy,
         Duration::from_secs(1),
+        None,
     ));
 
     downstream_client
@@ -763,7 +773,13 @@ async fn a_completely_idle_connection_has_a_bounded_lifetime() {
     let (_downstream_client, downstream_proxy) = socket_pair(WebSocketConfig::default()).await;
     let (_upstream_peer, upstream_proxy) = socket_pair(WebSocketConfig::default()).await;
 
-    let outcome = relay(downstream_proxy, upstream_proxy, Duration::from_millis(25)).await;
+    let outcome = relay(
+        downstream_proxy,
+        upstream_proxy,
+        Duration::from_millis(25),
+        None,
+    )
+    .await;
     assert_eq!(outcome, RelayOutcome::IdleTimeout);
 }
 
@@ -775,6 +791,7 @@ async fn a_slow_destination_times_out_without_spawning_unbounded_work() {
         downstream_proxy,
         upstream_proxy,
         Duration::from_millis(40),
+        None,
     ));
     let producer = tokio::spawn(async move {
         loop {
@@ -1288,4 +1305,70 @@ async fn an_invalid_upstream_switch_does_not_complete_the_downstream_upgrade() {
             "{name} must not complete the downstream upgrade: {text}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_client_text_map_rewrites_text_and_closes_without_forwarding_a_rejection() {
+    let (mut downstream_client, downstream_proxy) = socket_pair(WebSocketConfig::default()).await;
+    let (mut upstream_peer, upstream_proxy) = socket_pair(WebSocketConfig::default()).await;
+    let text_map: ClientTextMap = Arc::new(|text| {
+        if text.contains("\"model\":\"coding\"") {
+            Ok(Some(text.replace(
+                "\"model\":\"coding\"",
+                "\"model\":\"gpt-5.2-codex\"",
+            )))
+        } else if text.contains("\"model\":\"writing\"") {
+            Err("model_alias_unavailable")
+        } else {
+            Ok(None)
+        }
+    });
+    let relay_task = tokio::spawn(relay(
+        downstream_proxy,
+        upstream_proxy,
+        Duration::from_secs(2),
+        Some(text_map),
+    ));
+
+    downstream_client
+        .send(Message::text(r#"{"model":"coding"}"#))
+        .await
+        .expect("send an alias frame");
+    let Message::Text(rewritten) = next_message(&mut upstream_peer).await else {
+        panic!("expected the rewritten text frame");
+    };
+    assert_eq!(rewritten.as_str(), r#"{"model":"gpt-5.2-codex"}"#);
+
+    upstream_peer
+        .send(Message::text(r#"{"model":"coding"}"#))
+        .await
+        .expect("send an upstream frame");
+    let Message::Text(echo) = next_message(&mut downstream_client).await else {
+        panic!("expected the upstream text frame");
+    };
+    assert_eq!(echo.as_str(), r#"{"model":"coding"}"#);
+
+    downstream_client
+        .send(Message::binary(Bytes::from_static(b"untouched")))
+        .await
+        .expect("send a binary frame");
+    let Message::Binary(binary) = next_message(&mut upstream_peer).await else {
+        panic!("expected the binary frame");
+    };
+    assert_eq!(&binary[..], b"untouched");
+
+    downstream_client
+        .send(Message::text(r#"{"model":"writing"}"#))
+        .await
+        .expect("send an unavailable alias");
+    let close = next_message(&mut upstream_peer).await;
+    let Message::Close(Some(frame)) = close else {
+        panic!("expected a close instead of the rejected text, got {close:?}");
+    };
+    assert_eq!(u16::from(frame.code), 1008);
+    assert_eq!(frame.reason, "model_alias_unavailable");
+    assert_eq!(
+        relay_task.await.expect("relay task"),
+        RelayOutcome::ModelRejected("model_alias_unavailable")
+    );
 }

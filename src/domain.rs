@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
@@ -852,8 +853,9 @@ impl ApiKeyWithBindings {
 
 /// Account-owned configuration for one caller-facing model name.
 ///
-/// This value is deliberately absent from request snapshots. It is durable
-/// control-plane state only and cannot affect a proxy exchange.
+/// The stored record stays on the control plane. A request snapshot carries a
+/// [`ModelAliasTable`] projection for the provider that request resolved to,
+/// not this record.
 #[derive(Clone, Debug)]
 pub struct ModelAlias {
     id: ModelAliasId,
@@ -945,6 +947,93 @@ impl ModelAliasWithTargets {
 
     pub fn into_parts(self) -> (ModelAlias, Vec<ModelAliasTarget>) {
         (self.alias, self.targets)
+    }
+}
+
+/// Why a caller-facing model name could not be replaced.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelRewriteFailure {
+    /// The name is an alias and the selected provider has no target for it.
+    Unavailable,
+    /// The top-level model field is not one unambiguous string.
+    Invalid,
+}
+
+impl ModelRewriteFailure {
+    /// Stable machine-readable code for this failure.
+    ///
+    /// The value is the gateway error code. It carries neither the alias name
+    /// nor the upstream model name.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unavailable => "model_alias_unavailable",
+            Self::Invalid => "invalid_model_field",
+        }
+    }
+}
+
+/// How a decoded top-level model string relates to the frozen alias table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AliasLookup<'a> {
+    /// The string is not an alias for this account.
+    Passthrough,
+    /// The string names an alias that has an upstream model for this provider.
+    Upstream(&'a str),
+    /// The string names an alias that does not target this provider.
+    Unavailable,
+}
+
+/// Alias names frozen for the one provider a request already resolved to.
+///
+/// Available entries map a caller-facing name to that provider's upstream model
+/// name. Unavailable entries are names the account owns that have no target for
+/// this provider. An empty table means the account has no aliases, and the
+/// rewrite adapter does not read the payload.
+///
+/// Debug output records only the sizes. The names are application payload and
+/// must not appear in a log line that prints the snapshot.
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ModelAliasTable {
+    available: HashMap<String, String>,
+    unavailable: HashSet<String>,
+}
+
+impl ModelAliasTable {
+    /// Whether the account had no aliases to freeze.
+    pub fn is_empty(&self) -> bool {
+        self.available.is_empty() && self.unavailable.is_empty()
+    }
+
+    pub fn insert_available(&mut self, name: String, upstream: String) {
+        self.unavailable.remove(&name);
+        self.available.insert(name, upstream);
+    }
+
+    pub fn insert_unavailable(&mut self, name: String) {
+        if !self.available.contains_key(&name) {
+            self.unavailable.insert(name);
+        }
+    }
+
+    /// Resolves one decoded model string against this provider's frozen names.
+    pub fn lookup<'a>(&'a self, name: &str) -> AliasLookup<'a> {
+        if let Some(upstream) = self.available.get(name) {
+            AliasLookup::Upstream(upstream.as_str())
+        } else if self.unavailable.contains(name) {
+            AliasLookup::Unavailable
+        } else {
+            AliasLookup::Passthrough
+        }
+    }
+}
+
+impl fmt::Debug for ModelAliasTable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ModelAliasTable")
+            .field("available", &self.available.len())
+            .field("unavailable", &self.unavailable.len())
+            .finish()
     }
 }
 
@@ -1066,6 +1155,7 @@ pub struct ProviderSnapshot {
     provider_admission: ProviderAdmission,
     credential_admission: CredentialAdmission,
     health: ProviderHealthState,
+    aliases: ModelAliasTable,
 }
 
 impl ProviderSnapshot {
@@ -1087,7 +1177,23 @@ impl ProviderSnapshot {
             provider_admission: ProviderAdmission::default(),
             credential_admission: CredentialAdmission::default(),
             health: ProviderHealthState::default(),
+            aliases: ModelAliasTable::default(),
         }
+    }
+
+    /// Freezes the alias names that apply to the provider this request resolved to.
+    ///
+    /// The table is copied into the snapshot once. A later alias edit cannot
+    /// change a request that already holds it, and an empty table tells the
+    /// rewrite adapter not to read the payload.
+    pub fn with_aliases(mut self, aliases: ModelAliasTable) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Alias names frozen for the provider this request resolved to.
+    pub fn aliases(&self) -> &ModelAliasTable {
+        &self.aliases
     }
 
     /// Freezes the provider's health state alongside the rest of the snapshot.

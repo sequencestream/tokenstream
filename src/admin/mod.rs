@@ -1569,6 +1569,11 @@ where
                 "model_alias_conflict",
                 "A model alias with this name already exists for the account.",
             ),
+            ModelAliasServiceError::Limit => api_error(
+                StatusCode::CONFLICT,
+                "model_alias_limit",
+                "The account has reached its model alias limit.",
+            ),
             ModelAliasServiceError::NotFound => api_error(
                 StatusCode::NOT_FOUND,
                 "model_alias_not_found",
