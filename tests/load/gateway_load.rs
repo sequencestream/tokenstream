@@ -20,7 +20,7 @@ fn real_process_sustains_mixed_load_with_bounded_memory() {
         .unwrap()
         .to_string();
     let output = std::process::Command::new("python3")
-        .arg("tests/gateway_load_profile.py")
+        .arg("tests/load/gateway_load_profile.py")
         .env("GATEWAY_BINARY", env!("CARGO_BIN_EXE_tokenstream"))
         .env("TEST_ADMIN_HASH", hash)
         .output()

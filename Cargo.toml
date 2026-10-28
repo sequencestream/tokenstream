@@ -36,3 +36,175 @@ zeroize = "1.8.2"
 proc-macro2 = "=1.0.106"
 syn = { version = "=2.0.119", features = ["full", "visit"] }
 tempfile = "3.23.0"
+
+[[test]]
+name = "anthropic_route_validation"
+path = "tests/unit/anthropic_route_validation.rs"
+
+[[test]]
+name = "gateway_credential"
+path = "tests/unit/gateway_credential.rs"
+
+[[test]]
+name = "header_policy"
+path = "tests/unit/header_policy.rs"
+
+[[test]]
+name = "route_validation"
+path = "tests/unit/route_validation.rs"
+
+[[test]]
+name = "target_joining"
+path = "tests/unit/target_joining.rs"
+
+[[test]]
+name = "upstream_key_encryption"
+path = "tests/unit/upstream_key_encryption.rs"
+
+[[test]]
+name = "credential_edit_repository"
+path = "tests/repository/credential_edit_repository.rs"
+
+[[test]]
+name = "model_alias_repository"
+path = "tests/repository/model_alias_repository.rs"
+
+[[test]]
+name = "postgres_migrations"
+path = "tests/repository/postgres_migrations.rs"
+
+[[test]]
+name = "provider_repository"
+path = "tests/repository/provider_repository.rs"
+
+[[test]]
+name = "request_log_repository"
+path = "tests/repository/request_log_repository.rs"
+
+[[test]]
+name = "sqlite_migrations"
+path = "tests/repository/sqlite_migrations.rs"
+
+[[test]]
+name = "storage_time"
+path = "tests/repository/storage_time.rs"
+
+[[test]]
+name = "admission_control"
+path = "tests/contracts/admission_control.rs"
+
+[[test]]
+name = "gateway_error_contract"
+path = "tests/contracts/gateway_error_contract.rs"
+
+[[test]]
+name = "http_connection_reuse"
+path = "tests/contracts/http_connection_reuse.rs"
+
+[[test]]
+name = "http_request_forwarding"
+path = "tests/contracts/http_request_forwarding.rs"
+
+[[test]]
+name = "http_response_streaming"
+path = "tests/contracts/http_response_streaming.rs"
+
+[[test]]
+name = "http_routes_contract"
+path = "tests/contracts/http_routes_contract.rs"
+
+[[test]]
+name = "layered_admission"
+path = "tests/contracts/layered_admission.rs"
+
+[[test]]
+name = "websocket_contract"
+path = "tests/contracts/websocket_contract.rs"
+
+[[test]]
+name = "credential_rotation"
+path = "tests/security/credential_rotation.rs"
+
+[[test]]
+name = "gateway_authentication"
+path = "tests/security/gateway_authentication.rs"
+
+[[test]]
+name = "security_regression"
+path = "tests/security/security_regression.rs"
+
+[[test]]
+name = "gateway_load"
+path = "tests/load/gateway_load.rs"
+
+[[test]]
+name = "release_load_profile"
+path = "tests/load/release_load_profile.rs"
+
+[[test]]
+name = "resource_budgets"
+path = "tests/load/resource_budgets.rs"
+
+[[test]]
+name = "lifecycle"
+path = "tests/process/lifecycle.rs"
+
+[[test]]
+name = "process_diagnostics"
+path = "tests/process/process_diagnostics.rs"
+
+[[test]]
+name = "production_gateway"
+path = "tests/process/production_gateway.rs"
+
+[[test]]
+name = "startup_config"
+path = "tests/process/startup_config.rs"
+
+[[test]]
+name = "admin_api"
+path = "tests/administration/admin_api.rs"
+
+[[test]]
+name = "admin_browser"
+path = "tests/administration/admin_browser.rs"
+
+[[test]]
+name = "admin_console"
+path = "tests/administration/admin_console.rs"
+
+[[test]]
+name = "credential_edit_service"
+path = "tests/administration/credential_edit_service.rs"
+
+[[test]]
+name = "provider_creation_service"
+path = "tests/administration/provider_creation_service.rs"
+
+[[test]]
+name = "provider_edit_delete_service"
+path = "tests/administration/provider_edit_delete_service.rs"
+
+[[test]]
+name = "provider_concurrent_edit"
+path = "tests/administration/provider_concurrent_edit.rs"
+
+[[test]]
+name = "logging_pipeline"
+path = "tests/observability/logging_pipeline.rs"
+
+[[test]]
+name = "observability_baseline"
+path = "tests/observability/observability_baseline.rs"
+
+[[test]]
+name = "observability_shutdown"
+path = "tests/observability/observability_shutdown.rs"
+
+[[test]]
+name = "provider_health"
+path = "tests/observability/provider_health.rs"
+
+[[test]]
+name = "architecture"
+path = "tests/architecture/architecture.rs"

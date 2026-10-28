@@ -18,6 +18,7 @@ use tokenstream::providers::{
     CreateProviderRequest, ProviderService, ProviderServiceError, UpdateProviderRequest,
 };
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::bootstrap_account;
 

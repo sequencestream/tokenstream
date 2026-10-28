@@ -23,6 +23,7 @@ use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{NewProvider, ProviderRepository, ProviderUpdate, RepositoryError};
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::require_postgres_url;
 

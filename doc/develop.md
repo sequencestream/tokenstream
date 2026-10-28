@@ -208,3 +208,22 @@ Pull requests and pushes to `develop` or `main` run CI: frontend checks and buil
 Each archive contains one gateway binary with the administration page included.
 
 Design reference: [Architecture](./architecture.md), [module designs](./modules/), and [ADRs](./adr/).
+
+## Core protocol verification
+
+Run `make run-core-protocol-test` to execute core verification and real-upstream checks for OpenAI Chat Completions, OpenAI Responses, and Anthropic Messages in ordinary HTTP and SSE modes. Python 3 and the release-gate prerequisites above are required. The command starts an isolated local gateway with temporary storage and credentials, then removes that state on exit. It does not use an existing gateway's accounts or providers.
+
+Supply local settings in `tests/test-keys.env` (ignored by Git):
+
+```dotenv
+DEEPSEEK_API_KEY=your-real-key
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_OPENAI_URL=https://api.deepseek.com
+DEEPSEEK_ANTHROPIC_URL=https://api.deepseek.com/anthropic
+```
+
+Values may be quoted; comments and an optional `export` prefix are accepted. The file is parsed as data without shell execution. URLs are HTTPS origins with optional base-path prefixes; the API route is appended, so do not add `/v1` to an origin unless that prefix is required by the upstream. Live calls consume provider quota.
+
+Each run writes `dist/report/core-protocol-test-yyyyMMddHHmmss.md`, including failures. Reports contain check outcomes, HTTP statuses, durations and byte counts, without keys, bodies or raw diagnostic output. A nonzero exit means verification is incomplete or failed.
+
+Direct upstream and gateway calls validate response structure and SSE completion independently. Upstream refusal, including an unsupported Responses endpoint, is reported explicitly and never counts as successful API coverage. The gateway performs no protocol conversion. Invalid-model probes compare upstream and gateway error status, media type and stable error type, code and parameter fields. Error messages can contain request-specific metadata, so differences between independent live responses are recorded without asserting byte equality. Controlled contract tests supply deterministic byte-transparency, streaming, cancellation and WebSocket evidence; real-provider WebSocket generation is not exercised by the live probes. Core verification includes unit tests, repositories, HTTP/WebSocket contracts, security, load and pinned clients, along with frontend and static checks. It excludes administration browser acceptance, which remains mandatory in the unchanged full release gate (`make gate`). Test failures are collected without stopping the remaining core test stages, and live probes still run. Any failed stage keeps the overall result incomplete. Setup failures can prevent dependent stages from running.

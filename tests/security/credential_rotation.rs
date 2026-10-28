@@ -9,6 +9,7 @@ use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::persistence::{ApiKeyRepository, ProviderRepository};
 use tokenstream::providers::{CreateProviderRequest, ProviderService};
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::bootstrap_account;
 

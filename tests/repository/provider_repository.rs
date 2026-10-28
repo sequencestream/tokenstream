@@ -14,6 +14,7 @@ use tokenstream::persistence::{
 };
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{key_id, require_postgres_url};
 

@@ -9,6 +9,7 @@ use tokenstream::domain::{
 use tokenstream::persistence::sqlite::SqliteDatabase;
 use tokenstream::providers::{CreateProviderRequest, ProviderService, UpdateProviderRequest};
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::{bootstrap_account, issue_api_key};
 use tokenstream::proxy::error::GatewayError;

@@ -33,6 +33,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::bootstrap_account;
 

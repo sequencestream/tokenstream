@@ -19,6 +19,7 @@ const MASTER_KEY: [u8; 32] = [0x5c; 32];
 const UPSTREAM_KEY: &str = "sk-upstream-secret-value";
 const ROTATED_UPSTREAM_KEY: &str = "sk-rotated-secret-value";
 
+#[path = "../support/mod.rs"]
 mod support;
 
 use support::{bootstrap_account, issue_api_key, render};

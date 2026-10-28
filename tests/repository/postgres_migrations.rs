@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use sqlx::{PgPool, Row};
 use tokenstream::persistence::postgres::PostgresDatabase;
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::require_postgres_url;
 

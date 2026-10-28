@@ -2,7 +2,7 @@
 
 .PHONY: help lint fmt fmt-check clippy arch-check \
   web-deps web-check web-test web-build \
-  test test-unit test-web test-compat \
+  test test-unit test-web test-compat run-core-protocol-test \
   build package gate ci run clean
 
 help:
@@ -21,6 +21,7 @@ help:
 	@echo "  test-unit    Library unit tests only"
 	@echo "  test-web     Administration page unit tests"
 	@echo "  test-compat  Pinned client compatibility suite"
+	@echo "  run-core-protocol-test  Core verification plus live API probes and Markdown report"
 	@echo ""
 	@echo "Build"
 	@echo "  build        Release binary with the administration page"
@@ -72,6 +73,9 @@ test-web:
 test-compat:
 	npm --prefix compatibility ci --ignore-scripts
 	npm --prefix compatibility test
+
+run-core-protocol-test:
+	python3 tests/live/core_protocol_test.py
 
 build:
 	./scripts/build.sh

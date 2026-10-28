@@ -35,6 +35,7 @@ use tokenstream::telemetry::Metrics;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "../support/mod.rs"]
 mod support;
 use support::bootstrap_account;
 
