@@ -383,20 +383,17 @@ async fn a_snapshot_freezes_alias_names_for_the_selected_provider() {
         .await
         .expect("create alias without the first provider");
 
-    let snapshot = authenticator
-        .authenticate(&with_selection(&credential, first.id().get()))
+    let (snapshot, frozen_aliases) = authenticator
+        .prepare(&with_selection(&credential, first.id().get()))
         .await
         .expect("authenticate the first provider");
     assert_eq!(
-        snapshot.aliases().lookup("coding"),
+        frozen_aliases.lookup("coding"),
         AliasLookup::Upstream("gpt-5.2-codex")
     );
+    assert_eq!(frozen_aliases.lookup("writing"), AliasLookup::Unavailable);
     assert_eq!(
-        snapshot.aliases().lookup("writing"),
-        AliasLookup::Unavailable
-    );
-    assert_eq!(
-        snapshot.aliases().lookup("gpt-5.2-codex"),
+        frozen_aliases.lookup("gpt-5.2-codex"),
         AliasLookup::Passthrough
     );
     let rendered = format!("{snapshot:?}");
@@ -415,28 +412,28 @@ async fn a_snapshot_freezes_alias_names_for_the_selected_provider() {
         .await
         .expect("edit the alias after the snapshot");
     assert_eq!(
-        snapshot.aliases().lookup("coding"),
+        frozen_aliases.lookup("coding"),
         AliasLookup::Upstream("gpt-5.2-codex")
     );
 
-    let refreshed = authenticator
-        .authenticate(&with_selection(&credential, first.id().get()))
+    let (_, refreshed_aliases) = authenticator
+        .prepare(&with_selection(&credential, first.id().get()))
         .await
         .expect("authenticate after the edit");
     assert_eq!(
-        refreshed.aliases().lookup("coding"),
+        refreshed_aliases.lookup("coding"),
         AliasLookup::Upstream("gpt-5.3-codex")
     );
-    let other = authenticator
-        .authenticate(&with_selection(&credential, second.id().get()))
+    let (_, other_aliases) = authenticator
+        .prepare(&with_selection(&credential, second.id().get()))
         .await
         .expect("authenticate the second provider");
     assert_eq!(
-        other.aliases().lookup("coding"),
+        other_aliases.lookup("coding"),
         AliasLookup::Upstream("claude-sonnet")
     );
     assert_eq!(
-        other.aliases().lookup("writing"),
+        other_aliases.lookup("writing"),
         AliasLookup::Upstream("claude-opus")
     );
 }

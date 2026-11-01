@@ -546,3 +546,115 @@ fn contains_exact_string(value: &Value, needle: &str) -> bool {
         _ => false,
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recovers_pending_master_keys_before_binding_and_rejects_unrelated_keys() {
+    use tokenstream::crypto::{KeyGeneration, KeyRing, SecretCipher};
+    use tokenstream::domain::{ProtocolType, ProviderStatus, SecretString};
+    use tokenstream::persistence::sqlite::SqliteDatabase;
+    use tokenstream::persistence::{ProviderRepository, ProviderUpdate};
+    use tokenstream::providers::{CreateProviderRequest, ProviderService};
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}",
+        directory.path().join("recovery.db").display()
+    );
+    let database = SqliteDatabase::connect(&url, 2).await.unwrap();
+    database.migrate().await.unwrap();
+    let service = ProviderService::new(
+        database.clone(),
+        tokenstream::crypto::AesGcmCipher::new(&[0x11; 32]),
+        false,
+    );
+    let mut ids = Vec::new();
+    for name in ["first", "second"] {
+        ids.push(
+            service
+                .create(CreateProviderRequest::new(
+                    name.to_owned(),
+                    ProtocolType::OpenAi,
+                    "https://upstream.example".to_owned(),
+                    SecretString::new("upstream-recovery-secret"),
+                    ProviderStatus::Enabled,
+                ))
+                .await
+                .unwrap()
+                .id(),
+        );
+    }
+    let ring = KeyRing {
+        current: KeyGeneration {
+            version: 2,
+            key: [0x22; 32],
+        },
+        previous: Some(KeyGeneration {
+            version: 1,
+            key: [0x11; 32],
+        }),
+    };
+    let record = tokenstream::local_state::KeyRotationRecord::new(ring, &url).unwrap();
+    tokenstream::local_state::save_key_rotation(directory.path(), &record).unwrap();
+    let migrated = record
+        .ring
+        .current
+        .cipher()
+        .encrypt(&SecretString::new("upstream-recovery-secret"))
+        .unwrap();
+    ProviderRepository::update(
+        &database,
+        ids[0],
+        ProviderUpdate::new().with_upstream_api_key_ciphertext(migrated),
+    )
+    .await
+    .unwrap();
+    let data = unused_loopback_address();
+    let admin = unused_loopback_address();
+    let mut child = gateway_command(directory.path(), data, admin)
+        .env("TOKENSTREAM_DATABASE_URL", &url)
+        .env("TOKENSTREAM_ADMIN_PASSWORD", "recovery-admin-password")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until_listening(&mut child, data);
+    assert!(
+        tokenstream::local_state::load_key_rotation(directory.path())
+            .unwrap()
+            .unwrap()
+            .complete
+    );
+    for id in ids {
+        let stored = ProviderRepository::find_by_id(&database, id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            stored
+                .upstream_api_key_ciphertext()
+                .expose()
+                .starts_with("v2.")
+        );
+        assert_eq!(
+            record
+                .ring
+                .decrypt(stored.upstream_api_key_ciphertext())
+                .unwrap()
+                .expose(),
+            "upstream-recovery-secret"
+        );
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let data = unused_loopback_address();
+    let admin = unused_loopback_address();
+    let mut unrelated = gateway_command(directory.path(), data, admin)
+        .env("TOKENSTREAM_DATABASE_URL", &url)
+        .env("TOKENSTREAM_MASTER_KEY", "33".repeat(32))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(!wait_until_exit(&mut unrelated).success());
+    assert!(TcpStream::connect(data).is_err());
+    assert!(TcpStream::connect(admin).is_err());
+}

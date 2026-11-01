@@ -277,50 +277,182 @@ where
         &self.cipher
     }
 
-    /// Decrypts every stored upstream key with the current cipher and seals it with `next`.
-    pub async fn reencrypt_upstream_keys<N: SecretCipher>(
+    /// Restores the durable two-generation state and resumes before serving traffic.
+    pub async fn recover_master_key(
         &self,
-        next: &N,
+        config: &crate::config::Config,
     ) -> Result<(), ProviderServiceError> {
+        let Some(dir) = config.data_dir() else {
+            return Ok(());
+        };
+        let Some(mut record) =
+            crate::local_state::load_key_rotation(dir).map_err(|_| ProviderServiceError::Cipher)?
+        else {
+            return Ok(());
+        };
+        if !record.validates(config.database_url().expose(), config.master_key().expose()) {
+            return Err(ProviderServiceError::Cipher);
+        }
+        let shared = self
+            .cipher
+            .shared_cipher()
+            .ok_or(ProviderServiceError::Cipher)?;
+        shared.install_ring(record.ring.clone());
+        if !record.complete {
+            self.migrate_master_key().await?;
+            record.complete = true;
+            crate::local_state::save_key_rotation(dir, &record)
+                .map_err(|_| ProviderServiceError::Storage)?;
+        }
+        crate::local_state::save_master_key_file(
+            dir,
+            &crate::local_state::encode_master_key(&record.ring.current.key),
+        )
+        .map_err(|_| ProviderServiceError::Storage)?;
+        Ok(())
+    }
+
+    /// Serializes secret writers while readers continue to use both generations.
+    pub async fn rotate_master_key(
+        &self,
+        config: &crate::config::Config,
+        key: &[u8; 32],
+    ) -> Result<(), ProviderServiceError> {
+        let dir = config.data_dir().ok_or(ProviderServiceError::Cipher)?;
+        let shared = self
+            .cipher
+            .shared_cipher()
+            .ok_or(ProviderServiceError::Cipher)?;
+        let _writers = shared.try_rotation().map_err(map_cipher_error)?;
+        self.repository
+            .settle_secret_writes(config.admin_db_timeout())
+            .await
+            .map_err(map_repository_error)?;
+        let existing =
+            crate::local_state::load_key_rotation(dir).map_err(|_| ProviderServiceError::Cipher)?;
+        let ring = shared.ring();
+        if existing.as_ref().is_some_and(|record| {
+            !record.validates(config.database_url().expose(), &ring.current.key)
+        }) {
+            return Err(ProviderServiceError::Cipher);
+        }
+        let mut record = if let Some(record) = existing.filter(|record| !record.complete) {
+            if !record.validates(config.database_url().expose(), &ring.current.key)
+                || &record.ring.current.key != key
+            {
+                return Err(ProviderServiceError::Conflict);
+            }
+            record
+        } else {
+            if &ring.current.key == key {
+                crate::local_state::save_master_key_file(
+                    dir,
+                    &crate::local_state::encode_master_key(key),
+                )
+                .map_err(|_| ProviderServiceError::Storage)?;
+                return Ok(());
+            }
+            if config.external_master_key() && config.master_key().expose() != &ring.current.key {
+                return Err(ProviderServiceError::Conflict);
+            }
+            let ring = crate::crypto::KeyRing {
+                current: crate::crypto::KeyGeneration {
+                    version: ring
+                        .current
+                        .version
+                        .checked_add(1)
+                        .ok_or(ProviderServiceError::Cipher)?,
+                    key: *key,
+                },
+                previous: Some(ring.current.clone()),
+            };
+            crate::local_state::KeyRotationRecord::new(ring, config.database_url().expose())
+                .map_err(|_| ProviderServiceError::Cipher)?
+        };
+        // Waiting for old readers is bounded. New readers shed rather than queue.
+        let readers = tokio::time::timeout(config.admin_db_timeout(), shared.retire_readers())
+            .await
+            .map_err(|_| ProviderServiceError::Busy)?;
+        crate::local_state::save_key_rotation(dir, &record)
+            .map_err(|_| ProviderServiceError::Storage)?;
+        shared.install_ring(record.ring.clone());
+        drop(readers);
+        self.migrate_master_key().await?;
+        record.complete = true;
+        crate::local_state::save_key_rotation(dir, &record)
+            .map_err(|_| ProviderServiceError::Storage)?;
+        crate::local_state::save_master_key_file(
+            dir,
+            &crate::local_state::encode_master_key(&record.ring.current.key),
+        )
+        .map_err(|_| ProviderServiceError::Storage)?;
+        Ok(())
+    }
+
+    async fn migrate_master_key(&self) -> Result<(), ProviderServiceError> {
+        let shared = self
+            .cipher
+            .shared_cipher()
+            .ok_or(ProviderServiceError::Cipher)?;
+        let current = shared.ring().current;
+        let prefix = format!("v{}.", current.version);
         let mut after_id = None;
         loop {
             let page = self
                 .repository
                 .list(
                     ProviderListRequest::new(after_id, crate::persistence::MAX_PROVIDER_PAGE_SIZE)
-                        .expect("page size is in range"),
+                        .expect("bounded page"),
                 )
                 .await
                 .map_err(map_repository_error)?;
-            let has_more = page.has_more();
-            let next_cursor = page.next_after_id();
-            let items = page.into_items();
-            if items.is_empty() {
-                break;
-            }
-            for provider in items {
+            let more = page.has_more();
+            after_id = page.next_after_id();
+            for provider in page.into_items() {
+                if provider
+                    .upstream_api_key_ciphertext()
+                    .expose()
+                    .starts_with(&prefix)
+                {
+                    continue;
+                }
                 let plaintext = self
                     .cipher
                     .decrypt(provider.upstream_api_key_ciphertext())
                     .map_err(|_| ProviderServiceError::Cipher)?;
-                let ciphertext = next
+                let ciphertext = current
+                    .cipher()
                     .encrypt(&plaintext)
                     .map_err(|_| ProviderServiceError::Cipher)?;
-                self.repository
+                match self
+                    .repository
                     .update(
                         provider.id(),
-                        crate::persistence::ProviderUpdate::new()
-                            .with_upstream_api_key_ciphertext(ciphertext),
+                        ProviderUpdate::new().with_upstream_api_key_ciphertext(ciphertext),
                     )
                     .await
-                    .map_err(map_repository_error)?;
+                {
+                    Ok(_) => (),
+                    Err(RepositoryError::NotFound) => {
+                        // Some backends map constraint failures to NotFound too.
+                        // Only a provider actually deleted during the scan may be skipped.
+                        if self
+                            .repository
+                            .find_by_id(provider.id())
+                            .await
+                            .map_err(map_repository_error)?
+                            .is_some()
+                        {
+                            return Err(ProviderServiceError::Storage);
+                        }
+                    }
+                    Err(error) => return Err(map_repository_error(error)),
+                }
             }
-            if !has_more {
-                break;
+            if !more {
+                return Ok(());
             }
-            after_id = next_cursor;
         }
-        Ok(())
     }
 
     /// Builds a service over the given storage and cryptographic collaborators.
@@ -362,6 +494,7 @@ where
         &self,
         request: CreateProviderRequest,
     ) -> Result<Provider, ProviderServiceError> {
+        let _writer = self.cipher.secret_writer().map_err(map_cipher_error)?;
         let name = validate_name(&request.name)?;
         let endpoint = validate_endpoint(&request.endpoint, self.allow_insecure_endpoints)?;
         validate_upstream_api_key(&request.upstream_api_key)?;
@@ -402,6 +535,11 @@ where
         id: ProviderId,
         request: UpdateProviderRequest,
     ) -> Result<Provider, ProviderServiceError> {
+        let _writer = if request.upstream_api_key.is_some() {
+            self.cipher.secret_writer().map_err(map_cipher_error)?
+        } else {
+            None
+        };
         let mut update = ProviderUpdate::new();
         if let Some(name) = request.name {
             update = update.with_name(validate_name(&name)?);
@@ -560,6 +698,13 @@ fn map_repository_error(error: RepositoryError) -> ProviderServiceError {
 }
 
 pub mod health;
+
+fn map_cipher_error(error: crate::crypto::CipherError) -> ProviderServiceError {
+    match error {
+        crate::crypto::CipherError::Busy => ProviderServiceError::Busy,
+        _ => ProviderServiceError::Cipher,
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -169,12 +169,12 @@ impl RequestLifecycle {
     }
 
     /// Emits the finished point at most once and records the matching metric.
-    pub fn complete(&mut self, status: Option<StatusCode>, error: Option<&'static str>) {
+    pub fn complete(&mut self, status: Option<StatusCode>, error: Option<ProxyFailureCategory>) {
         let (Some(request_id), Some(transport)) = (self.request_id.take(), self.transport.take())
         else {
             return;
         };
-        let outcome = error.and_then(failure_category);
+        let outcome = error;
         let elapsed = self.started.elapsed();
         let _ = self.bus.emit(LifecycleEvent::Finished(Finished {
             request_id,
@@ -194,30 +194,6 @@ impl RequestLifecycle {
         self.metrics.record_exchange(recorded, elapsed);
         self.active.take();
     }
-}
-
-fn failure_category(error: &str) -> Option<ProxyFailureCategory> {
-    Some(match error {
-        "invalid_gateway_credential" => ProxyFailureCategory::InvalidGatewayCredential,
-        "provider_disabled" => ProxyFailureCategory::ProviderDisabled,
-        "account_disabled" => ProxyFailureCategory::AccountDisabled,
-        "key_expired" => ProxyFailureCategory::KeyExpired,
-        "no_provider_selected" => ProxyFailureCategory::NoProviderSelected,
-        "model_alias_unavailable" => ProxyFailureCategory::ModelAliasUnavailable,
-        "invalid_model_field" => ProxyFailureCategory::InvalidModelField,
-        "unsupported_route" => ProxyFailureCategory::UnsupportedRoute,
-        "invalid_upgrade" => ProxyFailureCategory::InvalidUpgrade,
-        "upstream_connect_failed" => ProxyFailureCategory::UpstreamConnectFailed,
-        "upstream_timeout" | "idle_timeout" => ProxyFailureCategory::UpstreamTimeout,
-        "connection_limit_reached" => ProxyFailureCategory::ConnectionLimitReached,
-        "resource_exhausted" => ProxyFailureCategory::ResourceExhausted,
-        "internal_error" => ProxyFailureCategory::InternalError,
-        "stream_failed" => ProxyFailureCategory::StreamFailed,
-        "downstream_cancelled" => ProxyFailureCategory::DownstreamCancelled,
-        "message_too_large" => ProxyFailureCategory::MessageTooLarge,
-        "relay_failed" => ProxyFailureCategory::RelayFailed,
-        _ => return None,
-    })
 }
 
 /// Response-body observer that completes a lifecycle on EOF, failure, or cancellation.
@@ -246,7 +222,7 @@ where
         body
     }
 
-    fn finish(&mut self, error: Option<&'static str>) {
+    fn finish(&mut self, error: Option<ProxyFailureCategory>) {
         if !self.finished {
             self.finished = true;
             drop(self.inner.take());
@@ -276,7 +252,7 @@ where
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Err(error))) => {
-                this.finish(Some("stream_failed"));
+                this.finish(Some(ProxyFailureCategory::StreamFailed));
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(Some(Ok(frame))) => {
@@ -307,8 +283,10 @@ impl<B> Drop for ObservedBody<B> {
         if !self.finished {
             self.finished = true;
             drop(self.inner.take());
-            self.lifecycle
-                .complete(Some(self.status), Some("downstream_cancelled"));
+            self.lifecycle.complete(
+                Some(self.status),
+                Some(ProxyFailureCategory::DownstreamCancelled),
+            );
         }
     }
 }

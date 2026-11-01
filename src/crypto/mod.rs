@@ -14,7 +14,7 @@ pub use password_work::{PasswordWork, PasswordWorkError};
 use std::error::Error;
 use std::fmt;
 
-pub use aes_gcm::{AesGcmCipher, KEY_VERSION, SharedCipher};
+pub use aes_gcm::{AesGcmCipher, KEY_VERSION, KeyGeneration, KeyRing, SharedCipher};
 pub use gateway_secret::Argon2GatewaySecretVerifier;
 
 use crate::domain::{GatewayCredential, PasswordHash, SecretCiphertext, SecretString};
@@ -27,9 +27,18 @@ pub trait SecretCipher: Send + Sync {
     /// Opens a ciphertext envelope previously produced by [`SecretCipher::encrypt`].
     fn decrypt(&self, ciphertext: &SecretCiphertext) -> Result<SecretString, CipherError>;
 
-    /// Replaces the in-memory master key after stored secrets have been re-encrypted.
-    fn install_master_key(&self, key: &[u8; 32]) {
-        let _ = key;
+    fn shared_cipher(&self) -> Option<SharedCipher> {
+        None
+    }
+
+    /// New readers fail immediately while a retiring generation is being replaced.
+    fn secret_reader(&self) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, CipherError> {
+        Ok(None)
+    }
+
+    /// Covers encryption through persistence, so a scan cannot miss an old write.
+    fn secret_writer(&self) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, CipherError> {
+        Ok(None)
     }
 }
 
@@ -39,6 +48,7 @@ pub trait SecretCipher: Send + Sync {
 /// be logged or surfaced without its cause leaking through diagnostic output.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CipherError {
+    Busy,
     /// Sealing a plaintext value failed.
     Encryption,
     /// A value is malformed, uses an unsupported key version, or failed authentication.
@@ -50,6 +60,7 @@ pub enum CipherError {
 impl fmt::Display for CipherError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let message = match self {
+            Self::Busy => "secret operation is busy",
             Self::Encryption => "secret encryption failed",
             Self::Decryption => "secret decryption failed",
             Self::InvalidKey => "master key is invalid",

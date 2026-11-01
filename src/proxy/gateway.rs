@@ -50,7 +50,10 @@ fn text_map(table: &ModelAliasTable) -> Option<ClientTextMap> {
     } else {
         let table = table.clone();
         Some(Arc::new(move |text| {
-            rewrite_text(&table, text).map_err(ModelRewriteFailure::code)
+            rewrite_text(&table, text).map_err(|error| match error {
+                ModelRewriteFailure::Unavailable => ProxyFailureCategory::ModelAliasUnavailable,
+                ModelRewriteFailure::Invalid => ProxyFailureCategory::InvalidModelField,
+            })
         }))
     }
 }
@@ -75,6 +78,13 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     body.map_err(Into::into).boxed_unsync()
+}
+
+/// Only preparation can return an unrecorded error. An admitted exchange owns
+/// its terminal observation and returns an already settled response instead.
+enum PreparationFailure {
+    Failed(GatewayError, TransportType),
+    Refused(GatewayError),
 }
 
 pub struct Gateway {
@@ -162,24 +172,24 @@ impl Gateway {
         peer: SocketAddr,
         permit: AdmissionPermit,
         id: RequestId,
-    ) -> Result<Exchange, (GatewayError, TransportType)> {
+    ) -> Result<Exchange, PreparationFailure> {
         // A request that never resolves a route has no transport, so every
         // failure this can return carries the transport it was decided under.
         // A failure before the route resolves is an HTTP request by definition:
         // a WebSocket exchange cannot exist without a resolved upgrade route.
         let transport = TransportType::Http;
-        let snapshot = self
+        let (snapshot, aliases) = self
             .authenticator
-            .authenticate(request.headers())
+            .prepare(request.headers())
             .await
-            .map_err(|error| (GatewayError::from(error), transport))?;
+            .map_err(|error| PreparationFailure::Failed(GatewayError::from(error), transport))?;
         let route = resolve_route(
             snapshot.protocol_type(),
             request.method(),
             request.uri().path(),
             request.headers(),
         )
-        .map_err(|error| (GatewayError::from(error), transport))?;
+        .map_err(|error| PreparationFailure::Failed(GatewayError::from(error), transport))?;
         let transport = route.transport();
         let query = request.uri().query().map(str::to_owned);
 
@@ -188,31 +198,43 @@ impl Gateway {
             // accept does not consume a rate slot, and before any upstream
             // connection. An empty alias table does not read the body.
             let (mut parts, body) = request.into_parts();
-            let rewritten = prepare(snapshot.aliases(), body)
-                .await
-                .map_err(|error| (rewrite_error(error), transport))?;
+            let rewritten =
+                tokio::time::timeout(self.settings.idle_timeout, prepare(&aliases, body))
+                    .await
+                    .map_err(|_| {
+                        PreparationFailure::Failed(GatewayError::UpstreamTimeout, transport)
+                    })?
+                    .map_err(|error| PreparationFailure::Failed(rewrite_error(error), transport))?;
             if rewritten.length_changed() {
                 align_content_length(&mut parts.headers, rewritten.size_hint());
             }
             let request = Request::from_parts(parts, rewritten);
             let slots = Arc::new(
                 self.admit_layers(&snapshot, transport)
-                    .map_err(|error| (error, transport))?,
+                    .map_err(PreparationFailure::Refused)?,
             );
-            let response = self
+            let mut lifecycle = RequestLifecycle::start(
+                self.events.clone(),
+                self.metrics.clone(),
+                id.clone(),
+                &snapshot,
+                &route,
+            )
+            .observe_http();
+            let response = match self
                 .http
-                .forward_logged(
-                    &snapshot,
-                    &route,
-                    query.as_deref(),
-                    peer,
-                    request,
-                    self.events.clone(),
-                    self.metrics.clone(),
-                    id,
-                )
+                .forward(&snapshot, &route, query.as_deref(), peer, request)
                 .await
-                .map_err(|error| (error, transport))?;
+            {
+                Ok(upstream) => {
+                    lifecycle.observe_upstream(Some(upstream.status()));
+                    observe_response(self.http.relay_response(upstream), lifecycle)
+                }
+                Err(error) => {
+                    lifecycle.complete(None, Some(error.category()));
+                    return Ok((error_response(error, &id), None));
+                }
+            };
             return Ok((
                 response.map(|body| {
                     boxed(PermittedBody {
@@ -231,12 +253,12 @@ impl Gateway {
         // outer layer already took.
         let slots = self
             .admit_layers(&snapshot, transport)
-            .map_err(|error| (error, transport))?;
+            .map_err(PreparationFailure::Refused)?;
         let slots = Arc::new(slots);
         let mut lifecycle = RequestLifecycle::start(
             self.events.clone(),
             self.metrics.clone(),
-            id,
+            id.clone(),
             &snapshot,
             &route,
         )
@@ -249,7 +271,7 @@ impl Gateway {
                 query.as_deref(),
                 peer,
                 &mut request,
-                text_map(snapshot.aliases()),
+                text_map(&aliases),
             )
             .await
         {
@@ -257,11 +279,12 @@ impl Gateway {
             Err(error) => {
                 // The lifecycle records this terminal point itself, including
                 // the exchange outcome, so the caller must not count it again.
-                lifecycle.complete(None, Some(error.code()));
-                return Err((error, transport));
+                lifecycle.complete(None, Some(error.category()));
+                return Ok((error_response(error, &id), None));
             }
         };
         let status = response.status();
+        lifecycle.observe_upstream(Some(status));
         match relay {
             None => Ok((
                 observe_response(response, lifecycle).map(|inner| {
@@ -280,9 +303,11 @@ impl Gateway {
                     let outcome = relay.await;
                     let error = match outcome {
                         RelayOutcome::Closed => None,
-                        RelayOutcome::MessageTooLarge => Some("message_too_large"),
-                        RelayOutcome::IdleTimeout => Some("idle_timeout"),
-                        RelayOutcome::Failed => Some("relay_failed"),
+                        RelayOutcome::MessageTooLarge => {
+                            Some(ProxyFailureCategory::MessageTooLarge)
+                        }
+                        RelayOutcome::IdleTimeout => Some(ProxyFailureCategory::UpstreamTimeout),
+                        RelayOutcome::Failed => Some(ProxyFailureCategory::RelayFailed),
                         RelayOutcome::ModelRejected(code) => Some(code),
                     };
                     lifecycle.complete(Some(status), error);
@@ -389,7 +414,13 @@ impl crate::DataPlaneService for Gateway {
         let started = std::time::Instant::now();
         let mut result = match self.forward(request, peer, permit, id.clone()).await {
             Ok(result) => result,
-            Err((error, transport)) => {
+            Err(failure) => {
+                let (error, transport) = match failure {
+                    PreparationFailure::Failed(error, transport) => (error, transport),
+                    PreparationFailure::Refused(error) => {
+                        return with_request_id((error_response(error, &id), None), &id);
+                    }
+                };
                 // Health isolation is a refusal before an exchange exists. It
                 // has its own counter and must not contribute a latency sample
                 // or inflate the gateway-failure rate.

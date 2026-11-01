@@ -203,6 +203,26 @@ impl MigrationRunner for PostgresDatabase {
 }
 
 impl ProviderRepository for PostgresDatabase {
+    async fn settle_secret_writes(&self, deadline: Duration) -> Result<(), RepositoryError> {
+        tokio::time::timeout(deadline, async {
+            // A ready pooled connection has drained previous driver work. Hold
+            // every slot together so cancellation cannot hide a late commit.
+            let capacity = self.shared.options().get_max_connections();
+            let mut held = Vec::with_capacity(capacity as usize);
+            for _ in 0..capacity {
+                let mut connection = self.shared.acquire().await.map_err(map_transaction_error)?;
+                sqlx::query("SELECT 1")
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(map_transaction_error)?;
+                held.push(connection);
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| RepositoryError::Timeout)?
+    }
+
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
         timed(
             self.admin_timeout,
@@ -1460,6 +1480,120 @@ fn map_read_error(error: sqlx::Error) -> RepositoryError {
 
 fn map_write_storage_error(error: sqlx::Error) -> RepositoryError {
     map_storage_error(error, crate::diagnostics::RepositoryOperation::WriteQuery)
+}
+
+impl super::GatewayLookupRepository for PostgresDatabase {
+    async fn gateway_configuration(
+        &self,
+        key_id: &crate::domain::GatewayKeyId,
+        selected: Option<&str>,
+    ) -> Result<Option<super::GatewayConfiguration>, RepositoryError> {
+        tokio::time::timeout(
+            self.auth_timeout,
+            self.read_gateway_configuration(key_id, selected),
+        )
+        .await
+        .map_err(|_| RepositoryError::Timeout)?
+    }
+}
+
+impl PostgresDatabase {
+    async fn read_gateway_configuration(
+        &self,
+        key_id: &crate::domain::GatewayKeyId,
+        selected: Option<&str>,
+    ) -> Result<Option<super::GatewayConfiguration>, RepositoryError> {
+        let mut transaction = self.auth.begin().await.map_err(map_transaction_error)?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_read_error)?;
+
+        let key = sqlx::query_as::<_, ApiKeyRow>(
+            "SELECT id, account_id, name, key_id, secret_hash, status,
+                        default_provider_id, expires_at,
+                        max_concurrent_requests, max_requests_per_second, max_websockets, created_at
+                 FROM ts_api_key
+                 WHERE key_id = $1",
+        )
+        .bind(key_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_read_error)?;
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let key = key.into_api_key()?;
+        let bindings = sqlx::query_as::<_, ApiKeyBindingRow>(
+            "SELECT api_key_id, provider_id, position
+             FROM ts_api_key_provider
+             WHERE api_key_id = $1
+             ORDER BY position ASC LIMIT $2",
+        )
+        .bind(key.id().get())
+        .bind(i64::try_from(super::MAX_API_KEY_PROVIDERS + 1).expect("bounded bindings"))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(map_read_error)?;
+        if bindings.len() > super::MAX_API_KEY_PROVIDERS {
+            return Err(RepositoryError::InvalidStoredData);
+        }
+        let bindings = bindings
+            .into_iter()
+            .map(ApiKeyBindingRow::into_binding)
+            .collect::<Result<Vec<_>, _>>()?;
+        let credential = ApiKeyWithBindings::new(key, bindings);
+        let account = sqlx::query_as::<_, AccountRow>(
+            "SELECT id, name, password_hash, role, status, is_bootstrap, created_at
+             FROM ts_account
+             WHERE id = $1",
+        )
+        .bind(credential.api_key().account_id().get())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(map_read_error)?
+        .map(AccountRow::into_account)
+        .transpose()?;
+        let provider = match super::GatewayConfiguration::selected_provider(&credential, selected) {
+            Some(id) => sqlx::query_as::<_, ProviderRow>(
+                "SELECT id, name, protocol_type, endpoint, upstream_api_key_ciphertext,
+                    status, health, probe_path, probe_interval_ms, probe_timeout_ms, probe_failure_threshold, max_concurrent_requests, max_requests_per_second, created_at
+             FROM ts_provider
+             WHERE id = $1",
+            )
+            .bind(id.get())
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(map_read_error)?
+            .map(ProviderRow::into_provider)
+            .transpose()?,
+            None => None,
+        };
+        let aliases = if let Some(provider) = &provider {
+            let rows = sqlx::query_as::<_, AliasResolutionRow>(
+                "SELECT a.name AS name,
+                    (SELECT t.upstream_model FROM ts_model_alias_target t WHERE t.model_alias_id = a.id AND t.provider_id = $1) AS upstream_model
+             FROM ts_model_alias a
+             WHERE a.account_id = $2 ORDER BY a.id ASC LIMIT $3",
+            )
+            .bind(provider.id().get())
+            .bind(credential.api_key().account_id().get())
+            .bind(i64::try_from(MAX_MODEL_ALIASES_PER_ACCOUNT + 1).expect("bounded aliases"))
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(map_read_error)?;
+            model_alias_table_from_rows(rows)?
+        } else {
+            crate::domain::ModelAliasTable::default()
+        };
+        transaction.commit().await.map_err(map_transaction_error)?;
+        Ok(Some(super::GatewayConfiguration {
+            credential,
+            account,
+            provider,
+            aliases,
+        }))
+    }
 }
 
 #[cfg(test)]

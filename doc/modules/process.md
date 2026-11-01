@@ -8,7 +8,7 @@ Load static settings, validate them before either listener binds, construct both
 
 One process runs two permanently separate planes ([ADR 0002](../adr/0002-dual-planes-in-one-process.md)). Settings, secrets, and hashing budgets are process-wide; they are not discovered at request time. Secrets come from the environment, a secret manager, or files in the process data directory, because process listings may expose command-line flags ([ADR 0011](../adr/0011-defaulted-local-settings.md)).
 
-The data directory is `~/.tokenstream` unless overridden. SQLite defaults to a file there. Listeners default to loopback ports 3300 and 3301. A missing master key is generated once into that directory. A missing administrator secret uses a documented default password whose hash is stored there. Environment values override files and compiled defaults.
+The data directory is `~/.tokenstream` unless overridden. SQLite defaults to a file there. Listeners default to loopback ports 3300 and 3301. A missing master key is generated once into that directory. A missing administrator secret uses a documented default password whose hash is stored there. Environment values override files and compiled defaults. For a deployment with an online key recovery record, that configured key must match its current or previous generation. The database-bound record supplies the active generations, and pending migration completes before either listener binds. It never silently accepts an unrelated environment key. A previous external generation can recover one transition; update the external source and restart before another rotation.
 
 After the complete configuration has been merged and validated, and before database work or listener binding, the process installs exactly one global diagnostic subscriber. Process diagnostics are single-line JSON on standard error. The top-level envelope contains `timestamp`, `level`, `target`, and `fields`; `fields` always contains a stable event name and constant message. An immutable admission rule accepts only the closed set of audited Tokenstream targets, events, messages, and context fields. `TOKENSTREAM_LOG_FILTER` selects verbosity within that safe set using tracing filter-directive syntax, defaults to `info`, follows the normal environment-over-overlay-over-default priority, and takes effect on restart. A directive naming a dependency or unknown target cannot admit its events. An empty, non-Unicode, or invalid directive fails startup before binding. A second or conflicting global subscriber is an initialization failure rather than permission to continue with an unknown output contract.
 
@@ -16,7 +16,7 @@ Configuration and diagnostic-installation failures use the same JSON envelope th
 
 Every accumulator this process owns is bounded and fail-closed ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)). Admission never queues. Data-plane and control-plane hashing budgets are independent under a process-wide ceiling. Authentication lookups may reserve pooled database connections. Idle HTTP sockets to an origin are capped and expire.
 
-Startup is all-or-nothing: invalid settings, a bad master key, a non-Argon2id administrator hash, failed migrations, or a missing compiled administration page mean neither listener binds.
+Startup is all-or-nothing: invalid settings, a bad master key, a non-Argon2id administrator hash, failed migrations, an invalid or unrecoverable key rotation, or a missing compiled administration page mean neither listener binds.
 
 ## Core flows
 
@@ -34,7 +34,7 @@ sequenceDiagram
     alt Settings, secrets, migrations, or compiled page invalid
         P-->>Op: Exit before bind
     else Valid
-        P->>P: Run migrations
+        P->>P: Run migrations and recover pending key rotation
         P->>D: Bind data-plane listener
         P->>C: Bind control-plane listener
         P->>H: Start bounded probe task

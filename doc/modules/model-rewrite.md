@@ -12,8 +12,9 @@ The rewrite runs after authentication and route validation and before the proxy
 credential bindings and the dedicated selection header still choose exactly one provider, and the
 alias table is not an input to that choice.
 
-Authentication freezes, into the request snapshot, the account's alias names that matter for that
-one provider. A name with a target for the provider is paired with that target's upstream model
+Request preparation freezes the account's alias names for that one provider from the same consistent
+configuration view as authentication. The adapter context is separate from the transport snapshot;
+transparent forwarding receives no alias configuration. A name with a target for the provider is paired with that target's upstream model
 name. A name the account owns that has no target for the provider is recorded as unavailable. An
 account with no aliases freezes an empty table. The table is immutable for the life of the request.
 A later edit is visible only to the next request.
@@ -22,7 +23,7 @@ An empty table skips the adapter. The body and any WebSocket message are not rea
 
 A non-empty table makes the adapter look for a single top-level JSON string named `model`:
 
-- On HTTP, the search covers a bounded prefix of the request body. Bytes after the prefix stream
+- On HTTP, the search covers a bounded prefix of the request body. Preparation occupies global connection capacity and has a total deadline equal to the configured stream idle timeout; cancellation drops the read. Per-provider and per-credential rate allowances are consumed only after preparation succeeds. Bytes after the prefix stream
   through. The body is never accumulated in full. When the replacement changes the length, the
   upstream request no longer claims the client's original length.
 - On WebSocket, the search covers each client text message. Those messages are already bounded by
@@ -95,4 +96,4 @@ sequenceDiagram
   left unchanged.
 - The frozen table is limited by the account's alias cap. A read that exceeds the cap fails closed
   instead of dropping names.
-- A body that fails while the prefix is being read fails closed before an upstream connection.
+- A body that fails while the prefix is being read fails closed before an upstream connection. Preparation exceeding its deadline returns the existing sanitized timeout error, releases its capacity, and makes no upstream connection.

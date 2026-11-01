@@ -223,7 +223,7 @@ where
                 Ok(observe_response(self.relay_response(upstream), lifecycle))
             }
             Err(error) => {
-                lifecycle.complete(None, Some(error.code()));
+                lifecycle.complete(None, Some(error.category()));
                 Err(error)
             }
         }

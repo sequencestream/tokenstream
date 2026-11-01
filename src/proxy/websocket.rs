@@ -54,7 +54,7 @@ use crate::proxy::admission::ProxyLimits;
 use crate::proxy::error::GatewayError;
 use crate::proxy::headers::{build_downstream_response_headers, build_upstream_request_headers};
 use crate::routing::{ResolvedRoute, build_upstream_uri};
-use crate::telemetry::Metrics;
+use crate::telemetry::{Metrics, ProxyFailureCategory};
 
 const WEBSOCKET_VERSION: &str = "13";
 const MESSAGE_TOO_LARGE_CODE: u16 = 1009;
@@ -66,7 +66,8 @@ const MODEL_REJECT_CODE: u16 = 1008;
 /// The relay applies it and does not interpret the text. `Ok(None)` keeps the
 /// original message. `Err` is a stable error code chosen by the caller; the
 /// relay uses that code as the close reason and does not inspect it.
-pub type ClientTextMap = Arc<dyn Fn(&str) -> Result<Option<String>, &'static str> + Send + Sync>;
+pub type ClientTextMap =
+    Arc<dyn Fn(&str) -> Result<Option<String>, ProxyFailureCategory> + Send + Sync>;
 
 pub type RelayFuture = std::pin::Pin<Box<dyn std::future::Future<Output = RelayOutcome> + Send>>;
 
@@ -118,13 +119,13 @@ pub enum RelayOutcome {
     /// A caller-supplied text replacement refused the message.
     ///
     /// The string is a stable gateway error code and carries no payload.
-    ModelRejected(&'static str),
+    ModelRejected(ProxyFailureCategory),
 }
 
 /// The WebSocket data-plane implementation and its immutable limits.
 #[derive(Clone, Debug)]
 pub struct WebSocketProxy {
-    connect_timeout: Duration,
+    connector: UpstreamConnector,
     header_timeout: Duration,
     idle_timeout: Duration,
     config: WebSocketConfig,
@@ -151,7 +152,7 @@ impl WebSocketProxy {
             .write_buffer_size(frame)
             .max_write_buffer_size(write_capacity);
         Self {
-            connect_timeout,
+            connector: UpstreamConnector::new(connect_timeout),
             header_timeout,
             idle_timeout,
             config,
@@ -239,7 +240,7 @@ impl WebSocketProxy {
         *upstream_request.headers_mut() = headers;
 
         let on_upgrade = hyper::upgrade::on(request);
-        let mut connector = UpstreamConnector::new(self.connect_timeout);
+        let mut connector = self.connector.clone();
         let stream = connector
             .call(upstream_uri.clone())
             .await
@@ -344,7 +345,7 @@ impl WebSocketProxy {
         {
             Ok(handshake) => handshake,
             Err(error) => {
-                lifecycle.complete(None, Some(error.code()));
+                lifecycle.complete(None, Some(error.category()));
                 return Err(error);
             }
         };
@@ -362,9 +363,9 @@ impl WebSocketProxy {
                 let outcome = relay.await.unwrap_or(RelayOutcome::Failed);
                 let error = match outcome {
                     RelayOutcome::Closed => None,
-                    RelayOutcome::MessageTooLarge => Some("message_too_large"),
-                    RelayOutcome::IdleTimeout => Some("idle_timeout"),
-                    RelayOutcome::Failed => Some("relay_failed"),
+                    RelayOutcome::MessageTooLarge => Some(ProxyFailureCategory::MessageTooLarge),
+                    RelayOutcome::IdleTimeout => Some(ProxyFailureCategory::UpstreamTimeout),
+                    RelayOutcome::Failed => Some(ProxyFailureCategory::RelayFailed),
                     RelayOutcome::ModelRejected(code) => Some(code),
                 };
                 lifecycle.complete(Some(status), error);
@@ -773,7 +774,7 @@ where
 enum TextDecision {
     Keep,
     Replace(String),
-    Reject(&'static str),
+    Reject(ProxyFailureCategory),
 }
 
 /// Applies a caller-supplied text replacement without the relay knowing why.
@@ -828,7 +829,13 @@ where
             TextDecision::Keep => message,
             TextDecision::Replace(rewritten) => Message::Text(rewritten.into()),
             TextDecision::Reject(code) => {
-                let _ = close_sink(&mut destination, MODEL_REJECT_CODE, code, idle_timeout).await;
+                let _ = close_sink(
+                    &mut destination,
+                    MODEL_REJECT_CODE,
+                    code.as_str(),
+                    idle_timeout,
+                )
+                .await;
                 return RelayOutcome::ModelRejected(code);
             }
         };

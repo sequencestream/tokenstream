@@ -104,6 +104,7 @@ point produces no row of its own.
   of subscribers a deployment happens to attach.
 - Every admitted request produces an admitted event, and every admitted request eventually produces a
   finished event unless the process is stopped first.
+- One exchange owns its terminal observation; a response body or connection task takes ownership rather than starting a second lifecycle. Internal outcomes stay in the closed failure-category set.
 - The finished point is emitted at most once for a request, and its elapsed time is measured from
   admission, so it covers the whole exchange and not only its headers.
 - Proxy forwarding depends on lifecycle publication only; it never depends on a subscriber or on a

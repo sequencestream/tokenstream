@@ -93,6 +93,7 @@ pub struct Config {
     admin_listen_addr: SocketAddr,
     database_url: DatabaseUrl,
     master_key: MasterKey,
+    external_master_key: bool,
     admin_password_hash: AdminPasswordHash,
     bootstrap_account: BootstrapAccount,
     upstream_connect_timeout: Duration,
@@ -248,7 +249,9 @@ impl Config {
         validate_database_url(&database_url_value)?;
         let database_url = DatabaseUrl(database_url_value);
 
-        let master_key_value = match optional(&mut get, "TOKENSTREAM_MASTER_KEY")? {
+        let supplied_master = optional(&mut get, "TOKENSTREAM_MASTER_KEY")?;
+        let external_master_key = supplied_master.is_some();
+        let master_key_value = match supplied_master {
             Some(value) => value,
             None => {
                 if let Some(file_value) = options.file_master {
@@ -483,6 +486,7 @@ impl Config {
             admin_listen_addr,
             database_url,
             master_key,
+            external_master_key,
             admin_password_hash,
             bootstrap_account,
             upstream_connect_timeout,
@@ -569,6 +573,10 @@ impl Config {
 
     pub fn database_url(&self) -> &DatabaseUrl {
         &self.database_url
+    }
+
+    pub fn external_master_key(&self) -> bool {
+        self.external_master_key
     }
 
     pub fn master_key(&self) -> &MasterKey {
