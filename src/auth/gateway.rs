@@ -18,9 +18,7 @@
 //! transparency holds for a credential that reaches several upstreams.
 
 use crate::crypto::{PasswordWork, PasswordWorkError};
-use crate::persistence::{
-    AccountRepository, ApiKeyRepository, ModelAliasRepository, ProviderRepository, RepositoryError,
-};
+use crate::persistence::{GatewayLookupRepository, RepositoryError};
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
@@ -30,8 +28,8 @@ use hyper::header::AUTHORIZATION;
 
 use crate::crypto::{GatewaySecretVerifier, SecretCipher};
 use crate::domain::{
-    AccountStatus, ApiKeyStatus, ApiKeyWithBindings, GatewayCredential, MAX_GATEWAY_CREDENTIAL_LEN,
-    ProtocolType, Provider, ProviderId, ProviderSnapshot, ProviderStatus,
+    AccountStatus, ApiKeyStatus, GatewayCredential, MAX_GATEWAY_CREDENTIAL_LEN, ModelAliasTable,
+    ProtocolType, ProviderSnapshot, ProviderStatus,
 };
 
 /// Header carrying the gateway credential on Anthropic-native routes.
@@ -129,22 +127,9 @@ pub struct GatewayAuthenticator<R, C, V> {
     password_work: PasswordWork,
 }
 
-/// The provider one request resolved to, before it is loaded in full.
-///
-/// Selection happens before the provider row is read, so a credential bound to
-/// several upstreams costs one small indexed read, not one read per binding.
-enum ProviderSelection {
-    Id(ProviderId),
-    Default,
-}
-
 impl<R, C, V> GatewayAuthenticator<R, C, V>
 where
-    // One lookup resolves the credential, the account that owns it, and the one
-    // provider it selects, so the hot path needs all three stores and nothing
-    // else. Keeping them on one repository is what makes that a single
-    // consistent read rather than three independently drifting ones.
-    R: ApiKeyRepository + AccountRepository + ProviderRepository + ModelAliasRepository,
+    R: GatewayLookupRepository,
     C: SecretCipher,
     V: GatewaySecretVerifier + 'static,
 {
@@ -173,16 +158,34 @@ where
         &self,
         headers: &HeaderMap,
     ) -> Result<Arc<ProviderSnapshot>, GatewayAuthError> {
+        self.prepare(headers).await.map(|(snapshot, _)| snapshot)
+    }
+
+    /// Produces separate transport and adapter contexts from one verified view.
+    /// Only the orchestrator receives alias configuration; forwarding receives
+    /// the transport snapshot and cannot consult model configuration.
+    pub async fn prepare(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<(Arc<ProviderSnapshot>, ModelAliasTable), GatewayAuthError> {
         let (source, raw) = extract_credential(headers)?;
         let credential =
             GatewayCredential::parse(raw).map_err(|_| GatewayAuthError::MalformedCredential)?;
 
-        let owned =
-            match ApiKeyRepository::find_by_key_id(&self.repository, credential.key_id()).await {
-                Ok(owned) => owned.ok_or(GatewayAuthError::UnknownCredential)?,
-                Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
-                Err(_) => return Err(GatewayAuthError::Unavailable),
-            };
+        let _secret_reader = self.cipher.secret_reader().map_err(|error| match error {
+            crate::crypto::CipherError::Busy => GatewayAuthError::Busy,
+            _ => GatewayAuthError::Unavailable,
+        })?;
+        let configuration = self
+            .repository
+            .gateway_configuration(credential.key_id(), selection_header(headers))
+            .await
+            .map_err(|error| match error {
+                RepositoryError::Timeout => GatewayAuthError::Busy,
+                _ => GatewayAuthError::Unavailable,
+            })?
+            .ok_or(GatewayAuthError::UnknownCredential)?;
+        let owned = &configuration.credential;
         let api_key = owned.api_key();
 
         if api_key.status() == ApiKeyStatus::Disabled {
@@ -192,19 +195,21 @@ where
             return Err(GatewayAuthError::KeyExpired);
         }
 
-        let account =
-            match AccountRepository::find_by_id(&self.repository, api_key.account_id()).await {
-                Ok(account) => account.ok_or(GatewayAuthError::UnknownCredential)?,
-                Err(RepositoryError::Timeout) => return Err(GatewayAuthError::Busy),
-                Err(_) => return Err(GatewayAuthError::Unavailable),
-            };
+        let account = configuration
+            .account
+            .as_ref()
+            .ok_or(GatewayAuthError::UnknownCredential)?;
         if account.status() == AccountStatus::Disabled {
             return Err(GatewayAuthError::AccountDisabled);
         }
 
-        let provider = self
-            .resolve_provider(&owned, selection_header(headers))
-            .await?;
+        let provider = configuration.provider.as_ref().ok_or_else(|| {
+            if owned.bindings().is_empty() && selection_header(headers).is_none() {
+                GatewayAuthError::NoProviderSelected
+            } else {
+                GatewayAuthError::UnknownCredential
+            }
+        })?;
 
         if source != native_source(provider.protocol_type()) {
             return Err(GatewayAuthError::ConflictingCredential);
@@ -242,97 +247,33 @@ where
             .cipher
             .decrypt(provider.upstream_api_key_ciphertext())
             .map_err(|_| GatewayAuthError::Unavailable)?;
-        let aliases = self.alias_table(account.id(), provider.id()).await?;
+        let aliases = configuration.aliases;
 
         // The admission bounds of both the credential and the selected provider
         // are frozen here, with the rest of the snapshot. A later limit edit
         // applies to new work and cannot reach what is already admitted. The
         // alias table is frozen the same way: it names models for the provider
         // already chosen and does not choose that provider.
-        Ok(Arc::new(
-            ProviderSnapshot::new(
-                account.id(),
-                api_key.id(),
-                provider.id(),
-                provider.protocol_type(),
-                provider.endpoint().clone(),
-                upstream_api_key,
-            )
-            .with_admission(provider.admission(), api_key.admission())
-            .with_health(provider.health())
-            .with_aliases(aliases),
+        Ok((
+            Arc::new(
+                ProviderSnapshot::new(
+                    account.id(),
+                    api_key.id(),
+                    provider.id(),
+                    provider.protocol_type(),
+                    provider.endpoint().clone(),
+                    upstream_api_key,
+                )
+                .with_admission(provider.admission(), api_key.admission())
+                .with_health(provider.health()),
+            ),
+            aliases,
         ))
-    }
-
-    /// Loads the alias names for the provider this request already resolved to.
-    ///
-    /// The read is on the authentication lookup path and fails closed with it.
-    /// An empty table means this account has no aliases.
-    async fn alias_table(
-        &self,
-        account_id: crate::domain::AccountId,
-        provider_id: ProviderId,
-    ) -> Result<crate::domain::ModelAliasTable, GatewayAuthError> {
-        match self
-            .repository
-            .model_alias_table(account_id, provider_id)
-            .await
-        {
-            Ok(table) => Ok(table),
-            Err(RepositoryError::Timeout) => Err(GatewayAuthError::Busy),
-            Err(_) => Err(GatewayAuthError::Unavailable),
-        }
-    }
-
-    /// Resolves the single provider this request reaches.
-    ///
-    /// The only inputs are the credential's own bindings and the dedicated
-    /// selection header. A selection naming a provider the credential is not
-    /// bound to is rejected as an unknown credential rather than silently
-    /// falling back, so a misconfigured client fails visibly instead of
-    /// reaching an unintended upstream. A credential that names nothing and has
-    /// no default fails closed rather than guessing.
-    async fn resolve_provider(
-        &self,
-        owned: &ApiKeyWithBindings,
-        selected: Option<&str>,
-    ) -> Result<Provider, GatewayAuthError> {
-        let selection = match selected {
-            Some(name) => {
-                let provider_id = name
-                    .parse::<i64>()
-                    .ok()
-                    .and_then(|id| ProviderId::try_from(id).ok())
-                    .ok_or(GatewayAuthError::UnknownCredential)?;
-                if !owned.allows(provider_id) {
-                    return Err(GatewayAuthError::UnknownCredential);
-                }
-                ProviderSelection::Id(provider_id)
-            }
-            None => ProviderSelection::Default,
-        };
-
-        let provider_id = match selection {
-            ProviderSelection::Id(provider_id) => Some(provider_id),
-            ProviderSelection::Default => owned
-                .api_key()
-                .default_provider_id()
-                .or_else(|| owned.bindings().first().map(|b| b.provider_id)),
-        };
-        let provider_id = provider_id.ok_or(GatewayAuthError::NoProviderSelected)?;
-
-        match ProviderRepository::find_by_id(&self.repository, provider_id).await {
-            Ok(provider) => provider.ok_or(GatewayAuthError::UnknownCredential),
-            Err(RepositoryError::Timeout) => Err(GatewayAuthError::Busy),
-            Err(_) => Err(GatewayAuthError::Unavailable),
-        }
     }
 }
 
-/// Reads the provider-selection header, rejecting a repeated or non-text value.
-///
-/// A repeated selection is ambiguous, so it is treated as a conflicting
-/// credential rather than resolved to whichever copy happened to come first.
+/// Reads a single non-empty text selection. Other header shapes retain the
+/// existing no-selector behavior rather than choosing one repeated value.
 fn selection_header(headers: &HeaderMap) -> Option<&str> {
     let mut values = headers.get_all(PROVIDER_SELECTION_HEADER).iter();
     let value = values.next()?;

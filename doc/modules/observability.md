@@ -81,6 +81,13 @@ enabled.
 
 Each fact is recorded at the single point where it is decided, and nowhere else.
 
+Request orchestration owns one lifecycle for every admitted exchange and transfers its terminal
+responsibility to the HTTP response body or WebSocket connection task. A transport failure reports its
+closed failure category to that owner; returning its response cannot also trigger preparation-failure
+accounting. Preparation failures have their own single observation point, and a layered capacity
+refusal has only its named refusal observation. Internal hand-offs retain closed categories rather
+than translating through error-code text ([ADR 0021](../adr/0021-consistent-request-preparation-and-recoverable-key-rotation.md)).
+
 A request that a gate refuses produces a refusal and only a refusal. It produces no lifecycle event,
 because it never became work the proxy runs, and no result fact, because there is no exchange to
 classify. This is what stops a shed request from being counted twice — once as a refusal and once as the

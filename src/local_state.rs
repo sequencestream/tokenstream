@@ -453,13 +453,187 @@ fn read_optional_secret(path: PathBuf, name: &'static str) -> Result<Option<Stri
     }
 }
 
+/// Replaces a private file durably without exposing partially written secrets.
 fn write_restricted(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
-    fs::write(path, bytes).map_err(|_| ConfigError::Invalid {
+    use std::io::Write;
+    let failed = || ConfigError::Invalid {
         name: "TOKENSTREAM_DATA_DIR",
-        requirement: "must name a writable directory",
-    })?;
-    restrict_mode(path, 0o600);
+        requirement: "must support durable private file replacement",
+    };
+    let parent = path.parent().ok_or_else(failed)?;
+    let mut random = [0_u8; 16];
+    getrandom::getrandom(&mut random).map_err(|_| failed())?;
+    let temporary = parent.join(format!(
+        ".secret-{}",
+        random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        durable_replace(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(|_| failed())
+}
+
+#[cfg(not(windows))]
+fn durable_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn durable_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+    let source: Vec<u16> = source.as_os_str().encode_wide().collect();
+    let destination: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if source.contains(&0) || destination.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid private file path",
+        ));
+    }
+    let source: Vec<u16> = source.into_iter().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination.into_iter().chain(Some(0)).collect();
+    // Both pointers refer to live, nul-terminated UTF-16 buffers. Replace the
+    // destination and flush the move before reporting a successful commit.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0x1 | 0x8) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
+}
+
+/// A bounded, private recovery record; intentionally has no debug representation.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRotationRecord {
+    pub ring: crate::crypto::KeyRing,
+    pub database: String,
+    pub complete: bool,
+}
+
+impl KeyRotationRecord {
+    pub fn new(
+        ring: crate::crypto::KeyRing,
+        database_url: &str,
+    ) -> Result<Self, crate::crypto::CipherError> {
+        use crate::crypto::SecretCipher;
+        let database = ring
+            .current
+            .cipher()
+            .encrypt(&crate::domain::SecretString::new(
+                rotation_database_identity(database_url),
+            ))?
+            .expose()
+            .to_owned();
+        Ok(Self {
+            ring,
+            database,
+            complete: false,
+        })
+    }
+
+    pub fn validates(&self, database_url: &str, configured: &[u8; 32]) -> bool {
+        self.ring.current.version > 0
+            && self
+                .ring
+                .previous
+                .as_ref()
+                .is_none_or(|old| old.version > 0 && old.version < self.ring.current.version)
+            && self.ring.accepts(configured)
+            && self
+                .ring
+                .decrypt(&crate::domain::SecretCiphertext::new(&self.database))
+                .is_ok_and(|value| value.expose() == rotation_database_identity(database_url))
+    }
+}
+
+/// Connection credentials and TLS options do not change a PostgreSQL database's
+/// identity. Namespace options remain part of the binding.
+fn rotation_database_identity(value: &str) -> String {
+    if !value.starts_with("postgres://") && !value.starts_with("postgresql://") {
+        return value.to_owned();
+    }
+    let Ok(mut parsed) = url::Url::parse(value) else {
+        return value.to_owned();
+    };
+    let namespace: Vec<_> = parsed
+        .query_pairs()
+        .filter(|(name, _)| name == "options")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect();
+    let port = parsed.port().unwrap_or(5432);
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    let _ = parsed.set_scheme("postgresql");
+    let _ = parsed.set_port(Some(port));
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    if !namespace.is_empty() {
+        parsed.query_pairs_mut().extend_pairs(namespace);
+    }
+    parsed.into()
+}
+
+pub fn load_key_rotation(data_dir: &Path) -> Result<Option<KeyRotationRecord>, ConfigError> {
+    use std::io::Read;
+    let failed = || ConfigError::Invalid {
+        name: "TOKENSTREAM_MASTER_KEY",
+        requirement: "must have a valid bounded key recovery record",
+    };
+    let file = match fs::File::open(data_dir.join("master.rotation.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(failed()),
+    };
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    file.take(16_385)
+        .read_to_end(&mut bytes)
+        .map_err(|_| failed())?;
+    if bytes.len() > 16_384 {
+        return Err(failed());
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|_| failed())
+}
+
+pub fn save_key_rotation(data_dir: &Path, record: &KeyRotationRecord) -> Result<(), ConfigError> {
+    ensure_data_dir(data_dir)?;
+    let bytes =
+        zeroize::Zeroizing::new(
+            serde_json::to_vec(record).map_err(|_| ConfigError::Invalid {
+                name: "TOKENSTREAM_MASTER_KEY",
+                requirement: "must have a valid key recovery record",
+            })?,
+        );
+    if bytes.len() > 16_384 {
+        return Err(ConfigError::Invalid {
+            name: "TOKENSTREAM_MASTER_KEY",
+            requirement: "must have a bounded key recovery record",
+        });
+    }
+    write_restricted(&data_dir.join("master.rotation.json"), &bytes)
 }
 
 fn restrict_mode(path: &Path, mode: u32) {
@@ -470,4 +644,43 @@ fn restrict_mode(path: &Path, mode: u32) {
     }
     let _ = mode;
     let _ = path;
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use crate::crypto::{KeyGeneration, KeyRing};
+
+    #[test]
+    fn postgres_recovery_binds_database_and_namespace_without_binding_connection_secrets() {
+        let ring = KeyRing {
+            current: KeyGeneration {
+                version: 2,
+                key: [0x22; 32],
+            },
+            previous: Some(KeyGeneration {
+                version: 1,
+                key: [0x11; 32],
+            }),
+        };
+        let record = KeyRotationRecord::new(
+            ring,
+            "postgres://old:password@example.com/app?sslmode=require",
+        )
+        .unwrap();
+        assert!(record.validates(
+            "postgresql://new:rotated@example.com:5432/app?sslmode=verify-full",
+            &[0x11; 32]
+        ));
+        assert!(record.validates("postgres://example.com/app", &[0x22; 32]));
+        assert!(!record.validates("postgres://example.com/other", &[0x22; 32]));
+        assert!(!record.validates("postgres://other.example.com/app", &[0x22; 32]));
+        assert!(!record.validates(
+            "postgres://example.com/app?options=-csearch_path%3Dother",
+            &[0x22; 32]
+        ));
+        assert!(!record.validates("postgres://example.com/app", &[0x33; 32]));
+        assert!(!record.database.contains("password"));
+        assert!(!record.database.contains("example.com"));
+    }
 }

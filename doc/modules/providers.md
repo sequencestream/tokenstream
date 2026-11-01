@@ -60,6 +60,36 @@ gateway, the other is about the credential.
 
 Disable sets status to disabled and commits. A disabled provider is still selectable configuration — a credential bound to it keeps resolving to it, so the failure is `provider_disabled` at authentication time rather than a missing selection. Edit of endpoint or upstream key validates and persists atomically. Existing streams retain the prior snapshot in both cases.
 
+## Online master-key rotation
+
+A rotation has one coordinator and at most two data-key generations
+([ADR 0021](../adr/0021-consistent-request-preparation-and-recoverable-key-rotation.md)). Its private
+recovery record binds those generations to the configured database without storing the database
+connection string in plaintext in that record. PostgreSQL connection credentials and TLS options
+do not change that binding; namespace options do. New key state is durably persisted before it becomes
+the write generation. A complete record remains available to recover a restart with the immediately
+previous external key; an unrelated key or database is refused.
+
+Only one rotation can proceed. Secret-bearing create and edit operations hold a non-queueing writer
+permit through persistence. Rotation excludes those writers, settles outstanding storage work from cancelled requests under a
+bounded deadline before switching generations, and then migrates bounded pages. This prevents a late
+commit from restoring an older generation after the scan. Meanwhile,
+readers continue to decrypt both generations. Metadata-only edits and health changes remain independent.
+A retiring generation is replaced only after outstanding secret readers have finished; admitted
+streams already own decrypted snapshots and need no generation lease.
+
+Each provider migration is independently committed and resumable. Already migrated ciphertext is not
+rewritten. Interruption leaves a pending recovery record; retrying with the same key resumes it, while
+a different key is refused. Startup resumes pending migration before binding. After successful
+migration the completed record is persisted and the ordinary local secret file is updated. Failure of
+that last update remains recoverable from the record, and retrying repairs it.
+
+A stale external key must be changed to the current key and the process restarted before starting
+another generation. This prevents an unbounded history of recovery keys. Local-secret deployments may
+rotate repeatedly. A deployment without durable private secret storage refuses rotation before any
+ciphertext changes. Recovery records and temporary secret files share the secret-storage access
+restrictions; replacement flushes content and the filesystem metadata required by the host platform.
+
 ## Health and isolation
 
 A provider may be probed, and only a provider that names a probe path is ever probed
@@ -115,7 +145,7 @@ a name, endpoint, key, or secret.
 - Ciphertext and password hashes never appear in API responses.
 - Decrypted keys exist only in short-lived snapshot wrappers.
 - A referenced provider cannot be deleted.
-- A provider carries no credential material of its own, so no provider record can leak a credential.
+- A provider issues no data-plane credentials. Its upstream credential is encrypted at rest and is never returned by an administration read.
 - Name uniqueness is enforced by storage, identically on both engines.
 - Only an administrator may write a provider.
 - A provider with no probe path is never probed and can never be isolated.

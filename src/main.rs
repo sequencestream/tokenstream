@@ -124,6 +124,19 @@ async fn run(config: Config) -> Result<(), StartupFailure> {
     let admin_password_work =
         tokenstream::crypto::PasswordWork::new(config.admin_password_concurrency());
     let cipher = SharedCipher::new(config.master_key().expose());
+    tokenstream::providers::ProviderService::new(
+        database.clone(),
+        cipher.clone(),
+        config.development_mode(),
+    )
+    .recover_master_key(&config)
+    .await
+    .map_err(|_| {
+        StartupFailure::new(
+            StartupStage::Configuration,
+            StartupErrorKind::InvalidSetting,
+        )
+    })?;
     let generated_password = std::env::var("TOKENSTREAM_ADMIN_PASSWORD").is_err()
         && !config.uses_default_admin_password();
     let bootstrap_password = match std::env::var("TOKENSTREAM_ADMIN_PASSWORD") {

@@ -1318,7 +1318,7 @@ async fn a_client_text_map_rewrites_text_and_closes_without_forwarding_a_rejecti
                 "\"model\":\"gpt-5.2-codex\"",
             )))
         } else if text.contains("\"model\":\"writing\"") {
-            Err("model_alias_unavailable")
+            Err(tokenstream::telemetry::ProxyFailureCategory::ModelAliasUnavailable)
         } else {
             Ok(None)
         }
@@ -1369,6 +1369,8 @@ async fn a_client_text_map_rewrites_text_and_closes_without_forwarding_a_rejecti
     assert_eq!(frame.reason, "model_alias_unavailable");
     assert_eq!(
         relay_task.await.expect("relay task"),
-        RelayOutcome::ModelRejected("model_alias_unavailable")
+        RelayOutcome::ModelRejected(
+            tokenstream::telemetry::ProxyFailureCategory::ModelAliasUnavailable
+        )
     );
 }

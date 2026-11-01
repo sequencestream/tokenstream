@@ -22,7 +22,7 @@ use super::{CipherError, SecretCipher};
 ///
 /// It identifies which master-key generation sealed a value, so a later
 /// rotation can still open ciphertexts produced by an earlier key.
-pub const KEY_VERSION: u8 = 1;
+pub const KEY_VERSION: u64 = 1;
 
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
@@ -30,7 +30,7 @@ const TAG_LEN: usize = 16;
 /// Authenticated cipher keyed by the configured 32-byte master key.
 pub struct AesGcmCipher {
     key: Zeroizing<[u8; 32]>,
-    key_version: u8,
+    key_version: u64,
 }
 
 impl AesGcmCipher {
@@ -81,23 +81,109 @@ impl SecretCipher for AesGcmCipher {
     }
 }
 
-/// A process-wide cipher whose key can be replaced after stored secrets are re-encrypted.
+/// A key generation persisted only in the private recovery record.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyGeneration {
+    pub version: u64,
+    pub key: [u8; 32],
+}
+
+impl Drop for KeyGeneration {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+impl KeyGeneration {
+    pub fn cipher(&self) -> AesGcmCipher {
+        AesGcmCipher {
+            key: Zeroizing::new(self.key),
+            key_version: self.version,
+        }
+    }
+}
+
+/// At most two data-key generations; requests always write with the current one.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRing {
+    pub current: KeyGeneration,
+    pub previous: Option<KeyGeneration>,
+}
+
+impl KeyRing {
+    pub fn accepts(&self, configured: &[u8; 32]) -> bool {
+        &self.current.key == configured
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|key| &key.key == configured)
+    }
+
+    pub fn decrypt(&self, ciphertext: &SecretCiphertext) -> Result<SecretString, CipherError> {
+        let version = ciphertext
+            .expose()
+            .split('.')
+            .next()
+            .and_then(parse_key_version)
+            .ok_or(CipherError::Decryption)?;
+        let generation = if self.current.version == version {
+            &self.current
+        } else {
+            self.previous
+                .as_ref()
+                .filter(|key| key.version == version)
+                .ok_or(CipherError::Decryption)?
+        };
+        generation.cipher().decrypt(ciphertext)
+    }
+}
+
+/// A shared two-generation cipher with bounded reader and secret-writer coordination.
 #[derive(Clone)]
 pub struct SharedCipher {
-    inner: Arc<RwLock<AesGcmCipher>>,
+    inner: Arc<RwLock<KeyRing>>,
+    readers: Arc<tokio::sync::RwLock<()>>,
+    writers: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl SharedCipher {
-    /// Builds a shared cipher over a 32-byte master key.
     pub fn new(master_key: &[u8; 32]) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(AesGcmCipher::new(master_key))),
+            inner: Arc::new(RwLock::new(KeyRing {
+                current: KeyGeneration {
+                    version: KEY_VERSION,
+                    key: *master_key,
+                },
+                previous: None,
+            })),
+            readers: Arc::new(tokio::sync::RwLock::new(())),
+            writers: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
-    /// Replaces the in-memory key. Stored ciphertexts must already use this key.
-    pub fn install(&self, master_key: &[u8; 32]) {
-        *self.inner.write().expect("cipher lock is not poisoned") = AesGcmCipher::new(master_key);
+    pub fn try_rotation(&self) -> Result<tokio::sync::OwnedRwLockWriteGuard<()>, CipherError> {
+        self.writers
+            .clone()
+            .try_write_owned()
+            .map_err(|_| CipherError::Busy)
+    }
+
+    pub async fn retire_readers(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        self.readers.clone().write_owned().await
+    }
+
+    pub fn ring(&self) -> KeyRing {
+        self.inner
+            .read()
+            .expect("cipher lock is not poisoned")
+            .clone()
+    }
+
+    /// The caller must coordinate retirement with outstanding secret readers.
+    pub fn install_ring(&self, ring: KeyRing) {
+        *self.inner.write().expect("cipher lock is not poisoned") = ring;
     }
 }
 
@@ -106,6 +192,8 @@ impl SecretCipher for SharedCipher {
         self.inner
             .read()
             .expect("cipher lock is not poisoned")
+            .current
+            .cipher()
             .encrypt(plaintext)
     }
 
@@ -116,8 +204,24 @@ impl SecretCipher for SharedCipher {
             .decrypt(ciphertext)
     }
 
-    fn install_master_key(&self, key: &[u8; 32]) {
-        self.install(key);
+    fn shared_cipher(&self) -> Option<SharedCipher> {
+        Some(self.clone())
+    }
+
+    fn secret_reader(&self) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, CipherError> {
+        self.readers
+            .clone()
+            .try_read_owned()
+            .map(Some)
+            .map_err(|_| CipherError::Busy)
+    }
+
+    fn secret_writer(&self) -> Result<Option<tokio::sync::OwnedRwLockReadGuard<()>>, CipherError> {
+        self.writers
+            .clone()
+            .try_read_owned()
+            .map(Some)
+            .map_err(|_| CipherError::Busy)
     }
 }
 
@@ -141,7 +245,7 @@ impl fmt::Debug for AesGcmCipher {
 
 /// A decoded ciphertext envelope.
 struct Envelope {
-    key_version: u8,
+    key_version: u64,
     nonce: Vec<u8>,
     ciphertext: Vec<u8>,
 }
@@ -182,7 +286,7 @@ impl Envelope {
 }
 
 /// Parses a `v<number>` key-version token, rejecting anything else.
-fn parse_key_version(token: &str) -> Option<u8> {
+fn parse_key_version(token: &str) -> Option<u64> {
     let digits = token.strip_prefix('v')?;
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -237,7 +341,7 @@ mod tests {
             format!("v1.{nonce}.{ciphertext}.extra"),
             format!("1.{nonce}.{ciphertext}"),
             format!("vX.{nonce}.{ciphertext}"),
-            format!("v256.{nonce}.{ciphertext}"),
+            format!("v18446744073709551616.{nonce}.{ciphertext}"),
             format!("v1.@@@.{ciphertext}"),
             format!("v1.{short_nonce}.{ciphertext}"),
             format!("v1.{nonce}.{short_ciphertext}"),

@@ -230,6 +230,7 @@ fn sha1(data: &[u8]) -> [u8; 20] {
 }
 
 struct Deployment {
+    metrics: Metrics,
     address: SocketAddr,
     credential: String,
     upstream: CountingUpstream,
@@ -328,7 +329,9 @@ async fn deploy(
         .await
         .expect("bind gateway");
     let address = listener.local_addr().expect("gateway address");
+    let server_metrics = metrics.clone();
     tokio::spawn(async move {
+        let metrics = server_metrics;
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -379,6 +382,7 @@ async fn deploy(
     });
 
     Deployment {
+        metrics,
         address,
         credential,
         upstream,
@@ -534,6 +538,13 @@ async fn a_credential_over_its_rate_bound_is_refused_before_the_upstream() {
         deployment.upstream.received.load(Ordering::SeqCst),
         1,
         "a refused request never reaches the upstream"
+    );
+    assert_eq!(
+        deployment
+            .metrics
+            .exchange_count_for_result(tokenstream::telemetry::ResultClass::GatewayFailure),
+        0,
+        "admission refusals are not failed exchanges"
     );
 }
 

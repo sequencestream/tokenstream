@@ -453,3 +453,196 @@ async fn cancelled_authentication_keeps_compute_until_hashing_finishes() {
     .await
     .expect("capacity returns after the hash finishes");
 }
+
+async fn seed_consistent_lookup(
+    database: &tokenstream::persistence::Database,
+) -> (GatewayKeyId, i64, i64, i64) {
+    use tokenstream::domain::{AccountRole, AccountStatus, PasswordHash, SecretCiphertext};
+    use tokenstream::persistence::{
+        AccountRepository, ModelAliasRepository, NewAccount, NewApiKey, NewModelAlias, NewProvider,
+    };
+    let prefix = format!(
+        "lookup-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let account = AccountRepository::create(
+        database,
+        NewAccount::new(
+            prefix.clone(),
+            PasswordHash::new("hash"),
+            AccountRole::User,
+            AccountStatus::Enabled,
+            false,
+            chrono::Utc::now(),
+        ),
+    )
+    .await
+    .unwrap();
+    let mut providers = Vec::new();
+    for suffix in ["left", "right"] {
+        providers.push(
+            ProviderRepository::create(
+                database,
+                NewProvider::new(
+                    format!("{prefix}-{suffix}"),
+                    ProtocolType::OpenAi,
+                    url::Url::parse("https://lookup.example").unwrap(),
+                    SecretCiphertext::new("ciphertext"),
+                    ProviderStatus::Enabled,
+                    chrono::Utc::now(),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let key_id = GatewayKeyId::new(prefix).unwrap();
+    let credential = ApiKeyRepository::create(
+        database,
+        NewApiKey::new(
+            account.id(),
+            providers[0].name().to_owned(),
+            key_id.clone(),
+            PasswordHash::new("hash"),
+            ApiKeyStatus::Enabled,
+            None,
+            None,
+            vec![providers[0].id()],
+            chrono::Utc::now(),
+        ),
+    )
+    .await
+    .unwrap();
+    database
+        .create_model_alias(NewModelAlias::new(
+            account.id(),
+            "coding".to_owned(),
+            providers
+                .iter()
+                .map(|provider| (provider.id(), provider.name().to_owned()))
+                .collect(),
+            chrono::Utc::now(),
+        ))
+        .await
+        .unwrap();
+    (
+        key_id,
+        credential.api_key().id().get(),
+        providers[0].id().get(),
+        providers[1].id().get(),
+    )
+}
+
+async fn assert_consistent_lookup(
+    database: &tokenstream::persistence::Database,
+    key: &GatewayKeyId,
+) {
+    use tokenstream::persistence::GatewayLookupRepository;
+    let value = database
+        .gateway_configuration(key, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let provider = value.provider.unwrap();
+    assert_eq!(value.credential.api_key().name(), provider.name());
+    assert_eq!(
+        value.aliases.lookup("coding"),
+        tokenstream::domain::AliasLookup::Upstream(provider.name())
+    );
+    assert_eq!(
+        value.account.unwrap().id(),
+        value.credential.api_key().account_id()
+    );
+}
+
+async fn exercise_consistent_lookup(database: tokenstream::persistence::Database) {
+    let (key, credential, left, right) = seed_consistent_lookup(&database).await;
+    let writing = database.clone();
+    let writer = tokio::spawn(async move {
+        for index in 0..80 {
+            let provider = if index % 2 == 0 { right } else { left };
+            macro_rules! change {
+                ($pool:expr) => {{
+                    let mut transaction = $pool.begin().await.unwrap();
+                    sqlx::query(&format!("UPDATE ts_api_key SET name = (SELECT name FROM ts_provider WHERE id = {provider}) WHERE id = {credential}")).execute(&mut *transaction).await.unwrap();
+                    tokio::task::yield_now().await;
+                    sqlx::query(&format!("DELETE FROM ts_api_key_provider WHERE api_key_id = {credential}")).execute(&mut *transaction).await.unwrap();
+                    sqlx::query(&format!("INSERT INTO ts_api_key_provider (api_key_id, provider_id, position) VALUES ({credential}, {provider}, 0)")).execute(&mut *transaction).await.unwrap();
+                    transaction.commit().await.unwrap();
+                }};
+            }
+            match &writing {
+                tokenstream::persistence::Database::Sqlite(db) => change!(db.pool()),
+                tokenstream::persistence::Database::Postgres(db) => change!(db.pool()),
+            }
+        }
+    });
+    for _ in 0..100 {
+        assert_consistent_lookup(&database, &key).await;
+    }
+    writer.await.unwrap();
+    assert_consistent_lookup(&database, &key).await;
+}
+
+#[tokio::test]
+async fn sqlite_complete_lookup_uses_reserved_capacity_and_one_consistent_view() {
+    use tokenstream::persistence::Database;
+    let directory = tempfile::tempdir().unwrap();
+    let sqlite = sqlite(
+        &directory.path().join("complete-reservation.db"),
+        DatabaseBounds {
+            max_connections: 3,
+            auth_connections: 1,
+            ..DatabaseBounds::for_tests(3)
+        },
+    )
+    .await;
+    let database = Database::Sqlite(sqlite.clone());
+    let (key, _, _, _) = seed_consistent_lookup(&database).await;
+    let held = (
+        sqlite.pool().acquire().await.unwrap(),
+        sqlite.pool().acquire().await.unwrap(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        assert_consistent_lookup(&database, &key),
+    )
+    .await
+    .unwrap();
+    drop(held);
+    exercise_consistent_lookup(database).await;
+}
+
+#[tokio::test]
+async fn postgres_complete_lookup_uses_reserved_capacity_and_one_consistent_view() {
+    use tokenstream::persistence::Database;
+    let _guard = POSTGRES.lock().await;
+    let pg = PostgresDatabase::connect_with_bounds(
+        &require_postgres_url("complete configuration lookup"),
+        DatabaseBounds {
+            max_connections: 3,
+            auth_connections: 1,
+            ..DatabaseBounds::for_tests(3)
+        },
+    )
+    .await
+    .unwrap();
+    pg.migrate().await.unwrap();
+    let database = Database::Postgres(pg.clone());
+    let (key, _, _, _) = seed_consistent_lookup(&database).await;
+    let held = (
+        pg.pool().acquire().await.unwrap(),
+        pg.pool().acquire().await.unwrap(),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        assert_consistent_lookup(&database, &key),
+    )
+    .await
+    .unwrap();
+    drop(held);
+    exercise_consistent_lookup(database).await;
+}

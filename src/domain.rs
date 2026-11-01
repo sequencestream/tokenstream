@@ -1155,7 +1155,6 @@ pub struct ProviderSnapshot {
     provider_admission: ProviderAdmission,
     credential_admission: CredentialAdmission,
     health: ProviderHealthState,
-    aliases: ModelAliasTable,
 }
 
 impl ProviderSnapshot {
@@ -1177,23 +1176,7 @@ impl ProviderSnapshot {
             provider_admission: ProviderAdmission::default(),
             credential_admission: CredentialAdmission::default(),
             health: ProviderHealthState::default(),
-            aliases: ModelAliasTable::default(),
         }
-    }
-
-    /// Freezes the alias names that apply to the provider this request resolved to.
-    ///
-    /// The table is copied into the snapshot once. A later alias edit cannot
-    /// change a request that already holds it, and an empty table tells the
-    /// rewrite adapter not to read the payload.
-    pub fn with_aliases(mut self, aliases: ModelAliasTable) -> Self {
-        self.aliases = aliases;
-        self
-    }
-
-    /// Alias names frozen for the provider this request resolved to.
-    pub fn aliases(&self) -> &ModelAliasTable {
-        &self.aliases
     }
 
     /// Freezes the provider's health state alongside the rest of the snapshot.

@@ -94,6 +94,14 @@ pub struct UpstreamConnector {
     inner: hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     timeout: Duration,
 }
+impl std::fmt::Debug for UpstreamConnector {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UpstreamConnector")
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
+}
 pub type UpstreamStream =
     hyper_rustls::MaybeHttpsStream<hyper_util::rt::TokioIo<tokio::net::TcpStream>>;
 impl UpstreamConnector {

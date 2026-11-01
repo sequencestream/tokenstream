@@ -24,7 +24,7 @@ use crate::credentials::{
     UpdateAccountRequest, UpdateApiKeyRequest,
 };
 use crate::crypto::{
-    AesGcmCipher, Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher, SharedCipher,
+    Argon2GatewaySecretVerifier, GatewaySecretVerifier, SecretCipher, SharedCipher,
 };
 use crate::model_aliases::{
     CreateModelAliasRequest, ModelAliasService, ModelAliasServiceError, ModelAliasTargetInput,
@@ -1412,15 +1412,22 @@ where
                 Ok(key) => key,
                 Err(_) => return invalid_input("Invalid master key."),
             };
-            let next = AesGcmCipher::new(&key);
-            if let Err(error) = self.providers.reencrypt_upstream_keys(&next).await {
-                return internal_error(error);
-            }
-            self.providers.cipher().install_master_key(&key);
-            if let Some(data_dir) = data_dir.as_deref()
-                && let Err(error) = crate::local_state::save_master_key_file(data_dir, &hex)
-            {
-                return internal_error(error);
+            let startup = {
+                process
+                    .lock()
+                    .expect("settings lock is not poisoned")
+                    .startup
+                    .clone()
+            };
+            if let Err(error) = self.providers.rotate_master_key(&startup, &key).await {
+                if error == ProviderServiceError::Conflict {
+                    return api_error(
+                        StatusCode::CONFLICT,
+                        "key_rotation_conflict",
+                        "Retry the pending key or update the external master key before another rotation.",
+                    );
+                }
+                return self.provider_error(error);
             }
         }
 

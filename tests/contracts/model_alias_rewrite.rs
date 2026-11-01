@@ -125,6 +125,9 @@ fn header_value(head: &str, name: &str) -> Option<String> {
 }
 
 struct Deployment {
+    metrics: Metrics,
+    database: Database,
+    first: ProviderId,
     address: SocketAddr,
     credential: String,
     second: ProviderId,
@@ -133,6 +136,10 @@ struct Deployment {
 }
 
 async fn deploy() -> Deployment {
+    deploy_with_idle(60_000).await
+}
+
+async fn deploy_with_idle(idle_ms: u64) -> Deployment {
     let upstream = spawn_upstream().await;
     let directory = tempfile::tempdir().expect("temporary directory");
     let sqlite = SqliteDatabase::connect(
@@ -146,6 +153,10 @@ async fn deploy() -> Deployment {
     let config = Config::from_settings(&std::collections::HashMap::from([
         ("TOKENSTREAM_DEVELOPMENT_MODE".to_owned(), "true".to_owned()),
         ("TOKENSTREAM_MASTER_KEY".to_owned(), "11".repeat(32)),
+        (
+            "TOKENSTREAM_STREAM_IDLE_TIMEOUT_MS".to_owned(),
+            idle_ms.to_string(),
+        ),
         (
             "TOKENSTREAM_ADMIN_PASSWORD_HASH".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA".to_owned(),
@@ -230,7 +241,7 @@ async fn deploy() -> Deployment {
         AdmissionControl::with_metrics(ProxyLimits::from_config(&config), metrics.clone());
     let gateway = Arc::new(Gateway::with_shared_cipher(
         &config,
-        database,
+        database.clone(),
         logs,
         metrics.clone(),
         PasswordWork::default(),
@@ -240,7 +251,9 @@ async fn deploy() -> Deployment {
         .await
         .expect("bind gateway");
     let address = listener.local_addr().expect("gateway address");
+    let server_metrics = metrics.clone();
     tokio::spawn(async move {
+        let metrics = server_metrics;
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
@@ -288,6 +301,9 @@ async fn deploy() -> Deployment {
     });
 
     Deployment {
+        metrics,
+        database,
+        first,
         address,
         credential: issued.credential().render(),
         second,
@@ -411,4 +427,56 @@ async fn an_alias_is_rewritten_for_the_selected_provider_only() {
     let (status, _) = post(&deployment, None, r#"{"model":"quoted"}"#).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(next_upstream(&deployment).await, r#"{"model":"gpt\"5"}"#);
+}
+
+#[tokio::test]
+async fn a_failed_upstream_exchange_is_counted_once_even_with_a_full_log_queue() {
+    use tokenstream::persistence::{ProviderRepository, ProviderUpdate};
+    use tokenstream::telemetry::ResultClass;
+    let deployment = deploy().await;
+    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = unused.local_addr().unwrap();
+    drop(unused);
+    ProviderRepository::update(
+        &deployment.database,
+        deployment.first,
+        ProviderUpdate::new().with_endpoint(url::Url::parse(&format!("http://{address}")).unwrap()),
+    )
+    .await
+    .unwrap();
+    let (status, _) = post(&deployment, None, r#"{"model":"coding"}"#).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        deployment
+            .metrics
+            .exchange_count_for_result(ResultClass::UpstreamFailure),
+        1
+    );
+    assert_eq!(
+        deployment
+            .metrics
+            .exchange_count_for_result(ResultClass::GatewayFailure),
+        0
+    );
+}
+
+#[tokio::test]
+async fn a_slow_alias_prefix_times_out_before_any_upstream_contact_and_releases_capacity() {
+    let deployment = deploy_with_idle(100).await;
+    let mut socket = TcpStream::connect(deployment.address).await.unwrap();
+    socket.write_all(format!("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Length: 1000\r\nConnection: close\r\n\r\n{{", deployment.credential).as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        socket.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert_eq!(deployment.upstream.hits.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        post(&deployment, None, r#"{"model":"coding"}"#).await.0,
+        StatusCode::OK
+    );
 }

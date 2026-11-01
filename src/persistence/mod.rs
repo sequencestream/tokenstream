@@ -1308,8 +1308,64 @@ impl HealthOutcome {
     }
 }
 
+/// One bounded, consistent configuration view for a data-plane request.
+pub struct GatewayConfiguration {
+    pub credential: ApiKeyWithBindings,
+    pub account: Option<Account>,
+    pub provider: Option<Provider>,
+    pub aliases: ModelAliasTable,
+}
+
+impl GatewayConfiguration {
+    pub(crate) fn selected_provider(
+        owned: &ApiKeyWithBindings,
+        selected: Option<&str>,
+    ) -> Option<ProviderId> {
+        match selected {
+            Some(value) => value
+                .parse::<i64>()
+                .ok()
+                .and_then(|id| ProviderId::try_from(id).ok())
+                .filter(|id| owned.allows(*id)),
+            None => owned
+                .api_key()
+                .default_provider_id()
+                .or_else(|| owned.bindings().first().map(|binding| binding.provider_id)),
+        }
+    }
+}
+
+/// Reads only data needed to prepare one request, under a single lookup budget.
+#[allow(async_fn_in_trait)]
+pub trait GatewayLookupRepository: Send + Sync {
+    async fn gateway_configuration(
+        &self,
+        key_id: &GatewayKeyId,
+        selected: Option<&str>,
+    ) -> Result<Option<GatewayConfiguration>, RepositoryError>;
+}
+
+impl GatewayLookupRepository for Database {
+    async fn gateway_configuration(
+        &self,
+        key_id: &GatewayKeyId,
+        selected: Option<&str>,
+    ) -> Result<Option<GatewayConfiguration>, RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.gateway_configuration(key_id, selected).await,
+            Self::Postgres(database) => database.gateway_configuration(key_id, selected).await,
+        }
+    }
+}
+
 #[allow(async_fn_in_trait)]
 pub trait ProviderRepository: Send + Sync {
+    /// Waits for previously issued writes, including detached driver work, to
+    /// settle before a key generation can be retired. Unsupported stores fail closed.
+    async fn settle_secret_writes(&self, _deadline: Duration) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Storage)
+    }
+
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError>;
 
     async fn list(&self, request: ProviderListRequest) -> Result<ProviderPage, RepositoryError>;
@@ -1450,6 +1506,13 @@ pub trait RequestLogRepository: Send + Sync {
 
 #[allow(async_fn_in_trait)]
 impl ProviderRepository for Database {
+    async fn settle_secret_writes(&self, deadline: Duration) -> Result<(), RepositoryError> {
+        match self {
+            Self::Sqlite(database) => database.settle_secret_writes(deadline).await,
+            Self::Postgres(database) => database.settle_secret_writes(deadline).await,
+        }
+    }
+
     async fn find_by_id(&self, id: ProviderId) -> Result<Option<Provider>, RepositoryError> {
         match self {
             Self::Sqlite(database) => ProviderRepository::find_by_id(database, id).await,

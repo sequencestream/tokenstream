@@ -12,7 +12,7 @@ For WebSocket routes the upstream handshake completes before the downstream upgr
 
 Idle connections to an origin may be reused only within a per-origin cap and idle deadline. Reuse never retries a failed exchange and never mixes credentials from two snapshots.
 
-TLS verification cannot be disabled. Plain HTTP upstreams exist only in explicit development mode.
+Transport and TLS trust configuration are prepared before serving traffic and reused for new connections. A WebSocket handshake does not reload system trust roots or discover process configuration. TLS verification cannot be disabled. Plain HTTP upstreams exist only in explicit development mode.
 
 ## Core flows
 

@@ -8,7 +8,11 @@ Verify an account-owned gateway credential, resolve the owning account and exact
 
 Admission happens before credential work so an overloaded process performs no hashing and no lookup ([ADR 0006](../adr/0006-fail-closed-resource-bounds.md)). After admission, authentication looks up the key identifier directly, verifies the Argon2id hash, resolves the owning account, and freezes the account, the credential, and one provider into an immutable snapshot ([ADR 0004](../adr/0004-request-local-immutable-snapshots.md), [ADR 0008](../adr/0008-secret-and-credential-model.md), [ADR 0013](../adr/0013-account-owned-data-plane-credentials.md)). There is no application-level credential cache.
 
-The credential belongs to an account, so a lookup is two reads: the credential row, then the account it names. Both are on the reserved lookup pool and both are inside the same execution deadline. A disabled account, a disabled credential, and an expired credential all fail before upstream contact, in that order, so an operator disabling an account stops its traffic without touching any credential. A resolved provider that is isolated or in maintenance fails closed the same way: new work is refused before any upstream is contacted, and an already admitted snapshot keeps the health state it started with.
+The credential, bounded provider bindings, owning account, selected provider and bounded alias projection are read in one short consistent view. Every read uses authentication-reserved capacity, and the complete read, including connection acquisition and transaction completion, shares one execution deadline ([ADR 0021](../adr/0021-consistent-request-preparation-and-recoverable-key-rotation.md)). SQLite uses a read transaction; PostgreSQL explicitly uses a read-only repeatable view. The view is released before hashing, and no database transaction survives into forwarding.
+
+The configuration visibility point is the read view: edits committed before it are observed, while edits concurrent with preparation may be observed by the next request. A disabled or expired credential, disabled account, disabled provider, or isolated or maintained provider fails before upstream contact. Their existing failure precedence is preserved. Already admitted streams retain their snapshots.
+
+Secret-read ownership spans configuration lookup through decryption. Replacing a retiring key generation waits for those bounded preparations; new readers fail busy instead of queueing. During ciphertext migration both generations remain readable and ordinary authentication continues.
 
 The native header is part of routing identity, and it is decided by the provider the request resolved to, not by the credential: OpenAI routes carry `Authorization: Bearer`, Anthropic routes carry `x-api-key`. Duplicate or conflicting credential headers fail here, before upstream contact.
 
@@ -59,11 +63,11 @@ A credential carries an ordered set of allowed providers and an optional default
 
 1. a dedicated provider-selection request header, when it names a member of the allowed set;
 2. otherwise the default binding, when the credential has one;
-3. otherwise fail closed.
+3. otherwise the first allowed binding in its stored preference order; an empty allowed set fails closed.
 
 The selector is read from the header map only. No branch of authentication reads the request body, deserializes anything, or looks for a model name; the allowed set is configuration, not payload ([ADR 0001](../adr/0001-transparent-proxy-core.md)). A credential bound to a single provider needs no selector at all.
 
-After the provider is resolved, authentication freezes that account's alias names for that one provider into the same snapshot ([ADR 0020](../adr/0020-model-alias-request-rewrite.md)). The read is bounded by the account alias cap and uses the same lookup deadline as the credential read. An empty result is an empty table. The table does not change which provider was selected, and authentication still does not read the body to find a model name.
+The same consistent view also supplies that account's alias names for the resolved provider as a separate immutable adapter context. Transparent transport receives only the identity and connection snapshot ([ADR 0020](../adr/0020-model-alias-request-rewrite.md)). The projection is part of the same consistent view and is bounded by the account alias cap. An empty result is an empty table. The table does not change which provider was selected, and authentication still does not read the body to find a model name.
 
 A selection naming a provider outside the allowed set is rejected as an unknown credential rather than silently falling back, so a misconfigured client fails visibly instead of reaching an unintended upstream.
 
