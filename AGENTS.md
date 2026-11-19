@@ -45,6 +45,8 @@ The core principles (payload transparency, loose upstream coupling, client-owned
 5. Prefer editing existing files.
 6. Keep the architecture simple and elegant.
 7. Change a feature with the smallest modification that satisfies it.
+8. After developing each feature, review its architecture for elegance, extensibility, and maintainability. Resolve any shortcomings and repeat the review before considering the feature complete.
+9. After developing each feature and resolving architecture review findings, run formatting and tests. Fix formatting issues and test failures before considering the feature complete.
 
 ## Verification
 
