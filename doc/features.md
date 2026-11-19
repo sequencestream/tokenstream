@@ -1,0 +1,105 @@
+- AI API access — Unified gateway access to supported native upstream APIs.
+  - OpenAI-compatible APIs — Connect to providers using the OpenAI protocol.
+    - Chat Completions — Forward `POST /v1/chat/completions` over HTTP or SSE.
+    - Responses — Forward `POST /v1/responses` over HTTP or SSE.
+    - Responses WebSocket — Relay bidirectional exchanges through `GET /v1/responses` upgrades.
+  - Anthropic-compatible APIs — Connect to providers using the Anthropic protocol.
+    - Messages — Forward `POST /v1/messages` over HTTP or SSE.
+- Transparent forwarding — Relay native traffic while preserving application content outside configured model alias replacement.
+  - Streaming transport — Support long-lived traffic with bounded memory.
+    - HTTP and SSE streaming — Stream request and response bodies with backpressure.
+    - Bidirectional WebSocket relay — Forward text and binary messages under configured size and queue limits.
+    - Cancellation propagation — Cancel the associated upstream exchange when the client disconnects.
+    - Connection reuse — Reuse upstream HTTP connections with bounded idle pools and expiration.
+  - Protocol preservation — Keep upstream protocol semantics visible to clients.
+    - Route allowlist — Validate provider protocol, method, path, and transport before upstream contact.
+    - Native credential replacement — Replace gateway credentials using OpenAI Bearer or Anthropic `x-api-key` authentication.
+    - Header and query forwarding — Preserve end-to-end headers and original query strings while sanitizing transport headers.
+    - Upstream response passthrough — Preserve upstream statuses and response bodies, including error bodies.
+    - WebSocket handshake validation — Validate the upstream handshake before accepting the downstream upgrade, allowing client-owned fallback.
+- Provider management — Configure multiple upstreams and select exactly one for each request.
+  - Provider configuration — Manage shared upstream connections as an administrator.
+    - Provider lifecycle — Create, list, inspect, edit, enable, disable, and delete unreferenced providers.
+    - Endpoint and upstream key — Configure the protocol, base endpoint, and replaceable upstream API key.
+    - Restricted deletion — Preserve providers referenced by credentials, aliases, or request logs.
+  - Provider selection — Resolve an upstream from the credential's permitted bindings.
+    - Explicit selection — Accept a dedicated request header only for a provider bound to the credential.
+    - Default selection — Use the credential's default provider or its first ordered binding when no selector is supplied.
+    - Stable active exchanges — Apply configuration changes to new requests while admitted streams retain their configuration.
+  - Health and availability — Probe configured upstreams and refuse new work when unavailable.
+    - Configurable probes — Set an optional probe path, interval, timeout, and consecutive-failure threshold.
+    - Automatic isolation and recovery — Isolate after repeated probe failures and recover after one successful probe; statuses below 500 count as healthy.
+    - Manual maintenance — Let administrators refuse new work and suspend probes during planned maintenance.
+    - Persistent health state — Retain health decisions across restarts without interrupting admitted streams.
+- Accounts and API credentials — Associate every data-plane credential and request with an account.
+  - Account administration — Manage caller identities through administrator APIs and the console.
+    - Account lifecycle — Create and inspect accounts; change names, passwords, roles, and enabled status.
+    - Two fixed roles — Separate administrator control from regular users' access to their own credentials, aliases, and logs.
+    - Account disablement — Reject new traffic from every credential belonging to a disabled account.
+    - Bootstrap administrator — Initialize and protect the administrator account against disablement or demotion.
+  - Credential lifecycle — Manage account-owned gateway access keys.
+    - Credential issuance — Create a key and display its plaintext once.
+    - In-place editing — Change name, status, expiration, provider bindings, default provider, and bounds without replacing the secret.
+    - Credential rotation — Issue a replacement credential once and invalidate the previous credential for new requests.
+    - Disablement and expiry — Reject new authentication for disabled or expired credentials.
+    - Restricted deletion — Delete credentials only when no request log references them.
+    - Provider bindings — Maintain an ordered allowed-provider set and an optional default per credential.
+- Model aliases — Use account-owned names for provider-specific upstream models.
+  - Alias configuration — Manage aliases through owner-checked control-plane APIs.
+    - Alias lifecycle — Create, list, inspect, update, and delete aliases for the authorized account.
+    - Provider-specific targets — Map one alias to an upstream model name for each configured target provider.
+    - Account isolation and bounds — Keep names unique within an account and limit each account to 100 aliases.
+  - Request model replacement — Resolve aliases after the request has selected its provider.
+    - HTTP model replacement — Replace one matching top-level `model` string within a bounded body prefix and preparation deadline.
+    - WebSocket model replacement — Replace matching top-level model names in client text messages while preserving binary and upstream messages.
+    - Native model passthrough — Preserve names that are not account aliases and leave omitted models unchanged.
+    - Unavailable-target rejection — Refuse an alias without a target for the selected provider rather than selecting another upstream.
+- Capacity and resource protection — Bound admitted traffic and resource use with immediate rejection on exhaustion.
+  - Layered admission — Apply explicitly configured transport limits to new work.
+    - Global concurrency — Limit the total number of admitted proxy exchanges.
+    - Provider limits — Set optional concurrent-request and request-rate bounds per provider.
+    - Credential limits — Set optional concurrent-request, request-rate, and long-lived WebSocket bounds per credential.
+  - Resource budgets — Bound supporting work as well as forwarding.
+    - Listener and transport bounds — Limit accepted connections, HTTP buffers, WebSocket frames, messages, and outbound queues.
+    - Authentication isolation — Reserve independent password-work budgets for the data and control planes.
+    - Database bounds — Configure pool capacity, authentication reservations, and operation deadlines.
+    - Transport deadlines — Bound connection establishment, headers, idle periods, and optionally total exchange duration.
+- Logs and observability — Inspect transport metadata without retaining application payloads.
+  - Request logs — Record account-attributed lifecycle facts on a best-effort basis.
+    - Metadata records — Capture request identity, account, credential, provider, transport, status, timing, and failure category.
+    - Filtered cursor queries — Filter by account, provider, transport, and start-time range with bounded cursor pagination.
+    - Owner-scoped visibility — Let regular users inspect their own logs and administrators inspect all accounts.
+    - Non-blocking collection — Use bounded event queues and asynchronous batches; logging failures do not block proxy traffic.
+  - Operational metrics — Expose bounded text metrics to authenticated administrators on the control plane.
+    - Results and latency — Report exchange counts, coarse outcomes, latency histograms, and derived percentiles.
+    - Active traffic and refusals — Report HTTP and WebSocket activity and admission refusals by layer and reason.
+    - Health and event delivery — Report probe outcomes, provider health-state counts, and attempted or dropped subscriber events.
+  - Process diagnostics — Emit structured operational events separately from request logs.
+    - JSON diagnostics — Write audited single-line JSON events to standard error with configurable verbosity.
+    - Sensitive-data exclusion — Keep credentials, authentication values, query strings, and application payloads out of logs and metrics.
+- Administration and security — Provide protected browser and API access to gateway configuration.
+  - Management console — Serve an embedded administration page from the control plane.
+    - Role-aware views — Present credentials, providers, accounts, request logs, and settings according to the signed-in role.
+    - Integration reference — Show supported endpoints, credential headers, placeholder cURL examples, and troubleshooting guidance.
+    - Session management — Support sign-in, session restoration, expiry, and sign-out.
+  - Access protection — Enforce authorization independently of visible controls.
+    - Plane separation — Keep account sessions and data-plane credentials mutually exclusive.
+    - Session and write protection — Use HTTP-only, same-site cookies, secure cookies in production, and CSRF checks for writes.
+    - Secret-safe responses — Redact stored secrets and prevent caching of administration JSON responses.
+  - Secret protection — Protect credentials at rest and during maintenance.
+    - Upstream key encryption — Encrypt upstream API keys at rest with AES-256-GCM and keep the master key outside the database.
+    - Password and credential hashing — Store Argon2id hashes rather than plaintext secrets.
+    - Online master-key rotation — Re-encrypt upstream keys while reads continue, with recoverable progress and interrupted-migration recovery before startup.
+- Deployment and operation — Run the gateway and administration plane in one process.
+  - Persistent configuration — Start from defaults and retain operator changes.
+    - Zero-configuration local startup — Initialize local storage and secrets using default settings.
+    - Settings management — Inspect and change settings through the console or API, with environment overrides and restart indicators.
+    - Dual storage backends — Use SQLite locally or PostgreSQL with equivalent persistence behavior.
+  - Process lifecycle — Control startup, readiness checks, and shutdown.
+    - Separate listeners — Bind data-plane and control-plane addresses independently.
+    - Health endpoints — Serve `/healthz` on both listeners for process health checks.
+    - Startup validation — Refuse startup on invalid configuration, unavailable required storage, or failed recovery.
+    - Graceful shutdown — Stop accepting new connections, drain active work, and flush logs within configured deadlines.
+  - Distribution and compatibility — Package the gateway with its administration page.
+    - Cross-platform binaries — Provide Linux and macOS amd64/arm64 and Windows amd64 release archives with checksums.
+    - Pinned-client verification — Check supported routes with pinned OpenAI and Anthropic SDKs and Codex CLI, including client-owned transport fallback.
