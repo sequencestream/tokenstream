@@ -207,9 +207,8 @@ mod diagnostic_tests {
             warn_rate_limited();
         });
         assert_eq!(output.lines().count(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("request-log diagnostic");
-        assert_eq!(event["fields"]["event"], "request_log_batch_failed");
-        assert_eq!(event["fields"]["subscriber"], "request_log");
+        let event = crate::diagnostics::parse_diagnostic_line(output.trim());
+        assert_eq!(event.event, "request_log_batch_failed");
+        assert_eq!(event.param("subscriber"), Some("request_log"));
     }
 }

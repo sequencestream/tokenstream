@@ -29,6 +29,7 @@ A new architectural fork gets an ADR before the architecture document changes. A
 | [0019](./0019-account-owned-model-alias-configuration.md) | Accepted | Account-owned model aliases; data-plane resolution superseded in part by 0020 |
 | [0020](./0020-model-alias-request-rewrite.md) | Accepted | Rewrite a caller-facing model alias to the selected provider's model name |
 | [0021](./0021-consistent-request-preparation-and-recoverable-key-rotation.md) | Accepted | Consistent request preparation, single lifecycle ownership, and recoverable online key rotation |
+| [0022](./0022-syslog-process-diagnostics.md) | Accepted | Readable lines for process diagnostics |
 
 ## Template
 

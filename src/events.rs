@@ -914,9 +914,8 @@ mod tests {
             warning.report(SubscriberName::RequestLog);
         });
         assert_eq!(output.lines().count(), 1);
-        let event: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("subscriber diagnostic");
-        assert_eq!(event["fields"]["event"], "event_subscriber_batch_failed");
-        assert_eq!(event["fields"]["subscriber"], "request_log");
+        let event = crate::diagnostics::parse_diagnostic_line(output.trim());
+        assert_eq!(event.event, "event_subscriber_batch_failed");
+        assert_eq!(event.param("subscriber"), Some("request_log"));
     }
 }

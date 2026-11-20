@@ -75,7 +75,7 @@
     - Active traffic and refusals — Report HTTP and WebSocket activity and admission refusals by layer and reason.
     - Health and event delivery — Report probe outcomes, provider health-state counts, and attempted or dropped subscriber events.
   - Process diagnostics — Emit structured operational events separately from request logs.
-    - JSON diagnostics — Write audited single-line JSON events to standard error with configurable verbosity.
+    - Readable diagnostics — Write one audited line per event to standard error, with a timestamp, level, target, and constant message, and with configurable verbosity.
     - Sensitive-data exclusion — Keep credentials, authentication values, query strings, and application payloads out of logs and metrics.
 - Administration and security — Provide protected browser and API access to gateway configuration.
   - Management console — Serve an embedded administration page from the control plane.

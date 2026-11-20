@@ -63,16 +63,16 @@ fn startup_error_does_not_echo_an_invalid_secret() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    let event: Value = serde_json::from_str(stderr.trim()).expect("single JSON diagnostic");
-    assert_eq!(event["fields"]["event"], "process_start_failed");
-    assert_eq!(event["fields"]["stage"], "configuration");
-    assert_eq!(event["fields"]["setting"], "TOKENSTREAM_MASTER_KEY");
+    let event = parse_diagnostic(stderr.trim());
+    assert_eq!(event.event, "process_start_failed");
+    assert_eq!(event.param("stage"), Some("configuration"));
+    assert_eq!(event.param("setting"), Some("TOKENSTREAM_MASTER_KEY"));
     assert!(stderr.contains("TOKENSTREAM_MASTER_KEY"));
     assert!(!stderr.contains(secret));
 }
 
 #[test]
-fn invalid_log_filter_fails_with_a_sanitized_json_diagnostic() {
+fn invalid_log_filter_fails_with_a_sanitized_diagnostic() {
     let hostile = "authorization=Bearer-secret,payload=[";
     let output = Command::new(env!("CARGO_BIN_EXE_tokenstream"))
         .env_clear()
@@ -85,11 +85,11 @@ fn invalid_log_filter_fails_with_a_sanitized_json_diagnostic() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert_eq!(stderr.lines().count(), 1);
-    let event: Value = serde_json::from_str(stderr.trim()).expect("single JSON diagnostic");
-    assert_eq!(event["level"], "ERROR");
-    assert_eq!(event["target"], "tokenstream::process");
-    assert_eq!(event["fields"]["event"], "process_start_failed");
-    assert_eq!(event["fields"]["setting"], "TOKENSTREAM_LOG_FILTER");
+    let event = parse_diagnostic(stderr.trim());
+    assert_eq!(event.param("level"), Some("ERROR"));
+    assert_eq!(event.param("target"), Some("tokenstream::process"));
+    assert_eq!(event.event, "process_start_failed");
+    assert_eq!(event.param("setting"), Some("TOKENSTREAM_LOG_FILTER"));
     assert!(!stderr.contains(hostile));
     assert!(!stderr.contains("Bearer-secret"));
 }
@@ -120,27 +120,19 @@ fn explicit_filter_applies_to_structured_runtime_diagnostics() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(!stderr.contains(secret_marker));
-    let events = stderr
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("JSON diagnostic"))
-        .collect::<Vec<_>>();
+    let events = stderr.lines().map(parse_diagnostic).collect::<Vec<_>>();
     assert_eq!(events.len(), 1, "info events must be filtered out");
     let keys = events[0]
-        .as_object()
-        .expect("diagnostic object")
+        .params
         .keys()
         .map(String::as_str)
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(keys, ["fields", "level", "target", "timestamp"].into());
-    assert_eq!(events[0]["level"], "ERROR");
-    assert_eq!(events[0]["fields"]["event"], "process_start_failed");
-    assert_eq!(events[0]["fields"]["error_kind"], "storage_unavailable");
-    assert_eq!(
-        events[0]["fields"]["message"],
-        "Tokenstream failed to start."
-    );
-    assert!(events[0].get("span").is_none());
-    assert!(events[0].get("spans").is_none());
+    assert_eq!(keys, ["error_kind", "level", "stage", "target"].into());
+    assert_eq!(events[0].param("level"), Some("ERROR"));
+    assert_eq!(events[0].event, "process_start_failed");
+    assert_eq!(events[0].param("error_kind"), Some("storage_unavailable"));
+    assert_eq!(events[0].message, "Tokenstream failed to start.");
+    assert!(!stderr.contains("span"));
 }
 
 #[test]
@@ -177,19 +169,18 @@ fn database_startup_emits_only_audited_diagnostics_for_permissive_filters() {
         assert!(!stderr.contains("CREATE TABLE"));
         assert!(!stderr.contains("SELECT "));
         for line in stderr.lines() {
-            let event: Value = serde_json::from_str(line).expect("structured diagnostic");
-            let keys = event
-                .as_object()
-                .expect("diagnostic object")
-                .keys()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>();
-            assert_eq!(keys, ["fields", "level", "target", "timestamp"].into());
-            assert!(event["fields"]["event"].is_string());
-            assert!(event["fields"]["message"].is_string());
+            let event = parse_diagnostic(line);
+            for key in event.params.keys() {
+                assert!(
+                    ALLOWED_PARAMETERS.contains(&key.as_str()),
+                    "unexpected parameter {key} in {line}"
+                );
+            }
+            assert!(!event.event.is_empty());
+            assert!(!event.message.is_empty());
             assert!(
-                event["target"]
-                    .as_str()
+                event
+                    .param("target")
                     .is_some_and(|target| target.starts_with("tokenstream::"))
             );
         }
@@ -232,12 +223,12 @@ fn fatal_startup_failure_is_not_silenced_by_a_disabling_filter() {
             1,
             "filter {filter:?} must emit exactly one fatal diagnostic: {stderr:?}"
         );
-        let event: Value = serde_json::from_str(stderr.trim()).expect("single JSON diagnostic");
-        assert_eq!(event["level"], "ERROR");
-        assert_eq!(event["target"], "tokenstream::process");
-        assert_eq!(event["fields"]["event"], "process_start_failed");
-        assert_eq!(event["fields"]["stage"], "database_connection");
-        assert_eq!(event["fields"]["error_kind"], "storage_unavailable");
+        let event = parse_diagnostic(stderr.trim());
+        assert_eq!(event.param("level"), Some("ERROR"));
+        assert_eq!(event.param("target"), Some("tokenstream::process"));
+        assert_eq!(event.event, "process_start_failed");
+        assert_eq!(event.param("stage"), Some("database_connection"));
+        assert_eq!(event.param("error_kind"), Some("storage_unavailable"));
         assert!(
             !stderr.contains(filter),
             "filter value must not echo into the diagnostic: {stderr:?}"
@@ -296,15 +287,15 @@ fn configured_and_default_admin_passwords_never_use_credential_output() {
     let events = String::from_utf8(default_output.stderr)
         .expect("default stderr UTF-8")
         .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("default JSON diagnostic"))
+        .map(parse_diagnostic)
         .collect::<Vec<_>>();
     assert!(
         events
             .iter()
-            .any(|event| { event["fields"]["event"] == "default_admin_password_enabled" })
+            .any(|event| event.event == "default_admin_password_enabled")
     );
     assert!(events.iter().all(|event| {
-        !contains_exact_string(event, tokenstream::local_state::DEFAULT_ADMIN_PASSWORD)
+        !diagnostic_records_exact(event, tokenstream::local_state::DEFAULT_ADMIN_PASSWORD)
     }));
 }
 
@@ -355,7 +346,7 @@ fn generated_bootstrap_password_is_output_only_for_the_first_creation() {
     let second_stderr = String::from_utf8(second_output.stderr).expect("second stderr UTF-8");
     assert!(!second_stderr.contains(&password));
     for line in second_stderr.lines() {
-        serde_json::from_str::<Value>(line).expect("structured stderr diagnostic");
+        parse_diagnostic(line);
     }
 }
 
@@ -379,14 +370,11 @@ fn bootstrap_stdout_failure_is_sanitized_and_not_replayed() {
         .expect("failure stderr")
         .read_to_string(&mut stderr)
         .expect("read failure stderr");
-    let events = stderr
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("structured failure diagnostic"))
-        .collect::<Vec<_>>();
+    let events = stderr.lines().map(parse_diagnostic).collect::<Vec<_>>();
     assert!(events.iter().any(|event| {
-        event["fields"]["event"] == "process_start_failed"
-            && event["fields"]["stage"] == "bootstrap"
-            && event["fields"]["error_kind"] == "credential_delivery_failed"
+        event.event == "process_start_failed"
+            && event.param("stage") == Some("bootstrap")
+            && event.param("error_kind") == Some("credential_delivery_failed")
     }));
     assert!(!stderr.contains("password"));
 
@@ -534,17 +522,73 @@ fn assert_admin_login(address: SocketAddr, password: &str) {
     );
 }
 
-fn contains_exact_string(value: &Value, needle: &str) -> bool {
-    match value {
-        Value::String(value) => value == needle,
-        Value::Array(values) => values
-            .iter()
-            .any(|value| contains_exact_string(value, needle)),
-        Value::Object(values) => values
-            .values()
-            .any(|value| contains_exact_string(value, needle)),
-        _ => false,
+const ALLOWED_PARAMETERS: &[&str] = &[
+    "level",
+    "target",
+    "stage",
+    "error_kind",
+    "backend",
+    "operation",
+    "subscriber",
+    "data_address",
+    "control_address",
+    "configured",
+    "setting",
+    "requirement",
+];
+
+struct ParsedDiagnostic {
+    event: String,
+    message: String,
+    params: std::collections::BTreeMap<String, String>,
+}
+
+impl ParsedDiagnostic {
+    fn param(&self, name: &str) -> Option<&str> {
+        self.params.get(name).map(String::as_str)
     }
+}
+
+fn parse_diagnostic(line: &str) -> ParsedDiagnostic {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (head, rest) = line
+        .split_once("] - ")
+        .unwrap_or_else(|| panic!("diagnostic message in {line}"));
+    let (prefix, target) = head
+        .rsplit_once(" [")
+        .unwrap_or_else(|| panic!("diagnostic target in {line}"));
+    let (_timestamp, level) = prefix
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("diagnostic level in {line}"));
+    let mut parts = rest.split(" | ");
+    let message = parts
+        .next()
+        .unwrap_or_else(|| panic!("diagnostic message in {line}"));
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("level".to_owned(), level.to_owned());
+    params.insert("target".to_owned(), target.to_owned());
+    let mut event = None;
+    for part in parts {
+        let (name, value) = part
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("diagnostic field in {line}"));
+        if name == "event" {
+            event = Some(value.to_owned());
+        } else {
+            params.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    ParsedDiagnostic {
+        event: event.unwrap_or_else(|| panic!("diagnostic event in {line}")),
+        message: message.to_owned(),
+        params,
+    }
+}
+
+fn diagnostic_records_exact(event: &ParsedDiagnostic, needle: &str) -> bool {
+    event.event == needle
+        || event.message == needle
+        || event.params.values().any(|value| value == needle)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

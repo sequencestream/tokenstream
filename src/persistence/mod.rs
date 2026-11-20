@@ -2343,11 +2343,10 @@ mod diagnostic_tests {
                 Err(RepositoryError::InvalidStoredData)
             ));
         });
-        let event: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("invalid-row diagnostic");
-        assert_eq!(event["fields"]["event"], "invalid_request_log_row");
-        assert_eq!(event["fields"]["backend"], "database");
-        assert_eq!(event["fields"]["operation"], "decode_request_log");
+        let event = crate::diagnostics::parse_diagnostic_line(output.trim());
+        assert_eq!(event.event, "invalid_request_log_row");
+        assert_eq!(event.param("backend"), Some("database"));
+        assert_eq!(event.param("operation"), Some("decode_request_log"));
         assert!(!output.contains(secret));
     }
 }

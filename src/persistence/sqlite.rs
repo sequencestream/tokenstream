@@ -1629,12 +1629,11 @@ mod diagnostic_tests {
                     RepositoryError::Storage
                 );
             });
-            let event: serde_json::Value =
-                serde_json::from_str(output.trim()).expect("repository diagnostic");
-            assert_eq!(event["fields"]["event"], "repository_operation_failed");
-            assert_eq!(event["fields"]["backend"], "sqlite");
-            assert_eq!(event["fields"]["operation"], operation);
-            assert_eq!(event["fields"]["error_kind"], "protocol");
+            let event = crate::diagnostics::parse_diagnostic_line(output.trim());
+            assert_eq!(event.event, "repository_operation_failed");
+            assert_eq!(event.param("backend"), Some("sqlite"));
+            assert_eq!(event.param("operation"), Some(operation));
+            assert_eq!(event.param("error_kind"), Some("protocol"));
             assert!(!output.contains(secret));
         }
     }

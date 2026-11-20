@@ -2423,11 +2423,10 @@ mod diagnostic_tests {
             let response = internal_error(secret);
             assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         });
-        let event: serde_json::Value =
-            serde_json::from_str(output.trim()).expect("administration diagnostic");
-        assert_eq!(event["fields"]["event"], "administration_request_failed");
-        assert_eq!(event["fields"]["operation"], "request");
-        assert_eq!(event["fields"]["error_kind"], "internal");
+        let event = crate::diagnostics::parse_diagnostic_line(output.trim());
+        assert_eq!(event.event, "administration_request_failed");
+        assert_eq!(event.param("operation"), Some("request"));
+        assert_eq!(event.param("error_kind"), Some("internal"));
         assert!(!output.contains(secret));
     }
 }

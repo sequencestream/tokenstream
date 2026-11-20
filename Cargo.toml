@@ -28,7 +28,7 @@ tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-
 tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
 tower-service = "0.3.3"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 url = "2.5.7"
 zeroize = "1.8.2"
 

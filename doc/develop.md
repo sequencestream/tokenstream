@@ -114,8 +114,14 @@ Exhausted hashing capacity rejects new work with `503 resource_exhausted`; it do
 
 | Stream | Content | Handling |
 | --- | --- | --- |
-| Standard error | One JSON diagnostic per line: `timestamp`, `level`, `target`, `fields`; stable `event` and `message` in `fields` | Collect as process logs |
+| Standard error | One line: UTC timestamp, level, bracketed target, constant message, then `key: value` fields separated by a vertical bar | Collect as process logs |
 | Standard output | One generated bootstrap-password record, only when needed and the account is first created | Capture securely on first production start |
+
+A startup failure looks like this:
+
+```text
+2026-11-20T01:20:00.123456Z ERROR [tokenstream::process] - Tokenstream failed to start. | event: process_start_failed | stage: database_connection | error_kind: storage_unavailable
+```
 
 Default and explicitly supplied passwords are never printed. A generated password is not printed again on restart. Diagnostic filters select only audited Tokenstream events; dependency and unknown targets stay excluded. Empty or invalid filters prevent startup without echoing the value.
 

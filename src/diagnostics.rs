@@ -1,4 +1,4 @@
-//! Structured process diagnostics and isolated one-time credential delivery.
+//! Process diagnostics as single readable lines, and isolated one-time credential delivery.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -11,8 +11,11 @@ use tracing::{Event, Metadata, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::filter_fn;
 use tracing_subscriber::fmt as tracing_fmt;
+use tracing_subscriber::fmt::FormatEvent;
+use tracing_subscriber::fmt::format::Writer as FormatWriter;
 use tracing_subscriber::layer::{Context, Filter};
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 
 pub const DEFAULT_FILTER: &str = "info";
 
@@ -136,10 +139,9 @@ where
     let filter = EnvFilter::try_new(filter).map_err(|_| InstallError)?;
     Ok(tracing_subscriber::registry().with(
         tracing_fmt::layer()
-            .json()
+            .event_format(DiagnosticFormat)
+            .with_ansi(false)
             .with_writer(writer)
-            .with_current_span(false)
-            .with_span_list(false)
             .with_filter(filter)
             .with_filter(filter_fn(is_diagnostic_metadata))
             .with_filter(DiagnosticEventFilter),
@@ -513,24 +515,131 @@ impl Visit for DiagnosticEventVisitor<'_> {
     }
 }
 
-#[derive(Serialize)]
-struct FallbackFields<'a> {
-    event: &'static str,
-    message: &'static str,
-    stage: &'a str,
-    error_kind: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    setting: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    requirement: Option<&'a str>,
+#[derive(Clone, Copy)]
+struct DiagnosticFormat;
+
+#[derive(Default)]
+struct CapturedEvent {
+    event: Option<String>,
+    message: Option<String>,
+    stage: Option<String>,
+    error_kind: Option<String>,
+    backend: Option<String>,
+    operation: Option<String>,
+    subscriber: Option<String>,
+    data_address: Option<String>,
+    control_address: Option<String>,
+    configured: Option<bool>,
 }
 
-#[derive(Serialize)]
-struct FallbackEvent<'a> {
-    timestamp: String,
-    level: &'static str,
-    target: &'static str,
-    fields: FallbackFields<'a>,
+impl<S, N> FormatEvent<S, N> for DiagnosticFormat
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> tracing_fmt::FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        _context: &tracing_fmt::FmtContext<'_, S, N>,
+        mut writer: FormatWriter<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let mut captured = CapturedEvent::default();
+        event.record(&mut captured);
+        write_captured(
+            &mut writer,
+            level_name(event.metadata().level()),
+            event.metadata().target(),
+            &captured,
+        )
+    }
+}
+
+impl Visit for CapturedEvent {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let slot = match field.name() {
+            "event" => &mut self.event,
+            "message" => &mut self.message,
+            "stage" => &mut self.stage,
+            "error_kind" => &mut self.error_kind,
+            "backend" => &mut self.backend,
+            "operation" => &mut self.operation,
+            "subscriber" => &mut self.subscriber,
+            "data_address" => &mut self.data_address,
+            "control_address" => &mut self.control_address,
+            _ => return,
+        };
+        *slot = Some(value.to_owned());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "configured" {
+            self.configured = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn fmt::Debug) {}
+}
+
+fn level_name(level: &tracing::Level) -> &'static str {
+    match *level {
+        tracing::Level::ERROR => "ERROR",
+        tracing::Level::WARN => "WARN",
+        tracing::Level::INFO => "INFO",
+        tracing::Level::DEBUG => "DEBUG",
+        tracing::Level::TRACE => "TRACE",
+    }
+}
+
+fn write_diagnostic_line(
+    writer: &mut impl fmt::Write,
+    level: &str,
+    target: &str,
+    event: &str,
+    message: &str,
+    context: &[(&str, &str)],
+) -> fmt::Result {
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
+    write!(
+        writer,
+        "{timestamp} {level} [{target}] - {message} | event: {event}"
+    )?;
+    for (name, value) in context {
+        write!(writer, " | {name}: {value}")?;
+    }
+    writer.write_char('\n')
+}
+
+fn write_captured(
+    writer: &mut impl fmt::Write,
+    level: &str,
+    target: &str,
+    captured: &CapturedEvent,
+) -> fmt::Result {
+    let (Some(event), Some(message)) = (captured.event.as_deref(), captured.message.as_deref())
+    else {
+        return Ok(());
+    };
+    let configured = match captured.configured {
+        Some(true) => Some("true"),
+        Some(false) => Some("false"),
+        None => None,
+    };
+    let mut context = Vec::new();
+    for (name, value) in [
+        ("stage", captured.stage.as_deref()),
+        ("error_kind", captured.error_kind.as_deref()),
+        ("backend", captured.backend.as_deref()),
+        ("operation", captured.operation.as_deref()),
+        ("subscriber", captured.subscriber.as_deref()),
+        ("data_address", captured.data_address.as_deref()),
+        ("control_address", captured.control_address.as_deref()),
+        ("configured", configured),
+    ] {
+        if let Some(value) = value {
+            context.push((name, value));
+        }
+    }
+    write_diagnostic_line(writer, level, target, event, message, &context)
 }
 
 pub fn write_fatal(
@@ -547,21 +656,26 @@ pub fn write_fatal_to(
     error_kind: StartupErrorKind,
     config: Option<ConfigFailure<'_>>,
 ) -> io::Result<()> {
-    let event = FallbackEvent {
-        timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true),
-        level: "ERROR",
-        target: "tokenstream::process",
-        fields: FallbackFields {
-            event: "process_start_failed",
-            message: "Tokenstream failed to start.",
-            stage: stage.as_str(),
-            error_kind: error_kind.as_str(),
-            setting: config.map(|value| value.setting),
-            requirement: config.and_then(|value| value.requirement),
-        },
-    };
-    serde_json::to_writer(&mut writer, &event)?;
-    writer.write_all(b"\n")?;
+    let mut context = Vec::new();
+    context.push(("stage", stage.as_str()));
+    context.push(("error_kind", error_kind.as_str()));
+    if let Some(config) = config {
+        context.push(("setting", config.setting));
+        if let Some(requirement) = config.requirement {
+            context.push(("requirement", requirement));
+        }
+    }
+    let mut line = String::new();
+    write_diagnostic_line(
+        &mut line,
+        "ERROR",
+        "tokenstream::process",
+        "process_start_failed",
+        DiagnosticEvent::ProcessStartFailed.message(),
+        &context,
+    )
+    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "diagnostic line"))?;
+    writer.write_all(line.as_bytes())?;
     writer.flush()
 }
 
@@ -697,6 +811,60 @@ pub(crate) fn capture_for_test(run: impl FnOnce()) -> String {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ParsedDiagnostic {
+    pub timestamp: String,
+    pub event: String,
+    pub message: String,
+    pub params: std::collections::BTreeMap<String, String>,
+}
+
+#[cfg(test)]
+impl ParsedDiagnostic {
+    pub(crate) fn param(&self, name: &str) -> Option<&str> {
+        self.params.get(name).map(String::as_str)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn parse_diagnostic_line(line: &str) -> ParsedDiagnostic {
+    let line = line.trim_end_matches(['\r', '\n']);
+    let (head, rest) = line
+        .split_once("] - ")
+        .unwrap_or_else(|| panic!("diagnostic message in {line}"));
+    let (prefix, target) = head
+        .rsplit_once(" [")
+        .unwrap_or_else(|| panic!("diagnostic target in {line}"));
+    let (timestamp, level) = prefix
+        .split_once(' ')
+        .unwrap_or_else(|| panic!("diagnostic level in {line}"));
+    let mut parts = rest.split(" | ");
+    let message = parts
+        .next()
+        .unwrap_or_else(|| panic!("diagnostic message in {line}"));
+    let mut params = std::collections::BTreeMap::new();
+    params.insert("level".to_owned(), level.to_owned());
+    params.insert("target".to_owned(), target.to_owned());
+    let mut event = None;
+    for part in parts {
+        let (name, value) = part
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("diagnostic field in {line}"));
+        if name == "event" {
+            event = Some(value.to_owned());
+        } else {
+            params.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    ParsedDiagnostic {
+        timestamp: timestamp.to_owned(),
+        event: event.unwrap_or_else(|| panic!("diagnostic event in {line}")),
+        message: message.to_owned(),
+        params,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::Write;
     use std::sync::{Arc, Mutex};
@@ -727,12 +895,16 @@ mod tests {
         .expect("write fallback event");
         let text = String::from_utf8(output).expect("UTF-8 diagnostic");
         assert_eq!(text.lines().count(), 1);
-        let value: Value = serde_json::from_str(text.trim()).expect("JSON diagnostic");
-        assert!(value["timestamp"].is_string());
-        assert_eq!(value["level"], "ERROR");
-        assert_eq!(value["target"], "tokenstream::process");
-        assert_eq!(value["fields"]["event"], "process_start_failed");
-        assert_eq!(value["fields"]["stage"], "configuration");
+        let event = parse_diagnostic_line(text.trim());
+        assert!(event.timestamp.contains('T') && event.timestamp.ends_with('Z'));
+        assert_eq!(event.param("level"), Some("ERROR"));
+        assert_eq!(event.param("target"), Some("tokenstream::process"));
+        assert_eq!(event.event, "process_start_failed");
+        assert_eq!(event.param("stage"), Some("configuration"));
+        assert_eq!(event.message, "Tokenstream failed to start.");
+        assert!(text.contains(
+            " ERROR [tokenstream::process] - Tokenstream failed to start. | event: process_start_failed | stage: configuration | error_kind: invalid_setting"
+        ));
     }
 
     #[test]
@@ -747,11 +919,11 @@ mod tests {
         )
         .expect("write fallback event");
         let text = String::from_utf8(output).expect("UTF-8 diagnostic");
-        let value: Value = serde_json::from_str(text.trim()).expect("JSON diagnostic");
-        assert_eq!(value["fields"]["setting"], "unknown_setting");
+        let event = parse_diagnostic_line(text.trim());
+        assert_eq!(event.param("setting"), Some("unknown_setting"));
         assert_eq!(
-            value["fields"]["requirement"],
-            "invalid configuration value"
+            event.param("requirement"),
+            Some("invalid configuration value")
         );
         assert!(!text.contains(secret));
     }
@@ -766,10 +938,11 @@ mod tests {
             None,
         )
         .expect("write migration failure");
-        let event: Value = serde_json::from_slice(&output).expect("migration diagnostic");
-        assert_eq!(event["fields"]["event"], "process_start_failed");
-        assert_eq!(event["fields"]["stage"], "migration");
-        assert_eq!(event["fields"]["error_kind"], "migration_failed");
+        let text = String::from_utf8(output).expect("UTF-8 diagnostic");
+        let event = parse_diagnostic_line(&text);
+        assert_eq!(event.event, "process_start_failed");
+        assert_eq!(event.param("stage"), Some("migration"));
+        assert_eq!(event.param("error_kind"), Some("migration_failed"));
     }
 
     #[test]
@@ -782,9 +955,10 @@ mod tests {
                 configured = false,
             );
         });
-        let event: Value = serde_json::from_str(output.trim()).expect("JSON diagnostic");
-        assert_eq!(event["fields"]["event"], "data_directory_resolved");
-        assert_eq!(event["fields"]["configured"], false);
+        let event = parse_diagnostic_line(output.trim());
+        assert_eq!(event.event, "data_directory_resolved");
+        assert_eq!(event.param("configured"), Some("false"));
+        assert_eq!(event.param("level"), Some("INFO"));
     }
 
     #[test]
@@ -798,7 +972,7 @@ mod tests {
     }
 
     #[test]
-    fn local_subscriber_writes_one_filtered_json_envelope() {
+    fn local_subscriber_writes_one_filtered_line() {
         #[derive(Clone)]
         struct Buffer(Arc<Mutex<Vec<u8>>>);
 
@@ -851,18 +1025,46 @@ mod tests {
         let bytes = output.lock().expect("output lock").clone();
         let text = String::from_utf8(bytes).expect("UTF-8 diagnostics");
         assert_eq!(text.lines().count(), 1);
-        let event: Value = serde_json::from_str(text.trim()).expect("JSON diagnostic");
+        let event = parse_diagnostic_line(text.trim());
         let keys = event
-            .as_object()
-            .expect("diagnostic object")
+            .params
             .keys()
             .map(String::as_str)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(keys, ["fields", "level", "target", "timestamp"].into());
-        assert_eq!(event["target"], "tokenstream::process");
-        assert_eq!(event["fields"]["event"], "process_starting");
-        assert_eq!(event["fields"]["message"], "Tokenstream is starting.");
+        assert_eq!(
+            keys,
+            ["control_address", "data_address", "level", "target"].into()
+        );
+        assert_eq!(event.param("target"), Some("tokenstream::process"));
+        assert_eq!(event.event, "process_starting");
+        assert_eq!(event.message, "Tokenstream is starting.");
+        assert!(text.contains(
+            " DEBUG [tokenstream::process] - Tokenstream is starting. | event: process_starting | data_address: 127.0.0.1:3300 | control_address: 127.0.0.1:3301\n"
+        ));
         assert!(!text.contains("SELECT"));
         assert!(!text.contains("hostile-secret"));
+        assert!(!text.contains("span"));
+    }
+
+    #[test]
+    fn diagnostic_line_keeps_an_address_and_the_sentence() {
+        let output = capture_for_test(|| {
+            tracing::info!(
+                target: "tokenstream::process",
+                event = "process_starting",
+                message = "Tokenstream is starting.",
+                data_address = "[::1]:3300",
+                control_address = "127.0.0.1:3301",
+            );
+        });
+        let line = output.trim();
+        assert!(
+            line.contains("data_address: [::1]:3300"),
+            "address missing from {line}"
+        );
+        assert!(line.contains("] - Tokenstream is starting. | event: process_starting"));
+        let event = parse_diagnostic_line(line);
+        assert_eq!(event.param("data_address"), Some("[::1]:3300"));
+        assert_eq!(event.param("level"), Some("INFO"));
     }
 }
