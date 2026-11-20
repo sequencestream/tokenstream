@@ -1,51 +1,35 @@
 # AGENTS.md
 
-Entry point for agents and contributors. Defines the rules governing Tokenstream. Long-term architecture and principles live in `doc/architecture.md`; module designs live under `doc/modules/`; architecture decision records live under `doc/adr/`.
+Rules for agents and contributors working on Tokenstream.
 
-## Documentation Independence Principle
+## Design Authority
 
-> **Core Constraint**: Documentation and source code must remain independent and self-consistent.
+| Source | Purpose |
+| --- | --- |
+| `doc/architecture.md` | Principles, constraints, security invariants, public contracts, and verification |
+| `doc/modules/` | Module designs and boundaries |
+| `doc/adr/` | Accepted architectural decisions |
+| `doc/develop.md` | Local development, verification, and releases |
 
-- Docs capture architecture-level concepts, flows, rules, and constraints; they do not describe implementation.
-- Docs must not reference code files, functions, types, or line numbers.
-- Code must not reference docs — no comments pointing to documentation.
-- Each artifact stands on its own. When they diverge, reconcile both.
-- Doc-to-doc references are allowed.
-
-## Documentation Index
-
-| Document | Path | Description |
-| --- | --- | --- |
-| Architecture | `doc/architecture.md` | Positioning, principles, constraints, data model, public contracts, and verification |
-| Development | `doc/develop.md` | Local build, settings, launch, verification, and GitHub Releases |
-| Decisions | `doc/adr/` | Accepted forks among real alternatives |
-| Process | `doc/modules/process.md` | Configuration, listeners, and graceful shutdown |
-| Authentication | `doc/modules/authentication.md` | Gateway credential verification and snapshots |
-| Accounts and credentials | `doc/modules/credentials.md` | Account ownership, credential lifecycle, provider bindings |
-| Model aliases | `doc/modules/model-aliases.md` | Account-owned model alias configuration and target bounds |
-| Model rewrite | `doc/modules/model-rewrite.md` | Replacement of a caller-facing model name after provider selection |
-| Routing | `doc/modules/routing.md` | Route and transport allowlist decisions |
-| Proxy | `doc/modules/proxy.md` | HTTP/SSE streaming and WebSocket relay |
-| Providers | `doc/modules/providers.md` | Provider lifecycle and snapshot loading |
-| Events | `doc/modules/events.md` | The request-lifecycle sideband event bus and its bounded subscribers |
-| Logging | `doc/modules/logging.md` | Bounded, non-blocking transport-metadata logging |
-| Observability | `doc/modules/observability.md` | The bounded operational exposition and its result classification |
-| Administration | `doc/modules/administration.md` | Control-plane session, APIs, administration page, and page presentation |
-
-## Architecture Authority
-
-The core principles (payload transparency, loose upstream coupling, client-owned fallback, performance first, explicit scope discipline), the non-negotiable proxy/logging/bounds constraints, the security invariants, and the route and header policies are defined in `doc/architecture.md` and bind every change. Module designs apply those rules within their own boundary and must never relax them; when a document relies on these rules, it references the architecture document rather than redefining them. A new architectural fork is recorded as an ADR under `doc/adr/` before the architecture document changes.
+Every change must comply with the architecture, relevant module designs, and ADRs. Module designs must reference architectural rules rather than redefine or relax them. Record new architectural forks in an ADR before changing the architecture document.
 
 ## Working Rules
 
-1. No application-payload types in the proxy core.
-2. No out-of-scope features without approval.
-3. Verify behavior against `doc/architecture.md`, the relevant module designs under `doc/modules/`, and the relevant ADRs under `doc/adr/`.
-4. No doc↔code cross-references; keep docs self-consistent.
-5. Prefer editing existing files.
-6. Keep the architecture simple and elegant.
-7. Change a feature with the smallest modification that satisfies it.
+- Keep the architecture simple and elegant; make the smallest change that satisfies the feature and prefer existing files.
+- Do not introduce application-payload types into the proxy core.
+- Obtain approval before adding out-of-scope features.
 
-## Verification
+## Documentation Independence
 
-Complete only when unit, repository, HTTP/WebSocket contract, security, load, and pinned-client compatibility tests pass. See the architecture document for details.
+- Docs describe architectural concepts, flows, rules, and constraints, not implementation.
+- Docs must not reference code files, functions, types, or line numbers; code must not reference docs. Doc-to-doc references are allowed.
+- Docs and code must each stand alone and remain self-consistent. Reconcile both when they diverge.
+
+## Feature Completion
+
+After developing each feature:
+
+1. Review the architecture for elegance, extensibility, and maintainability. Fix shortcomings and repeat until the review passes.
+2. Run formatting and tests after resolving review findings. Fix all formatting issues and test failures before completion.
+
+Required tests include unit, repository, HTTP/WebSocket contract, security, load, and pinned-client compatibility tests, as defined in `doc/architecture.md`.
