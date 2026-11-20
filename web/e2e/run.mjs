@@ -361,6 +361,12 @@ async function runSuite(browser, origin, label) {
   try {
     await page.goto(origin, { waitUntil: 'networkidle' })
     await page.getByRole('heading', { name: 'Sign in' }).waitFor()
+    await page.getByRole('button', { name: '中文', exact: true }).click()
+    await page.getByRole('heading', { name: '登录' }).waitFor()
+    await page.reload({ waitUntil: 'networkidle' })
+    await page.getByRole('heading', { name: '登录' }).waitFor()
+    await page.getByRole('button', { name: 'EN', exact: true }).click()
+    await page.getByRole('heading', { name: 'Sign in' }).waitFor()
     if (label === 'hosted') {
       const document = await page.evaluate(async () => {
         const response = await fetch('/', { credentials: 'same-origin' })

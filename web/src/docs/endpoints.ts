@@ -102,21 +102,27 @@ export function curlExamples(): CurlExample[] {
   ]
 }
 
+export type TroubleshootingId = 'unauthorized' | 'mismatch' | 'unavailable'
+
 export interface TroubleshootingNote {
+  id: TroubleshootingId
   symptom: string
   cause: string
 }
 
 export const TROUBLESHOOTING: TroubleshootingNote[] = [
   {
+    id: 'unauthorized',
     symptom: '401',
     cause: 'The credential is wrong, expired, disabled, or sent in the wrong header. OpenAI routes take Authorization: Bearer; Anthropic routes take x-api-key.',
   },
   {
+    id: 'mismatch',
     symptom: '404',
     cause: 'The protocol and the path do not match. Each protocol answers only its own allowed paths, and a path valid for one protocol is rejected when presented to another.',
   },
   {
+    id: 'unavailable',
     symptom: '503, or no upstream at all',
     cause: 'The selected provider is unavailable or in maintenance. The request is refused rather than rerouted to another provider, so a retry reaches the same provider again.',
   },

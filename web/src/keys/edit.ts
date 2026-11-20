@@ -1,4 +1,5 @@
 import type { ApiKey, ApiKeyAdmissionWrite } from '../api/client.ts'
+import type { MessagePath } from '../locale/en.ts'
 
 /**
  * The credential edit, as the page holds it.
@@ -72,15 +73,15 @@ function expiryDraft(value: string | null): string {
  * An empty draft clears the expiration, which the server expresses as an
  * explicit null rather than as an absent field.
  */
-export function readExpiry(raw: string): { value: string | null } | { error: string } {
+export function readExpiry(raw: string): { value: string | null } | { error: MessagePath } {
   const text = raw.trim()
   if (text === '') return { value: null }
   const parsed = new Date(text)
   if (Number.isNaN(parsed.getTime())) {
-    return { error: 'Enter a date and time, or leave it empty for no expiry.' }
+    return { error: 'expiry.invalid' }
   }
   if (parsed.getTime() <= Date.now()) {
-    return { error: 'An expiry in the past would never authenticate. Choose a future time.' }
+    return { error: 'expiry.past' }
   }
   return { value: parsed.toISOString() }
 }

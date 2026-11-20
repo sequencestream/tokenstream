@@ -80,6 +80,7 @@
 - Administration and security — Provide protected browser and API access to gateway configuration.
   - Management console — Serve an embedded administration page from the control plane.
     - Role-aware views — Present credentials, providers, accounts, request logs, and settings according to the signed-in role.
+    - Language — Switch the administration page between English and Simplified Chinese. The choice stays in the browser.
     - Integration reference — Show supported endpoints, credential headers, placeholder cURL examples, and troubleshooting guidance.
     - Session management — Support sign-in, session restoration, expiry, and sign-out.
   - Access protection — Enforce authorization independently of visible controls.

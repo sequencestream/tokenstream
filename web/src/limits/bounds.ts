@@ -1,3 +1,5 @@
+import type { MessagePath } from '../locale/en.ts'
+
 /**
  * Admission bounds as the page edits them.
  *
@@ -20,19 +22,19 @@ export function emptyBoundDrafts(): BoundDrafts {
 }
 
 /**
- * Reads one bound, or reports the text that is not a positive count.
+ * Reads one bound, or reports the message key for text that is not a positive count.
  *
  * Empty is unbounded, which is a real choice and not a mistake, so it never
  * fails. Only a non-empty value that is not a positive whole number fails, and
  * it fails in the page rather than at the server.
  */
-export function readBound(raw: string): { value: number | null } | { error: string } {
+export function readBound(raw: string): { value: number | null } | { error: MessagePath } {
   const text = raw.trim()
   if (text === '') return { value: null }
-  if (!/^\d+$/.test(text)) return { error: 'Enter a whole number, or leave it empty for no bound.' }
+  if (!/^\d+$/.test(text)) return { error: 'bounds.wholeNumber' }
   const value = Number(text)
   if (!Number.isSafeInteger(value) || value < 1) {
-    return { error: 'A bound must be at least 1. Zero would forbid all traffic.' }
+    return { error: 'bounds.atLeastOne' }
   }
   return { value }
 }
@@ -41,7 +43,7 @@ export function readBound(raw: string): { value: number | null } | { error: stri
 export function readBounds<K extends keyof BoundDrafts>(
   drafts: Record<K, string>,
   fields: readonly K[],
-): { values: Record<K, number | null> } | { error: string } {
+): { values: Record<K, number | null> } | { error: MessagePath } {
   const values = {} as Record<K, number | null>
   for (const field of fields) {
     const read = readBound(drafts[field])
@@ -62,9 +64,12 @@ export function boundDraft(value: number | null): string {
  * A dimension with no bound shows "Unbounded" only when none of them is set, so
  * a column of numbers stays readable.
  */
-export function boundSummary(parts: readonly (readonly [string, number | null])[]): string {
+export function boundSummary(
+  parts: readonly (readonly [string, number | null])[],
+  emptyLabel = 'Unbounded',
+): string {
   const set = parts
     .filter(([, value]) => value !== null)
     .map(([label, value]) => `${label} ${value}`)
-  return set.length === 0 ? 'Unbounded' : set.join(', ')
+  return set.length === 0 ? emptyLabel : set.join(', ')
 }

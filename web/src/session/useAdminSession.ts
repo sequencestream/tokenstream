@@ -1,6 +1,18 @@
 import { computed, ref } from 'vue'
 
-import { AdminApi, type AccountRole, SessionExpiredError } from '../api/client.ts'
+import {
+  AdminApi,
+  type AccountRole,
+  SessionExpiredError,
+  UnreadableResponseError,
+} from '../api/client.ts'
+
+/** Why an administration action failed, without choosing a language for it. */
+export type ActionFailure =
+  | { reason: 'session-ended' }
+  | { reason: 'transport'; status: number }
+  | { reason: 'server'; message: string }
+  | { reason: 'unknown' }
 
 /**
  * Owns the administrator session for the page.
@@ -54,17 +66,23 @@ export function useAdminSession(api: AdminApi) {
   }
 
   /**
-   * Reports whether an action failed because the session ended.
+   * Classifies an action failure so the page can drop a dead session.
    *
-   * The page uses this to drop its session-dependent state, so an expired
-   * session never leaves provider or log rows from the previous session behind.
+   * An expired session never leaves provider or log rows from the previous
+   * session behind. The sentences themselves are chosen by the page.
    */
-  function handleFailure(error: unknown): string {
+  function handleFailure(error: unknown): ActionFailure {
     if (error instanceof SessionExpiredError) {
       signedIn.value = false
-      return error.message
+      return { reason: 'session-ended' }
     }
-    return error instanceof Error ? error.message : 'The request could not be completed.'
+    if (error instanceof UnreadableResponseError) {
+      return { reason: 'transport', status: error.status }
+    }
+    if (error instanceof Error && error.message) {
+      return { reason: 'server', message: error.message }
+    }
+    return { reason: 'unknown' }
   }
 
   return {

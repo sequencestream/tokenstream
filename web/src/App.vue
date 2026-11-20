@@ -3,14 +3,8 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 
 import { AdminApi, type ProviderHealthWrite, type ProviderStatus, type ProtocolType } from './api/client.ts'
 import { emptyAccountPage, loadAccounts, type AccountPage } from './accounts/list.ts'
-import {
-  BASE_URL_NOTE,
-  ENDPOINTS,
-  PROTOCOL_LABELS,
-  TROUBLESHOOTING,
-  WEBSOCKET_NOTE,
-  curlExamples,
-} from './docs/endpoints.ts'
+import { ENDPOINTS, PROTOCOL_LABELS, TROUBLESHOOTING, curlExamples, type TroubleshootingId } from './docs/endpoints.ts'
+import { locale, setLocale, settingLabel, t, type MessagePath, type MessageVars } from './locale/state.ts'
 import {
   changeSetFor,
   editDraftFor,
@@ -26,7 +20,7 @@ import { emptyLogFilters, logFiltersChanged, type LogFilterValues } from './logs
 import { loadLogs, type LogPage } from './logs/list.ts'
 import { emptyProviderPage, loadProviders, type ProviderPage } from './providers/list.ts'
 import { loadSettings } from './settings/list.ts'
-import { useAdminSession } from './session/useAdminSession.ts'
+import { useAdminSession, type ActionFailure } from './session/useAdminSession.ts'
 
 const api = new AdminApi()
 const session = useAdminSession(api)
@@ -34,8 +28,12 @@ const session = useAdminSession(api)
 const accountName = ref('')
 const password = ref('')
 const busy = ref(false)
-const notice = ref('')
-const errorMessage = ref('')
+type PageCopy =
+  | { source: 'page'; key: MessagePath; vars?: MessageVars }
+  | { source: 'server'; text: string }
+
+const notice = ref<PageCopy | null>(null)
+const errorMessage = ref<PageCopy | null>(null)
 type View = 'providers' | 'keys' | 'accounts' | 'logs' | 'settings' | 'docs'
 const activeView = ref<View>('keys')
 
@@ -51,8 +49,30 @@ const accountPage = ref<AccountPage>({ ...emptyAccountPage })
 const editingProviderId = ref<number | null>(null)
 const creatingProvider = ref(false)
 const oneTimeSecret = ref<string | null>(null)
-const oneTimeAction = ref('')
+const oneTimeAction = ref<PageCopy | null>(null)
 const oneTimePassword = ref<string | null>(null)
+
+function page(key: MessagePath, vars?: MessageVars): PageCopy {
+  return { source: 'page', key, vars }
+}
+
+function show(copy: PageCopy | null): string {
+  if (!copy) return ''
+  return copy.source === 'server' ? copy.text : t(copy.key, copy.vars)
+}
+
+function failureCopy(failure: ActionFailure): PageCopy {
+  switch (failure.reason) {
+    case 'session-ended':
+      return page('session.ended')
+    case 'transport':
+      return page('request.failed', { status: failure.status })
+    case 'server':
+      return { source: 'server', text: failure.message }
+    case 'unknown':
+      return page('request.incomplete')
+  }
+}
 
 function emptyCreateForm() {
   return {
@@ -120,8 +140,8 @@ const ownAccountId = computed(
 )
 
 function clearFeedback() {
-  notice.value = ''
-  errorMessage.value = ''
+  notice.value = null
+  errorMessage.value = null
 }
 
 /**
@@ -136,7 +156,7 @@ async function runAction(action: () => Promise<void>) {
   try {
     await action()
   } catch (error) {
-    errorMessage.value = session.handleFailure(error)
+    errorMessage.value = failureCopy(session.handleFailure(error))
     if (!session.signedIn.value) {
       providerPage.value = { ...emptyProviderPage }
       logPage.value = { items: [], cursor: null, exhausted: true }
@@ -239,12 +259,12 @@ function cancelCreate() {
 async function createProvider() {
   const bounds = readBounds(createForm.bounds, PROVIDER_BOUND_FIELDS)
   if ('error' in bounds) {
-    errorMessage.value = bounds.error
+    errorMessage.value = page(bounds.error)
     return
   }
   const health = readHealth(createForm.health)
   if ('error' in health) {
-    errorMessage.value = health.error
+    errorMessage.value = page(health.error)
     return
   }
   await runAction(async () => {
@@ -253,7 +273,7 @@ async function createProvider() {
     await api.createProvider({ ...providerFields, ...bounds.values, ...(health.value ? { health: health.value } : {}) })
     Object.assign(createForm, emptyCreateForm())
     creatingProvider.value = false
-    notice.value = 'Provider created. Issue a credential to call it.'
+    notice.value = page('provider.created')
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -283,12 +303,12 @@ function beginEdit(providerId: number, source: typeof providers.value[number]) {
 async function saveProvider(id: number) {
   const bounds = readBounds(editForm.bounds, PROVIDER_BOUND_FIELDS)
   if ('error' in bounds) {
-    errorMessage.value = bounds.error
+    errorMessage.value = page(bounds.error)
     return
   }
   const health = readHealth(editForm.health, true)
   if ('error' in health) {
-    errorMessage.value = health.error
+    errorMessage.value = page(health.error)
     return
   }
   await runAction(async () => {
@@ -301,7 +321,7 @@ async function saveProvider(id: number) {
       ...(editForm.upstream_api_key ? { upstream_api_key: editForm.upstream_api_key } : {}),
     })
     editingProviderId.value = null
-    notice.value = 'Provider updated.'
+    notice.value = page('provider.updated')
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -309,7 +329,7 @@ async function saveProvider(id: number) {
 function readHealth(
   fields: { probe_path: string; failure_threshold: string; probe_interval_ms: string; probe_timeout_ms: string },
   includeDisabled = false,
-): { value: ProviderHealthWrite | null } | { error: string } {
+): { value: ProviderHealthWrite | null } | { error: MessagePath } {
   const probePath = fields.probe_path.trim()
   if (!probePath) {
     return includeDisabled
@@ -318,7 +338,7 @@ function readHealth(
   }
   const values = [fields.failure_threshold, fields.probe_interval_ms, fields.probe_timeout_ms].map((value) => Number(value))
   if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
-    return { error: 'Probe threshold, interval, and timeout must be positive integers.' }
+    return { error: 'healthProbe.positive' }
   }
   return {
     value: {
@@ -333,7 +353,7 @@ function readHealth(
 async function toggleMaintenance(id: number, maintenance: boolean) {
   await runAction(async () => {
     await api.setProviderMaintenance(id, maintenance)
-    notice.value = maintenance ? 'Provider entered maintenance.' : 'Provider left maintenance.'
+    notice.value = page(maintenance ? 'provider.enteredMaintenance' : 'provider.leftMaintenance')
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -342,18 +362,18 @@ async function toggleProvider(id: number, current: ProviderStatus) {
   await runAction(async () => {
     const status: ProviderStatus = current === 'enabled' ? 'disabled' : 'enabled'
     await api.updateProvider(id, { status })
-    notice.value = status === 'disabled' ? 'Provider disabled.' : 'Provider enabled.'
+    notice.value = page(status === 'disabled' ? 'provider.disabled' : 'provider.enabled')
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
 
 async function deleteProvider(id: number, name: string) {
-  if (!window.confirm(`Delete ${name}? Providers referenced by request logs or a model alias cannot be deleted.`)) {
+  if (!window.confirm(t('confirm.providerDelete', { name }))) {
     return
   }
   await runAction(async () => {
     await api.deleteProvider(id)
-    notice.value = 'Provider deleted.'
+    notice.value = page('provider.deleted')
     providerPage.value = await loadProviders(api, providerPage.value, true)
   })
 }
@@ -380,28 +400,28 @@ async function createAccount() {
     if (created.generated_password) {
       oneTimePassword.value = created.generated_password
     }
-    notice.value = `Account ${created.account.name} created.`
+    notice.value = page('account.created', { name: created.account.name })
     accountPage.value = await loadAccounts(api, accountPage.value, true)
   })
 }
 
 async function toggleAccount(id: number, current: string, name: string) {
   const status = current === 'enabled' ? 'disabled' : 'enabled'
-  if (status === 'disabled' && !window.confirm(`Disable ${name}? Its credentials stop working immediately.`)) {
+  if (status === 'disabled' && !window.confirm(t('confirm.accountDisable', { name }))) {
     return
   }
   await runAction(async () => {
     await api.updateAccount(id, { status })
-    notice.value = status === 'disabled' ? 'Account disabled.' : 'Account enabled.'
+    notice.value = page(status === 'disabled' ? 'account.disabled' : 'account.enabled')
     accountPage.value = await loadAccounts(api, accountPage.value, true)
   })
 }
 
 async function deleteAccount(id: number, name: string) {
-  if (!window.confirm(`Delete ${name}?`)) return
+  if (!window.confirm(t('confirm.accountDelete', { name }))) return
   await runAction(async () => {
     await api.deleteAccount(id)
-    notice.value = 'Account deleted.'
+    notice.value = page('account.deleted')
     accountPage.value = await loadAccounts(api, accountPage.value, true)
   })
 }
@@ -417,7 +437,7 @@ function resetKeyForm() {
 async function issueKey() {
   const bounds = readBounds(keyForm.bounds, CREDENTIAL_BOUND_FIELDS)
   if ('error' in bounds) {
-    errorMessage.value = bounds.error
+    errorMessage.value = page(bounds.error)
     return
   }
   await runAction(async () => {
@@ -429,7 +449,7 @@ async function issueKey() {
       status: 'enabled',
       ...bounds.values,
     })
-    showSecret(issued.api_key_secret, `Credential for ${issued.api_key.name}`)
+    showSecret(issued.api_key_secret, page('credential.forName', { name: issued.api_key.name }))
     resetKeyForm()
     keyPage.value = await loadApiKeys(api, keyPage.value, true)
   })
@@ -506,74 +526,74 @@ function moveKeyProvider(providerId: number, offset: number) {
 async function saveKey(id: number) {
   const bounds = readBounds(keyEditBounds, CREDENTIAL_BOUND_FIELDS)
   if ('error' in bounds) {
-    errorMessage.value = bounds.error
+    errorMessage.value = page(bounds.error)
     return
   }
   const expiry = readExpiry(keyEditDraft.expires_at)
   if ('error' in expiry) {
-    errorMessage.value = expiry.error
+    errorMessage.value = page(expiry.error)
     return
   }
   if (keyEditDraft.provider_ids.length === 0) {
-    errorMessage.value = 'Bind at least one provider.'
+    errorMessage.value = page('credential.bind')
     return
   }
   if (keyEditDraft.name.trim() === '') {
-    errorMessage.value = 'Enter a name for this credential.'
+    errorMessage.value = page('credential.nameRequired')
     return
   }
   await runAction(async () => {
     await api.updateApiKey(id, changeSetFor(keyEditDraft, expiry.value, bounds.values))
     editingKeyId.value = null
-    notice.value = 'Credential updated.'
+    notice.value = page('credential.updated')
     // Reloading with the applied conditions keeps the list on one result set.
     keyPage.value = await loadApiKeys(api, keyPage.value, true)
   })
 }
 
 async function rotateKey(id: number, name: string) {
-  if (!window.confirm(`Rotate the credential for ${name}? The old credential stops working immediately.`)) {
+  if (!window.confirm(t('confirm.credentialRotate', { name }))) {
     return
   }
   await runAction(async () => {
     const rotated = await api.rotateApiKey(id)
-    showSecret(rotated.api_key_secret, `New credential for ${rotated.api_key.name}`)
+    showSecret(rotated.api_key_secret, page('credential.newForName', { name: rotated.api_key.name }))
     keyPage.value = await loadApiKeys(api, keyPage.value, true)
   })
 }
 
 async function deleteKey(id: number, name: string) {
-  if (!window.confirm(`Delete the credential for ${name}? Clients using it stop working immediately.`)) {
+  if (!window.confirm(t('confirm.credentialDelete', { name }))) {
     return
   }
   await runAction(async () => {
     await api.deleteApiKey(id)
-    notice.value = 'Credential deleted.'
+    notice.value = page('credential.deleted')
     keyPage.value = await loadApiKeys(api, keyPage.value, true)
   })
 }
 
-function showSecret(value: string, action: string) {
+function showSecret(value: string, action: PageCopy) {
   oneTimeSecret.value = value
   oneTimeAction.value = action
 }
 
 function dismissSecret() {
   oneTimeSecret.value = null
-  oneTimeAction.value = ''
+  oneTimeAction.value = null
   oneTimePassword.value = null
 }
 
 async function copyPassword() {
   if (!oneTimePassword.value) return
   await navigator.clipboard.writeText(oneTimePassword.value)
-  notice.value = 'Password copied.'
+  notice.value = page('password.copied')
 }
 
 async function copySecret() {
   if (!oneTimeSecret.value) return
   await navigator.clipboard.writeText(oneTimeSecret.value)
-  notice.value = 'Credential copied. Store it securely before closing this message.'
+  notice.value = page('credential.copied')
 }
 
 async function loadMoreLogs() {
@@ -614,21 +634,19 @@ async function saveSettings() {
       if (draft !== (item.value ?? '')) patch[item.name] = draft
     }
     if (Object.keys(patch).length === 0) {
-      notice.value = 'No settings were changed.'
+      notice.value = page('settings.unchangedNotice')
       return
     }
     settingsPage.value = await api.updateSettings(patch)
     resetSettingDrafts()
     const pending = settingsPage.value.items.some((item) => item.pending_restart)
-    notice.value = pending
-      ? 'Settings saved. Some values apply after the process restarts.'
-      : 'Settings saved.'
+    notice.value = page(pending ? 'settings.savedPending' : 'settings.saved')
   })
 }
 
 function formatDate(value: string | null) {
   if (!value) return '—'
-  return new Intl.DateTimeFormat(undefined, {
+  return new Intl.DateTimeFormat(locale.value, {
     year: 'numeric',
     month: 'short',
     day: '2-digit',
@@ -648,22 +666,61 @@ function accountLabel(accountId: number) {
   return account ? account.name : `#${accountId}`
 }
 
+const viewTitleKey = {
+  keys: 'view.keys.title',
+  providers: 'view.providers.title',
+  accounts: 'view.accounts.title',
+  logs: 'view.logs.title',
+  settings: 'view.settings.title',
+  docs: 'view.docs.title',
+} as const satisfies Record<View, MessagePath>
+
+const viewLedeKey = {
+  keys: 'view.keys.lede',
+  providers: 'view.providers.lede',
+  accounts: 'view.accounts.lede',
+  logs: 'view.logs.lede',
+  settings: 'view.settings.lede',
+  docs: 'view.docs.lede',
+} as const satisfies Record<View, MessagePath>
+
 function viewTitle(view: View) {
-  if (view === 'providers') return 'Providers'
-  if (view === 'accounts') return 'Accounts'
-  if (view === 'logs') return 'Request logs'
-  if (view === 'settings') return 'Settings'
-  if (view === 'docs') return 'Docs'
-  return 'Credentials'
+  return t(viewTitleKey[view])
 }
 
 function viewLede(view: View) {
-  if (view === 'providers') return 'Upstream identities and endpoints. A provider issues no credential.'
-  if (view === 'accounts') return 'Principals that own data-plane credentials.'
-  if (view === 'logs') return 'Transport metadata for proxied requests. Payloads are not stored.'
-  if (view === 'settings') return 'Process configuration. Secrets are write-only; bind-time values apply after restart.'
-  if (view === 'docs') return 'Where to point a client, which credential header each protocol takes, and what a failure means.'
-  return 'API keys owned by an account, each bound to the providers it may reach.'
+  return t(viewLedeKey[view])
+}
+
+function statusLabel(status: 'enabled' | 'disabled') {
+  return status === 'enabled' ? t('status.enabled') : t('status.disabled')
+}
+
+function roleLabel(role: 'admin' | 'user') {
+  return role === 'admin' ? t('role.admin') : t('role.user')
+}
+
+function healthLabel(state: 'healthy' | 'isolated' | 'maintenance') {
+  if (state === 'healthy') return t('health.healthy')
+  if (state === 'isolated') return t('health.isolated')
+  return t('health.maintenance')
+}
+
+function exampleTitle(id: string) {
+  if (id === 'chat-completions' || id === 'responses' || id === 'messages') return t(`docs.example.${id}`)
+  return id
+}
+
+function troubleSymptom(id: TroubleshootingId) {
+  if (id === 'unauthorized') return t('docs.symptom.unauthorized')
+  if (id === 'mismatch') return t('docs.symptom.mismatch')
+  return t('docs.symptom.unavailable')
+}
+
+function troubleCause(id: TroubleshootingId) {
+  if (id === 'unauthorized') return t('docs.cause.unauthorized')
+  if (id === 'mismatch') return t('docs.cause.mismatch')
+  return t('docs.cause.unavailable')
 }
 
 onMounted(restoreSession)
@@ -672,71 +729,77 @@ onMounted(restoreSession)
 <template>
   <div class="shell">
     <header class="masthead">
-      <a class="brand" href="/" aria-label="Tokenstream administration">
+      <a class="brand" href="/" :aria-label="t('documentTitle')">
         <span class="brand-mark">T</span>
         <span>Tokenstream</span>
       </a>
-      <nav v-if="session.signedIn.value" class="tabs" aria-label="Administration views">
+      <nav v-if="session.signedIn.value" class="tabs" :aria-label="t('nav.label')">
         <button
           :class="{ active: activeView === 'keys' }"
           :aria-current="activeView === 'keys' ? 'page' : undefined"
           @click="activeView = 'keys'"
-        >Credentials</button>
+        >{{ t('nav.credentials') }}</button>
         <button
           v-if="isAdmin"
           :class="{ active: activeView === 'providers' }"
           :aria-current="activeView === 'providers' ? 'page' : undefined"
           @click="activeView = 'providers'"
-        >Providers</button>
+        >{{ t('nav.providers') }}</button>
         <button
           v-if="isAdmin"
           :class="{ active: activeView === 'accounts' }"
           :aria-current="activeView === 'accounts' ? 'page' : undefined"
           @click="activeView = 'accounts'"
-        >Accounts</button>
+        >{{ t('nav.accounts') }}</button>
         <button
           :class="{ active: activeView === 'logs' }"
           :aria-current="activeView === 'logs' ? 'page' : undefined"
           @click="activeView = 'logs'"
-        >Request logs</button>
+        >{{ t('nav.logs') }}</button>
         <button
           v-if="isAdmin"
           :class="{ active: activeView === 'settings' }"
           :aria-current="activeView === 'settings' ? 'page' : undefined"
           @click="activeView = 'settings'"
-        >Settings</button>
+        >{{ t('nav.settings') }}</button>
         <button
           :class="{ active: activeView === 'docs' }"
           :aria-current="activeView === 'docs' ? 'page' : undefined"
           @click="activeView = 'docs'"
-        >Docs</button>
+        >{{ t('nav.docs') }}</button>
       </nav>
-      <span v-if="session.signedIn.value" class="identity">
-        {{ session.accountName.value }}
-        <span class="badge neutral">{{ session.role.value }}</span>
-      </span>
-      <button v-if="session.signedIn.value" class="button ghost sign-out" :disabled="busy" @click="signOut">Sign out</button>
+      <div class="masthead-end">
+        <div class="locale" role="group" :aria-label="t('locale.switch')">
+          <button type="button" :aria-pressed="locale === 'en'" @click="setLocale('en')">EN</button>
+          <button type="button" :aria-pressed="locale === 'zh-CN'" @click="setLocale('zh-CN')">中文</button>
+        </div>
+        <span v-if="session.signedIn.value" class="identity">
+          {{ session.accountName.value }}
+          <span class="badge neutral">{{ roleLabel(session.role.value) }}</span>
+        </span>
+        <button v-if="session.signedIn.value" class="button ghost sign-out" :disabled="busy" @click="signOut">{{ t('session.signOut') }}</button>
+      </div>
     </header>
 
     <main v-if="session.checking.value" class="center-card" aria-live="polite">
       <div class="spinner"></div>
-      <p>Checking your session…</p>
+      <p>{{ t('session.checking') }}</p>
     </main>
 
     <main v-else-if="!session.signedIn.value" class="login-layout">
       <form class="card login-card" @submit.prevent="signIn">
-        <h2>Sign in</h2>
-        <p class="login-note">Access to this control plane.</p>
+        <h2>{{ t('signIn.title') }}</h2>
+        <p class="login-note">{{ t('signIn.note') }}</p>
         <label>
-          Account
+          {{ t('signIn.account') }}
           <input v-model="accountName" autocomplete="username" required autofocus placeholder="admin" />
         </label>
         <label>
-          Password
+          {{ t('signIn.password') }}
           <input v-model="password" type="password" autocomplete="current-password" required />
         </label>
-        <p v-if="errorMessage" class="alert error" role="alert">{{ errorMessage }}</p>
-        <button class="button primary" :disabled="busy">{{ busy ? 'Signing in…' : 'Sign in' }}</button>
+        <p v-if="errorMessage" class="alert error" role="alert">{{ show(errorMessage) }}</p>
+        <button class="button primary" :disabled="busy">{{ busy ? t('signIn.busy') : t('signIn.submit') }}</button>
       </form>
     </main>
 
@@ -752,59 +815,59 @@ onMounted(restoreSession)
           type="button"
           :disabled="busy"
           @click="beginCreate"
-        >New provider</button>
+        >{{ t('action.newProvider') }}</button>
         <button
           v-if="isAdmin && activeView === 'accounts' && !creatingAccount"
           class="button primary"
           type="button"
           :disabled="busy"
           @click="beginAccount"
-        >New account</button>
+        >{{ t('action.newAccount') }}</button>
       </section>
 
-      <p v-if="errorMessage" class="alert error" role="alert">{{ errorMessage }}</p>
-      <p v-if="notice" class="alert success" role="status">{{ notice }}</p>
+      <p v-if="errorMessage" class="alert error" role="alert">{{ show(errorMessage) }}</p>
+      <p v-if="notice" class="alert success" role="status">{{ show(notice) }}</p>
 
       <section v-if="oneTimeSecret" class="credential-card" aria-live="assertive">
         <div>
-          <h2>{{ oneTimeAction }}</h2>
-          <p>Shown once. Copy it now; it disappears when dismissed or when the page is refreshed.</p>
+          <h2>{{ show(oneTimeAction) }}</h2>
+          <p>{{ t('secret.once') }}</p>
         </div>
         <code>{{ oneTimeSecret }}</code>
         <div class="actions">
-          <button class="button primary" @click="copySecret">Copy credential</button>
-          <button class="button ghost" @click="dismissSecret">I have stored it</button>
+          <button class="button primary" @click="copySecret">{{ t('secret.copy') }}</button>
+          <button class="button ghost" @click="dismissSecret">{{ t('secret.stored') }}</button>
         </div>
       </section>
 
       <section v-if="oneTimePassword" class="credential-card" aria-live="assertive">
         <div>
-          <h2>Password for the new account</h2>
-          <p>Shown once. It is never returned again; a new password can be set at any time.</p>
+          <h2>{{ t('password.title') }}</h2>
+          <p>{{ t('password.once') }}</p>
         </div>
         <code>{{ oneTimePassword }}</code>
         <div class="actions">
-          <button class="button primary" @click="copyPassword">Copy password</button>
-          <button class="button ghost" @click="dismissSecret">I have stored it</button>
+          <button class="button primary" @click="copyPassword">{{ t('password.copy') }}</button>
+          <button class="button ghost" @click="dismissSecret">{{ t('secret.stored') }}</button>
         </div>
       </section>
 
       <template v-if="activeView === 'keys'">
         <section class="card create-card">
           <div class="section-title">
-            <h2>Issue credential</h2>
-            <span class="section-note">The plaintext is shown once.</span>
+            <h2>{{ t('credential.issueTitle') }}</h2>
+            <span class="section-note">{{ t('credential.issueNote') }}</span>
           </div>
           <form class="provider-form" @submit.prevent="issueKey">
-            <label>Name<input v-model="keyForm.name" maxlength="128" required placeholder="ci" /></label>
+            <label>{{ t('credential.name') }}<input v-model="keyForm.name" maxlength="128" required placeholder="ci" /></label>
             <label v-if="isAdmin">
-              Owning account
+              {{ t('credential.owningAccount') }}
               <select v-model.number="keyForm.account_id" required>
                 <option v-for="account in accountPage.items" :key="account.id" :value="account.id">{{ account.name }}</option>
               </select>
             </label>
             <fieldset class="wide bindings">
-              <legend>Providers this credential may reach</legend>
+              <legend>{{ t('credential.providersLegend') }}</legend>
               <label v-for="provider in providers" :key="provider.id" class="binding">
                 <input
                   type="checkbox"
@@ -814,98 +877,98 @@ onMounted(restoreSession)
                 />
                 {{ provider.name }}
               </label>
-              <p v-if="providers.length === 0" class="section-note">No providers exist yet.</p>
+              <p v-if="providers.length === 0" class="section-note">{{ t('credential.noProviders') }}</p>
             </fieldset>
             <label v-if="isAdmin" class="wide">
-              Default provider
+              {{ t('credential.defaultProvider') }}
               <select v-model="keyForm.default_provider_id">
-                <option :value="null">First bound provider</option>
+                <option :value="null">{{ t('credential.firstBound') }}</option>
                 <option v-for="id in keyForm.provider_ids" :key="id" :value="id">{{ providerName(id) }}</option>
               </select>
             </label>
             <fieldset class="wide bounds">
-              <legend>Admission bounds for this credential</legend>
-              <label>Max concurrent
-                <input v-model="keyForm.bounds.max_concurrent_requests" inputmode="numeric" placeholder="unbounded" aria-label="Max concurrent requests" />
+              <legend>{{ t('bounds.legendCredential') }}</legend>
+              <label>{{ t('bounds.maxConcurrent') }}
+                <input v-model="keyForm.bounds.max_concurrent_requests" inputmode="numeric" :placeholder="t('bounds.placeholder')" :aria-label="t('bounds.ariaConcurrent')" />
               </label>
-              <label>Requests per second
-                <input v-model="keyForm.bounds.max_requests_per_second" inputmode="numeric" placeholder="unbounded" aria-label="Max requests per second" />
+              <label>{{ t('bounds.maxRate') }}
+                <input v-model="keyForm.bounds.max_requests_per_second" inputmode="numeric" :placeholder="t('bounds.placeholder')" :aria-label="t('bounds.ariaRate')" />
               </label>
-              <label>Max WebSockets
-                <input v-model="keyForm.bounds.max_websockets" inputmode="numeric" placeholder="unbounded" aria-label="Max WebSocket connections" />
+              <label>{{ t('bounds.maxWebsockets') }}
+                <input v-model="keyForm.bounds.max_websockets" inputmode="numeric" :placeholder="t('bounds.placeholder')" :aria-label="t('bounds.ariaWebsockets')" />
               </label>
-              <p class="section-note">Leave a field empty for no bound. A bound of 0 is refused.</p>
+              <p class="section-note">{{ t('bounds.note') }}</p>
             </fieldset>
             <div class="actions wide">
-              <button class="button primary" :disabled="busy" :title="keyForm.provider_ids.length === 0 ? 'Bind at least one provider' : undefined">Create credential</button>
+              <button class="button primary" :disabled="busy" :title="keyForm.provider_ids.length === 0 ? t('credential.bindTitle') : undefined">{{ t('action.createCredential') }}</button>
             </div>
           </form>
         </section>
 
-        <section class="card table-card" aria-label="Credentials">
+        <section class="card table-card" :aria-label="t('credential.tableLabel')">
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>ID</th>
-                  <th>Name</th>
-                  <th v-if="isAdmin">Account</th>
-                  <th>Status</th>
-                  <th class="fill">Providers</th>
-                  <th>Bounds</th>
-                  <th>Key ID</th>
-                  <th>Expires</th>
-                  <th>Created</th>
-                  <th>Actions</th>
+                  <th>{{ t('column.id') }}</th>
+                  <th>{{ t('column.name') }}</th>
+                  <th v-if="isAdmin">{{ t('column.account') }}</th>
+                  <th>{{ t('column.status') }}</th>
+                  <th class="fill">{{ t('column.providers') }}</th>
+                  <th>{{ t('column.bounds') }}</th>
+                  <th>{{ t('column.keyId') }}</th>
+                  <th>{{ t('column.expires') }}</th>
+                  <th>{{ t('column.created') }}</th>
+                  <th>{{ t('column.actions') }}</th>
                 </tr>
               </thead>
               <tbody>
                 <template v-for="key in keyPage.items" :key="key.id">
                   <tr v-if="editingKeyId === key.id">
                     <td>{{ key.id }}</td>
-                    <td><input v-model="keyEditDraft.name" maxlength="128" required aria-label="Name" /></td>
+                    <td><input v-model="keyEditDraft.name" maxlength="128" required :aria-label="t('credential.ariaName')" /></td>
                     <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
                     <td>
-                      <select v-model="keyEditDraft.status" aria-label="Status">
-                        <option value="enabled">Enabled</option>
-                        <option value="disabled">Disabled</option>
+                      <select v-model="keyEditDraft.status" :aria-label="t('credential.ariaStatus')">
+                        <option value="enabled">{{ t('status.enabledOption') }}</option>
+                        <option value="disabled">{{ t('status.disabledOption') }}</option>
                       </select>
                     </td>
                     <td class="fill">
                       <div class="row-bindings">
                         <div v-for="(id, index) in keyEditDraft.provider_ids" :key="id" class="binding-row">
                           <span class="binding-name">
-                            {{ providerName(id) }}<span v-if="id === keyEditDraft.default_provider_id"> (default)</span>
+                            {{ providerName(id) }}<span v-if="id === keyEditDraft.default_provider_id">{{ t('credential.defaultSuffix') }}</span>
                           </span>
                           <button
                             class="button ghost"
                             type="button"
                             :disabled="index === 0"
-                            :aria-label="`Move ${providerName(id)} earlier`"
+                            :aria-label="t('credential.moveEarlier', { name: providerName(id) })"
                             @click="moveKeyProvider(id, -1)"
                           >↑</button>
                           <button
                             class="button ghost"
                             type="button"
                             :disabled="index === keyEditDraft.provider_ids.length - 1"
-                            :aria-label="`Move ${providerName(id)} later`"
+                            :aria-label="t('credential.moveLater', { name: providerName(id) })"
                             @click="moveKeyProvider(id, 1)"
                           >↓</button>
                           <button
                             class="button ghost"
                             type="button"
-                            :aria-label="`Remove ${providerName(id)}`"
+                            :aria-label="t('credential.remove', { name: providerName(id) })"
                             @click="toggleKeyProvider(id)"
-                          >Remove</button>
+                          >{{ t('action.remove') }}</button>
                         </div>
                         <label v-for="provider in providers" :key="provider.id" v-show="!keyEditDraft.provider_ids.includes(provider.id)" class="binding">
                           <input type="checkbox" :value="provider.id" @change="toggleKeyProvider(provider.id)" />
-                          Add {{ provider.name }}
+                          {{ t('credential.add', { name: provider.name }) }}
                         </label>
                         <label class="binding">
-                          Default
+                          {{ t('credential.defaultLabel') }}
                           <select v-model.number="keyEditDraft.default_provider_id">
-                            <option :value="null">No default</option>
+                            <option :value="null">{{ t('credential.noDefault') }}</option>
                             <option v-for="id in keyEditDraft.provider_ids" :key="id" :value="id">{{ providerName(id) }}</option>
                           </select>
                         </label>
@@ -916,32 +979,32 @@ onMounted(restoreSession)
                         <input
                           v-model="keyEditBounds.max_concurrent_requests"
                           inputmode="numeric"
-                          placeholder="unbounded"
-                          aria-label="Max concurrent requests"
+                          :placeholder="t('bounds.placeholder')"
+                          :aria-label="t('bounds.ariaConcurrent')"
                         />
                         <input
                           v-model="keyEditBounds.max_requests_per_second"
                           inputmode="numeric"
-                          placeholder="unbounded"
-                          aria-label="Max requests per second"
+                          :placeholder="t('bounds.placeholder')"
+                          :aria-label="t('bounds.ariaRate')"
                         />
                         <input
                           v-model="keyEditBounds.max_websockets"
                           inputmode="numeric"
-                          placeholder="unbounded"
-                          aria-label="Max WebSocket connections"
+                          :placeholder="t('bounds.placeholder')"
+                          :aria-label="t('bounds.ariaWebsockets')"
                         />
                       </div>
                     </td>
                     <td><code>{{ key.key_id }}</code></td>
                     <td>
-                      <input v-model="keyEditDraft.expires_at" type="datetime-local" aria-label="Expires" />
+                      <input v-model="keyEditDraft.expires_at" type="datetime-local" :aria-label="t('expiry.aria')" />
                     </td>
                     <td>{{ formatDate(key.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
-                        <button class="button primary" :disabled="busy" @click="saveKey(key.id)">Save changes</button>
-                        <button class="button ghost" type="button" @click="cancelKeyEdit">Cancel</button>
+                        <button class="button primary" :disabled="busy" @click="saveKey(key.id)">{{ t('action.save') }}</button>
+                        <button class="button ghost" type="button" @click="cancelKeyEdit">{{ t('action.cancel') }}</button>
                       </div>
                     </td>
                   </tr>
@@ -949,21 +1012,21 @@ onMounted(restoreSession)
                     <td>{{ key.id }}</td>
                     <td>{{ key.name }}</td>
                     <td v-if="isAdmin">{{ accountLabel(key.account_id) }}</td>
-                    <td><span class="badge" :class="key.status">{{ key.status }}</span></td>
+                    <td><span class="badge" :class="key.status">{{ statusLabel(key.status) }}</span></td>
                     <td class="fill">
                       <span v-for="(id, index) in key.provider_ids" :key="id">
-                        {{ providerName(id) }}<span v-if="id === key.default_provider_id"> (default)</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
+                        {{ providerName(id) }}<span v-if="id === key.default_provider_id">{{ t('credential.defaultSuffix') }}</span>{{ index < key.provider_ids.length - 1 ? ', ' : '' }}
                       </span>
                     </td>
-                    <td>{{ boundSummary([['conc', key.max_concurrent_requests], ['rate', key.max_requests_per_second], ['WS', key.max_websockets]]) }}</td>
+                    <td>{{ boundSummary([[t('bounds.conc'), key.max_concurrent_requests], [t('bounds.rate'), key.max_requests_per_second], [t('bounds.ws'), key.max_websockets]], t('bounds.unbounded')) }}</td>
                     <td><code>{{ key.key_id }}</code></td>
                     <td>{{ formatDate(key.expires_at) }}</td>
                     <td>{{ formatDate(key.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
-                        <button class="button ghost" @click="beginKeyEdit(key)">Edit</button>
-                        <button class="button ghost" :disabled="busy" @click="rotateKey(key.id, key.name)">Rotate credential</button>
-                        <button class="button danger" :disabled="busy" @click="deleteKey(key.id, key.name)">Delete</button>
+                        <button class="button ghost" @click="beginKeyEdit(key)">{{ t('action.edit') }}</button>
+                        <button class="button ghost" :disabled="busy" @click="rotateKey(key.id, key.name)">{{ t('action.rotate') }}</button>
+                        <button class="button danger" :disabled="busy" @click="deleteKey(key.id, key.name)">{{ t('action.delete') }}</button>
                       </div>
                     </td>
                   </tr>
@@ -971,94 +1034,94 @@ onMounted(restoreSession)
               </tbody>
             </table>
           </div>
-          <div v-if="keyPage.items.length === 0" class="empty-state">No credentials issued.</div>
-          <button v-if="!keyPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreKeys">Load more</button>
+          <div v-if="keyPage.items.length === 0" class="empty-state">{{ t('credential.empty') }}</div>
+          <button v-if="!keyPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreKeys">{{ t('action.loadMore') }}</button>
         </section>
       </template>
 
       <template v-else-if="activeView === 'providers'">
         <section v-if="creatingProvider" class="card create-card">
           <div class="section-title">
-            <h2>Add provider</h2>
-            <span class="section-note">The upstream key is write-only.</span>
+            <h2>{{ t('provider.addTitle') }}</h2>
+            <span class="section-note">{{ t('provider.addNote') }}</span>
           </div>
           <form class="provider-form" @submit.prevent="createProvider">
-            <label>Name<input v-model="createForm.name" maxlength="128" required placeholder="primary-openai" /></label>
-            <label>Protocol<select v-model="createForm.protocol_type"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></label>
-            <label>Status<select v-model="createForm.status"><option value="enabled">Enabled</option><option value="disabled">Disabled</option></select></label>
-            <label class="wide">Endpoint<input v-model="createForm.endpoint" type="url" required placeholder="https://api.example.com" /></label>
-            <label class="wide">Upstream API key<input v-model="createForm.upstream_api_key" type="password" autocomplete="new-password" required /></label>
+            <label>{{ t('provider.name') }}<input v-model="createForm.name" maxlength="128" required placeholder="primary-openai" /></label>
+            <label>{{ t('provider.protocol') }}<select v-model="createForm.protocol_type"><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option></select></label>
+            <label>{{ t('column.status') }}<select v-model="createForm.status"><option value="enabled">{{ t('status.enabledOption') }}</option><option value="disabled">{{ t('status.disabledOption') }}</option></select></label>
+            <label class="wide">{{ t('provider.endpoint') }}<input v-model="createForm.endpoint" type="url" required placeholder="https://api.example.com" /></label>
+            <label class="wide">{{ t('provider.upstreamKey') }}<input v-model="createForm.upstream_api_key" type="password" autocomplete="new-password" required /></label>
             <fieldset class="wide bounds">
-              <legend>Admission bounds</legend>
-              <label>Max concurrent
-                <input v-model="createForm.bounds.max_concurrent_requests" inputmode="numeric" placeholder="unbounded" aria-label="Max concurrent requests" />
+              <legend>{{ t('bounds.legendProvider') }}</legend>
+              <label>{{ t('bounds.maxConcurrent') }}
+                <input v-model="createForm.bounds.max_concurrent_requests" inputmode="numeric" :placeholder="t('bounds.placeholder')" :aria-label="t('bounds.ariaConcurrent')" />
               </label>
-              <label>Requests per second
-                <input v-model="createForm.bounds.max_requests_per_second" inputmode="numeric" placeholder="unbounded" aria-label="Max requests per second" />
+              <label>{{ t('bounds.maxRate') }}
+                <input v-model="createForm.bounds.max_requests_per_second" inputmode="numeric" :placeholder="t('bounds.placeholder')" :aria-label="t('bounds.ariaRate')" />
               </label>
-              <p class="section-note">Leave a field empty for no bound. A bound of 0 is refused.</p>
+              <p class="section-note">{{ t('bounds.note') }}</p>
             </fieldset>
             <fieldset class="wide bounds">
-              <legend>Health probe</legend>
-              <label>Path<input v-model="createForm.health.probe_path" placeholder="disabled" aria-label="Probe path" /></label>
-              <label>Failure threshold<input v-model="createForm.health.failure_threshold" inputmode="numeric" aria-label="Probe failure threshold" /></label>
-              <label>Interval (ms)<input v-model="createForm.health.probe_interval_ms" inputmode="numeric" aria-label="Probe interval milliseconds" /></label>
-              <label>Timeout (ms)<input v-model="createForm.health.probe_timeout_ms" inputmode="numeric" aria-label="Probe timeout milliseconds" /></label>
-              <p class="section-note">Leave the path empty to disable probing. Probes carry no credentials or request body.</p>
+              <legend>{{ t('healthProbe.legend') }}</legend>
+              <label>{{ t('healthProbe.path') }}<input v-model="createForm.health.probe_path" :placeholder="t('healthProbe.pathPlaceholder')" :aria-label="t('healthProbe.ariaPath')" /></label>
+              <label>{{ t('healthProbe.threshold') }}<input v-model="createForm.health.failure_threshold" inputmode="numeric" :aria-label="t('healthProbe.ariaThreshold')" /></label>
+              <label>{{ t('healthProbe.interval') }}<input v-model="createForm.health.probe_interval_ms" inputmode="numeric" :aria-label="t('healthProbe.ariaInterval')" /></label>
+              <label>{{ t('healthProbe.timeout') }}<input v-model="createForm.health.probe_timeout_ms" inputmode="numeric" :aria-label="t('healthProbe.ariaTimeout')" /></label>
+              <p class="section-note">{{ t('healthProbe.note') }}</p>
             </fieldset>
             <div class="actions wide">
-              <button class="button primary" :disabled="busy">Create provider</button>
-              <button class="button ghost" type="button" @click="cancelCreate">Cancel</button>
+              <button class="button primary" :disabled="busy">{{ t('action.createProvider') }}</button>
+              <button class="button ghost" type="button" @click="cancelCreate">{{ t('action.cancel') }}</button>
             </div>
           </form>
         </section>
 
-        <section class="card table-card" aria-label="Providers">
+        <section class="card table-card" :aria-label="t('provider.tableLabel')">
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>ID</th>
-                  <th>Name</th>
-                  <th>Protocol</th>
-                  <th>Status</th>
-                  <th>Health</th>
-                  <th class="fill">Endpoint</th>
-                  <th>Upstream key</th>
-                  <th>Bounds</th>
-                  <th>Created</th>
-                  <th>Actions</th>
+                  <th>{{ t('column.id') }}</th>
+                  <th>{{ t('column.name') }}</th>
+                  <th>{{ t('column.protocol') }}</th>
+                  <th>{{ t('column.status') }}</th>
+                  <th>{{ t('column.health') }}</th>
+                  <th class="fill">{{ t('column.endpoint') }}</th>
+                  <th>{{ t('column.upstreamKey') }}</th>
+                  <th>{{ t('column.bounds') }}</th>
+                  <th>{{ t('column.created') }}</th>
+                  <th>{{ t('column.actions') }}</th>
                 </tr>
               </thead>
               <tbody>
                 <template v-for="provider in providers" :key="provider.id">
                   <tr v-if="editingProviderId === provider.id">
                     <td>{{ provider.id }}</td>
-                    <td><input v-model="editForm.name" maxlength="128" required aria-label="Name" /></td>
-                    <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
+                    <td><input v-model="editForm.name" maxlength="128" required :aria-label="t('credential.ariaName')" /></td>
+                    <td><span class="badge neutral">{{ PROTOCOL_LABELS[provider.protocol_type] }}</span></td>
                     <td>
-                      <select v-model="editForm.status" aria-label="Status">
-                        <option value="enabled">Enabled</option>
-                        <option value="disabled">Disabled</option>
+                      <select v-model="editForm.status" :aria-label="t('credential.ariaStatus')">
+                        <option value="enabled">{{ t('status.enabledOption') }}</option>
+                        <option value="disabled">{{ t('status.disabledOption') }}</option>
                       </select>
                     </td>
                     <td>
                       <div class="row-probe">
-                        <span class="badge" :class="provider.health">{{ provider.health }}</span>
-                        <input v-model="editForm.health.probe_path" placeholder="probe disabled" aria-label="Probe path" />
-                        <input v-model="editForm.health.failure_threshold" inputmode="numeric" aria-label="Probe failure threshold" />
-                        <input v-model="editForm.health.probe_interval_ms" inputmode="numeric" aria-label="Probe interval milliseconds" />
-                        <input v-model="editForm.health.probe_timeout_ms" inputmode="numeric" aria-label="Probe timeout milliseconds" />
+                        <span class="badge" :class="provider.health">{{ healthLabel(provider.health) }}</span>
+                        <input v-model="editForm.health.probe_path" :placeholder="t('healthProbe.editPlaceholder')" :aria-label="t('healthProbe.ariaPath')" />
+                        <input v-model="editForm.health.failure_threshold" inputmode="numeric" :aria-label="t('healthProbe.ariaThreshold')" />
+                        <input v-model="editForm.health.probe_interval_ms" inputmode="numeric" :aria-label="t('healthProbe.ariaInterval')" />
+                        <input v-model="editForm.health.probe_timeout_ms" inputmode="numeric" :aria-label="t('healthProbe.ariaTimeout')" />
                       </div>
                     </td>
-                    <td class="fill"><input v-model="editForm.endpoint" type="url" required aria-label="Endpoint" /></td>
+                    <td class="fill"><input v-model="editForm.endpoint" type="url" required :aria-label="t('provider.ariaEndpoint')" /></td>
                     <td>
                       <input
                         v-model="editForm.upstream_api_key"
                         type="password"
                         autocomplete="new-password"
-                        placeholder="unchanged"
-                        aria-label="Replace upstream API key"
+                        :placeholder="t('provider.unchanged')"
+                        :aria-label="t('provider.ariaReplaceKey')"
                       />
                     </td>
                     <td>
@@ -1066,49 +1129,49 @@ onMounted(restoreSession)
                         <input
                           v-model="editForm.bounds.max_concurrent_requests"
                           inputmode="numeric"
-                          placeholder="unbounded"
-                          aria-label="Max concurrent requests"
+                          :placeholder="t('bounds.placeholder')"
+                          :aria-label="t('bounds.ariaConcurrent')"
                         />
                         <input
                           v-model="editForm.bounds.max_requests_per_second"
                           inputmode="numeric"
-                          placeholder="unbounded"
-                          aria-label="Max requests per second"
+                          :placeholder="t('bounds.placeholder')"
+                          :aria-label="t('bounds.ariaRate')"
                         />
                       </div>
                     </td>
                     <td>{{ formatDate(provider.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
-                        <button class="button primary" :disabled="busy" @click="saveProvider(provider.id)">Save changes</button>
-                        <button class="button ghost" type="button" @click="editingProviderId = null">Cancel</button>
+                        <button class="button primary" :disabled="busy" @click="saveProvider(provider.id)">{{ t('action.save') }}</button>
+                        <button class="button ghost" type="button" @click="editingProviderId = null">{{ t('action.cancel') }}</button>
                       </div>
                     </td>
                   </tr>
                   <tr v-else>
                     <td>{{ provider.id }}</td>
                     <td>{{ provider.name }}</td>
-                    <td><span class="badge neutral">{{ provider.protocol_type }}</span></td>
-                    <td><span class="badge" :class="provider.status">{{ provider.status }}</span></td>
+                    <td><span class="badge neutral">{{ PROTOCOL_LABELS[provider.protocol_type] }}</span></td>
+                    <td><span class="badge" :class="provider.status">{{ statusLabel(provider.status) }}</span></td>
                     <td>
-                      <span class="badge" :class="provider.health">{{ provider.health }}</span>
-                      <small v-if="provider.health_probe">{{ provider.health_probe.probe_path }} · {{ provider.health_probe.failure_threshold }} failures · {{ provider.health_probe.probe_interval_ms }} ms</small>
-                      <small v-else>Probe disabled</small>
+                      <span class="badge" :class="provider.health">{{ healthLabel(provider.health) }}</span>
+                      <small v-if="provider.health_probe">{{ t('healthProbe.summary', { path: provider.health_probe.probe_path, count: provider.health_probe.failure_threshold, interval: provider.health_probe.probe_interval_ms }) }}</small>
+                      <small v-else>{{ t('healthProbe.disabled') }}</small>
                     </td>
                     <td class="fill">{{ provider.endpoint }}</td>
-                    <td>{{ provider.has_upstream_api_key ? 'Configured' : 'Not configured' }}</td>
-                    <td>{{ boundSummary([['conc', provider.max_concurrent_requests], ['rate', provider.max_requests_per_second]]) }}</td>
+                    <td>{{ provider.has_upstream_api_key ? t('status.configured') : t('status.notConfigured') }}</td>
+                    <td>{{ boundSummary([[t('bounds.conc'), provider.max_concurrent_requests], [t('bounds.rate'), provider.max_requests_per_second]], t('bounds.unbounded')) }}</td>
                     <td>{{ formatDate(provider.created_at) }}</td>
                     <td class="row-actions">
                       <div class="actions">
-                        <button class="button ghost" @click="beginEdit(provider.id, provider)">Edit</button>
+                        <button class="button ghost" @click="beginEdit(provider.id, provider)">{{ t('action.edit') }}</button>
                         <button
                           class="button ghost"
                           :disabled="busy"
                           @click="toggleMaintenance(provider.id, provider.health !== 'maintenance')"
-                        >{{ provider.health === 'maintenance' ? 'Leave maintenance' : 'Maintenance' }}</button>
-                        <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
-                        <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">Delete</button>
+                        >{{ provider.health === 'maintenance' ? t('action.leaveMaintenance') : t('action.maintenance') }}</button>
+                        <button class="button ghost" :disabled="busy" @click="toggleProvider(provider.id, provider.status)">{{ provider.status === 'enabled' ? t('action.disable') : t('action.enable') }}</button>
+                        <button class="button danger" :disabled="busy" @click="deleteProvider(provider.id, provider.name)">{{ t('action.delete') }}</button>
                       </div>
                     </td>
                   </tr>
@@ -1116,86 +1179,104 @@ onMounted(restoreSession)
               </tbody>
             </table>
           </div>
-          <div v-if="providers.length === 0" class="empty-state">No providers configured.</div>
-          <button v-if="!providerPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreProviders">Load more</button>
+          <div v-if="providers.length === 0" class="empty-state">{{ t('provider.empty') }}</div>
+          <button v-if="!providerPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreProviders">{{ t('action.loadMore') }}</button>
         </section>
       </template>
 
       <template v-else-if="activeView === 'accounts'">
         <section v-if="creatingAccount" class="card create-card">
           <div class="section-title">
-            <h2>Add account</h2>
-            <span class="section-note">The password is shown once.</span>
+            <h2>{{ t('account.addTitle') }}</h2>
+            <span class="section-note">{{ t('account.addNote') }}</span>
           </div>
           <form class="provider-form" @submit.prevent="createAccount">
-            <label>Name<input v-model="accountForm.name" maxlength="128" required placeholder="analyst" /></label>
-            <label>Role<select v-model="accountForm.role"><option value="user">User</option><option value="admin">Administrator</option></select></label>
+            <label>{{ t('account.name') }}<input v-model="accountForm.name" maxlength="128" required placeholder="analyst" /></label>
+            <label>{{ t('account.role') }}<select v-model="accountForm.role"><option value="user">{{ t('role.userOption') }}</option><option value="admin">{{ t('role.adminOption') }}</option></select></label>
             <div class="actions wide">
-              <button class="button primary" :disabled="busy">Create account</button>
-              <button class="button ghost" type="button" @click="cancelAccount">Cancel</button>
+              <button class="button primary" :disabled="busy">{{ t('action.createAccount') }}</button>
+              <button class="button ghost" type="button" @click="cancelAccount">{{ t('action.cancel') }}</button>
             </div>
           </form>
         </section>
 
-        <section class="card table-card" aria-label="Accounts">
+        <section class="card table-card" :aria-label="t('account.tableLabel')">
           <div class="table-wrap">
             <table>
               <thead>
-                <tr><th>ID</th><th>Name</th><th>Role</th><th>Status</th><th>Created</th><th>Actions</th></tr>
+                <tr>
+                  <th>{{ t('column.id') }}</th>
+                  <th>{{ t('column.name') }}</th>
+                  <th>{{ t('column.role') }}</th>
+                  <th>{{ t('column.status') }}</th>
+                  <th>{{ t('column.created') }}</th>
+                  <th>{{ t('column.actions') }}</th>
+                </tr>
               </thead>
               <tbody>
                 <tr v-for="account in accountPage.items" :key="account.id">
                   <td>{{ account.id }}</td>
                   <td>
                     {{ account.name }}
-                    <span v-if="account.is_bootstrap" class="badge neutral">bootstrap</span>
+                    <span v-if="account.is_bootstrap" class="badge neutral">{{ t('status.bootstrap') }}</span>
                   </td>
-                  <td><span class="badge neutral">{{ account.role }}</span></td>
-                  <td><span class="badge" :class="account.status">{{ account.status }}</span></td>
+                  <td><span class="badge neutral">{{ roleLabel(account.role) }}</span></td>
+                  <td><span class="badge" :class="account.status">{{ statusLabel(account.status) }}</span></td>
                   <td>{{ formatDate(account.created_at) }}</td>
                   <td class="row-actions">
                     <div class="actions">
                       <button
                         class="button ghost"
                         :disabled="busy || account.is_bootstrap"
-                        :title="account.is_bootstrap ? 'The bootstrap account cannot be disabled' : undefined"
+                        :title="account.is_bootstrap ? t('account.cannotDisable') : undefined"
                         @click="toggleAccount(account.id, account.status, account.name)"
-                      >{{ account.status === 'enabled' ? 'Disable' : 'Enable' }}</button>
+                      >{{ account.status === 'enabled' ? t('action.disable') : t('action.enable') }}</button>
                       <button
                         class="button danger"
                         :disabled="busy || account.is_bootstrap"
-                        :title="account.is_bootstrap ? 'The bootstrap account cannot be deleted' : undefined"
+                        :title="account.is_bootstrap ? t('account.cannotDelete') : undefined"
                         @click="deleteAccount(account.id, account.name)"
-                      >Delete</button>
+                      >{{ t('action.delete') }}</button>
                     </div>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <div v-if="accountPage.items.length === 0" class="empty-state">No accounts.</div>
-          <button v-if="!accountPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreAccounts">Load more</button>
+          <div v-if="accountPage.items.length === 0" class="empty-state">{{ t('account.empty') }}</div>
+          <button v-if="!accountPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreAccounts">{{ t('action.loadMore') }}</button>
         </section>
       </template>
 
       <template v-else-if="activeView === 'logs'">
         <section class="card filters-card">
           <form class="filters" @submit.prevent="applyLogFilters">
-            <label>Provider<select v-model="logFilters.provider_id"><option value="">All providers</option><option v-for="provider in providers" :key="provider.id" :value="String(provider.id)">{{ provider.name }}</option></select></label>
-            <label>Transport<select v-model="logFilters.transport_type"><option value="">All transports</option><option value="http">HTTP / SSE</option><option value="websocket">WebSocket</option></select></label>
-            <label>Started after<input v-model="logFilters.start_time_gte" type="datetime-local" /></label>
-            <label>Started before<input v-model="logFilters.start_time_lt" type="datetime-local" /></label>
-            <div class="actions filter-actions"><button class="button primary" :disabled="busy">Apply filters</button><button class="button ghost" type="button" @click="resetLogFilters">Reset</button></div>
+            <label>{{ t('logs.provider') }}<select v-model="logFilters.provider_id"><option value="">{{ t('logs.allProviders') }}</option><option v-for="provider in providers" :key="provider.id" :value="String(provider.id)">{{ provider.name }}</option></select></label>
+            <label>{{ t('logs.transport') }}<select v-model="logFilters.transport_type"><option value="">{{ t('logs.allTransports') }}</option><option value="http">{{ t('logs.http') }}</option><option value="websocket">{{ t('logs.websocket') }}</option></select></label>
+            <label>{{ t('logs.startedAfter') }}<input v-model="logFilters.start_time_gte" type="datetime-local" /></label>
+            <label>{{ t('logs.startedBefore') }}<input v-model="logFilters.start_time_lt" type="datetime-local" /></label>
+            <div class="actions filter-actions"><button class="button primary" :disabled="busy">{{ t('action.applyFilters') }}</button><button class="button ghost" type="button" @click="resetLogFilters">{{ t('action.reset') }}</button></div>
           </form>
           <p v-if="logFiltersDirty" class="filters-pending" role="status">
-            Filters are edited but not applied. Paging continues in the applied result set.
+            {{ t('logs.pending') }}
           </p>
         </section>
 
         <section class="card table-card">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Request</th><th>Account</th><th>Provider</th><th>Transport</th><th class="fill">Route</th><th>Status</th><th>Started</th><th>Completed</th></tr></thead>
+              <thead>
+                <tr>
+                  <th>{{ t('column.request') }}</th>
+                  <th>{{ t('column.account') }}</th>
+                  <th>{{ t('logs.provider') }}</th>
+                  <th>{{ t('column.transport') }}</th>
+                  <th class="fill">{{ t('column.route') }}</th>
+                  <th>{{ t('column.status') }}</th>
+                  <th>{{ t('column.started') }}</th>
+                  <th>{{ t('column.completed') }}</th>
+                </tr>
+              </thead>
               <tbody>
                 <tr v-for="log in logPage.items" :key="log.id">
                   <td><code>{{ log.request_id }}</code></td>
@@ -1203,15 +1284,15 @@ onMounted(restoreSession)
                   <td>{{ providerName(log.provider_id) }}</td>
                   <td>{{ log.transport_type }}</td>
                   <td class="fill"><code>{{ log.path }}</code></td>
-                  <td><span v-if="log.incomplete" class="badge incomplete">Incomplete</span><span v-else>{{ log.status_code ?? '—' }}</span><small v-if="log.error_msg" class="row-error">{{ log.error_msg }}</small></td>
+                  <td><span v-if="log.incomplete" class="badge incomplete">{{ t('status.incomplete') }}</span><span v-else>{{ log.status_code ?? '—' }}</span><small v-if="log.error_msg" class="row-error">{{ log.error_msg }}</small></td>
                   <td>{{ formatDate(log.start_time) }}</td>
                   <td>{{ formatDate(log.end_time) }}</td>
                 </tr>
               </tbody>
             </table>
           </div>
-          <div v-if="logPage.items.length === 0" class="empty-state">No request metadata matches these filters.</div>
-          <button v-if="!logPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreLogs">Load more</button>
+          <div v-if="logPage.items.length === 0" class="empty-state">{{ t('logs.empty') }}</div>
+          <button v-if="!logPage.exhausted" class="button load-more" :disabled="busy" @click="loadMoreLogs">{{ t('action.loadMore') }}</button>
         </section>
       </template>
 
@@ -1221,36 +1302,36 @@ onMounted(restoreSession)
             <table>
               <thead>
                 <tr>
-                  <th>Setting</th>
-                  <th class="fill">Value</th>
-                  <th>Applies</th>
+                  <th>{{ t('column.setting') }}</th>
+                  <th class="fill">{{ t('column.value') }}</th>
+                  <th>{{ t('column.applies') }}</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="item in settingsPage.items" :key="item.name">
                   <td>
-                    <strong>{{ item.label }}</strong>
+                    <strong>{{ settingLabel(item.name, item.label) }}</strong>
                     <small>{{ item.name }}</small>
                   </td>
                   <td class="fill">
                     <input
                       v-model="settingDrafts[item.name]"
                       :type="item.secret ? 'password' : 'text'"
-                      :placeholder="item.secret ? 'unchanged' : ''"
+                      :placeholder="item.secret ? t('settings.unchanged') : ''"
                       :autocomplete="item.secret ? 'new-password' : 'off'"
                     />
                   </td>
                   <td>
-                    <span v-if="item.pending_restart" class="badge incomplete">Restart pending</span>
-                    <span v-else-if="item.restart_required" class="badge neutral">Next start</span>
-                    <span v-else class="badge enabled">Live</span>
+                    <span v-if="item.pending_restart" class="badge incomplete">{{ t('status.restartPending') }}</span>
+                    <span v-else-if="item.restart_required" class="badge neutral">{{ t('status.nextStart') }}</span>
+                    <span v-else class="badge enabled">{{ t('status.live') }}</span>
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
           <div class="actions settings-actions">
-            <button class="button primary" :disabled="busy" @click="saveSettings">Save settings</button>
+            <button class="button primary" :disabled="busy" @click="saveSettings">{{ t('action.saveSettings') }}</button>
           </div>
         </section>
       </template>
@@ -1258,19 +1339,19 @@ onMounted(restoreSession)
       <template v-else-if="activeView === 'docs'">
         <section class="card docs-card">
           <div class="section-title">
-            <h2>Endpoints</h2>
-            <span class="section-note">Static reference. Nothing here is sent to the gateway.</span>
+            <h2>{{ t('docs.endpoints') }}</h2>
+            <span class="section-note">{{ t('docs.staticNote') }}</span>
           </div>
-          <p class="docs-note">{{ BASE_URL_NOTE }}</p>
+          <p class="docs-note">{{ t('docs.baseUrl') }}</p>
           <div class="table-wrap">
             <table>
               <thead>
                 <tr>
-                  <th>Protocol</th>
-                  <th>Method</th>
-                  <th class="fill">Path</th>
-                  <th>Authentication</th>
-                  <th>Transport</th>
+                  <th>{{ t('column.protocol') }}</th>
+                  <th>{{ t('column.method') }}</th>
+                  <th class="fill">{{ t('column.path') }}</th>
+                  <th>{{ t('column.authentication') }}</th>
+                  <th>{{ t('column.transport') }}</th>
                 </tr>
               </thead>
               <tbody>
@@ -1284,34 +1365,34 @@ onMounted(restoreSession)
               </tbody>
             </table>
           </div>
-          <p class="section-note">{{ WEBSOCKET_NOTE }}</p>
+          <p class="section-note">{{ t('docs.websocket') }}</p>
         </section>
 
-        <section class="card docs-card" aria-label="Request examples">
+        <section class="card docs-card" :aria-label="t('docs.examplesLabel')">
           <div class="section-title">
-            <h2>Examples</h2>
-            <span class="section-note">Replace the base URL and the credential, then run as-is.</span>
+            <h2>{{ t('docs.examples') }}</h2>
+            <span class="section-note">{{ t('docs.examplesNote') }}</span>
           </div>
           <div class="docs-examples">
             <article v-for="example in docsExamples" :key="example.id" class="docs-example">
-              <h3>{{ example.title }}</h3>
+              <h3>{{ exampleTitle(example.id) }}</h3>
               <pre><code>{{ example.command }}</code></pre>
             </article>
           </div>
         </section>
 
-        <section class="card docs-card" aria-label="Troubleshooting">
+        <section class="card docs-card" :aria-label="t('docs.troubleshootingLabel')">
           <div class="section-title">
-            <h2>Troubleshooting</h2>
-            <span class="section-note">The three failures a client hits first.</span>
+            <h2>{{ t('docs.troubleshooting') }}</h2>
+            <span class="section-note">{{ t('docs.troubleshootingNote') }}</span>
           </div>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Symptom</th><th class="fill">Meaning</th></tr></thead>
+              <thead><tr><th>{{ t('column.symptom') }}</th><th class="fill">{{ t('column.meaning') }}</th></tr></thead>
               <tbody>
-                <tr v-for="note in TROUBLESHOOTING" :key="note.symptom">
-                  <td><span class="badge neutral">{{ note.symptom }}</span></td>
-                  <td class="fill">{{ note.cause }}</td>
+                <tr v-for="note in TROUBLESHOOTING" :key="note.id">
+                  <td><span class="badge neutral">{{ troubleSymptom(note.id) }}</span></td>
+                  <td class="fill">{{ troubleCause(note.id) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -1409,7 +1490,7 @@ code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere;
   top: 0;
   z-index: var(--z-masthead);
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto 1fr auto;
   align-items: stretch;
   column-gap: var(--space-3);
   min-height: var(--masthead-height);
@@ -1427,6 +1508,7 @@ code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere;
   white-space: nowrap;
 }
 .brand {
+  grid-column: 1;
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
@@ -1447,7 +1529,39 @@ code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere;
   font-size: var(--font-size-meta);
   font-weight: var(--font-weight-bold);
 }
-.tabs { display: flex; align-items: stretch; min-width: 0; }
+.tabs { grid-column: 2; display: flex; align-items: stretch; min-width: 0; }
+.masthead-end {
+  grid-column: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.locale {
+  display: inline-flex;
+  align-self: center;
+  overflow: hidden;
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-md);
+}
+.locale button {
+  min-height: var(--control-height);
+  padding: 0 var(--space-2);
+  border: 0;
+  color: var(--color-muted);
+  background: transparent;
+  font-size: var(--font-size-ui);
+  font-weight: var(--font-weight-semibold);
+}
+.locale button + button { border-left: 1px solid var(--color-line); }
+.locale button[aria-pressed='true'] {
+  color: var(--color-accent-ink);
+  background: var(--color-control-fill);
+}
+:lang(zh-CN) th,
+:lang(zh-CN) .badge {
+  letter-spacing: 0;
+  text-transform: none;
+}
 .tabs button {
   padding: 0 var(--space-3);
   border: 0;
@@ -1687,15 +1801,13 @@ td small { display: block; margin-top: var(--space-1); color: var(--color-muted)
 
 @media (max-width: 780px) {
   .masthead {
-    grid-template-columns: 1fr auto auto;
-    grid-template-areas: "brand ident out" "tabs tabs tabs";
+    grid-template-columns: 1fr auto;
     min-height: 0;
     padding: 0 var(--space-3);
   }
-  .brand { grid-area: brand; height: 40px; }
-  .identity { grid-area: ident; }
-  .sign-out { grid-area: out; }
-  .tabs { grid-area: tabs; }
+  .brand { grid-column: 1; grid-row: 1; height: 40px; }
+  .masthead-end { grid-column: 2; grid-row: 1; }
+  .tabs { grid-column: 1 / -1; grid-row: 2; }
   .tabs button { flex: 1; height: var(--control-height-lg); }
   .workspace { padding-top: var(--space-3); }
   .page-heading { margin-bottom: var(--space-2); }

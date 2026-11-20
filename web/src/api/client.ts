@@ -190,6 +190,22 @@ export class SessionExpiredError extends Error {
   }
 }
 
+/**
+ * An administration response that carried no error sentence.
+ *
+ * The page supplies its own sentence for this case. A response that did include
+ * a sentence is thrown as a plain Error so that sentence can be shown unchanged.
+ */
+export class UnreadableResponseError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`Request failed (${status}).`)
+    this.name = 'UnreadableResponseError'
+    this.status = status
+  }
+}
+
 interface ErrorResponse {
   error?: { message?: string }
 }
@@ -217,7 +233,9 @@ export class AdminApi {
     }
     if (!response.ok) {
       const body = (await response.json().catch(() => ({}))) as ErrorResponse
-      throw new Error(body.error?.message ?? `Request failed (${response.status}).`)
+      const message = body.error?.message
+      if (!message) throw new UnreadableResponseError(response.status)
+      throw new Error(message)
     }
     if (response.status === 204) return undefined as T
     return response.json() as Promise<T>

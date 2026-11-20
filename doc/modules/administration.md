@@ -138,8 +138,8 @@ Name each role once and reuse those names. A new surface does not introduce a se
 
 ### Layout
 
-- Sticky top chrome on a hairline, about 44px tall. Identity on the left, primary views next to it, session action on the right.
-- Below 780px, identity and the session action stay on the first row; the views wrap onto the second.
+- Sticky top chrome on a hairline, about 44px tall. Identity on the left, primary views next to it, the language control and session action on the right. The language control is present before sign-in.
+- Below 780px, identity, the language control, and the session action stay on the first row; the views wrap onto the second.
 - Signed-in content fills the viewport width, with a modest side inset and no maximum. The page has a 1024px minimum width so tables stay one row; a narrower viewport scrolls horizontally.
 - Each view has a small page title and one muted sentence. The title names the view; it is not a hero.
 - A scan of many rows uses a table that stretches with the page. Filters sit in one compact toolbar row with the table they control. A create form or one-time credential uses a card.
@@ -202,7 +202,7 @@ System UI sans-serif at 13px, line-height 1.4. Identifiers, request IDs, and sec
 | Lede, button, description | 11px | 500–600 | |
 | Label, table header, badge | 10px | 600–700 | Headers and badges uppercase, slight tracking |
 
-Do not add a display size above the page title. Do not load a webfont; the control plane must keep serving the page without a third-party font origin.
+Do not add a display size above the page title. Do not load a webfont; the control plane must keep serving the page without a third-party font origin. In Chinese, table headers and badges are not uppercased and carry no letter-spacing. Chinese text uses the system interface font.
 
 ### Space and radius
 
@@ -217,4 +217,16 @@ A 4px grid: 4, 8, 12, 16, 20, 24, 32. Table rows and label gaps may use 6px when
 
 ### Motion and status
 
-The only animation is a small indeterminate spinner while a session is checked. Status is a short uppercase chip: enabled, disabled, live, next start, incomplete. One-time secrets sit on inverse paper and must remain visually louder than ordinary fields.
+The only animation is a small indeterminate spinner while a session is checked. Status is a short uppercase chip: enabled, disabled, live, next start, incomplete. One-time secrets sit on inverse paper and must remain visually louder than ordinary fields. In Chinese the chip keeps its meaning and drops the uppercase treatment.
+
+### Language
+
+The page is shown in English or Chinese (`zh-CN`). The operator's choice is kept in the browser for this origin and applies on the next visit, including the sign-in screen. When no choice is stored, a browser language of `zh`, `zh-CN`, `zh-SG`, or `zh-Hans` selects Chinese. `zh-TW`, `zh-HK`, and `zh-Hant` stay on English. An explicit choice wins over the browser.
+
+Switching language redraws the page immediately and does not call the control plane. Dates follow the selected language.
+
+The page translates its own sentences: navigation, forms, validation, notices, status chips, role names, and the display names of known process settings. An unknown setting keeps the label returned by the API. Account names, provider names, identifiers, endpoints, protocol names, routes, methods, credential headers, and shell examples stay as written. API error text and request-log error text stay as stored or returned.
+
+The language control offers `EN` and `中文`, each named in that word.
+
+The docs view translates its section titles, notes, example titles, and troubleshooting sentences. The endpoint rows and the example commands stay the public contract.
